@@ -2525,7 +2525,7 @@ pub(crate) fn dispatch_edit_grammar(
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::ReplaceText {
             file,
@@ -2560,7 +2560,7 @@ pub(crate) fn dispatch_edit_grammar(
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::ReplaceLines {
             file,
@@ -2586,7 +2586,7 @@ pub(crate) fn dispatch_edit_grammar(
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::ReplaceSpan {
             handle,
@@ -2611,7 +2611,7 @@ pub(crate) fn dispatch_edit_grammar(
                 let (new_content, changed) = edit_op_replace(&located, &new_bytes);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::Write {
             path,
@@ -2621,7 +2621,7 @@ pub(crate) fn dispatch_edit_grammar(
         } => {
             let outcome = edit_positional_payload(new, "NEW")
                 .and_then(|bytes| run_trained_write(root_path, &path, bytes, dry_run, verify));
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::Delete {
             symbol,
@@ -2644,7 +2644,7 @@ pub(crate) fn dispatch_edit_grammar(
                 let (new_content, changed) = edit_op_delete(&located);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::DeleteLines {
             file,
@@ -2668,7 +2668,7 @@ pub(crate) fn dispatch_edit_grammar(
                 let (new_content, changed) = edit_op_delete(&located);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::InsertLines {
             file,
@@ -2719,7 +2719,7 @@ pub(crate) fn dispatch_edit_grammar(
                 let (new_content, changed) = edit_splice(&located.content, &mut edits);
                 edit_publish(root_path, &located, new_content, changed, dry_run, verify)
             })();
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::Rename {
             symbol,
@@ -2728,7 +2728,7 @@ pub(crate) fn dispatch_edit_grammar(
             verify,
         } => {
             let outcome = run_trained_rename(root_path, root, &symbol, &name, dry_run, verify)?;
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::Undo {
             id,
@@ -2736,7 +2736,7 @@ pub(crate) fn dispatch_edit_grammar(
             verify,
         } => {
             let outcome = run_edit_undo(root_path, id.as_deref(), dry_run, verify);
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
         EditCommand::Patch {
             diff,
@@ -2745,7 +2745,7 @@ pub(crate) fn dispatch_edit_grammar(
         } => {
             let outcome = edit_positional_payload(diff, "DIFF")
                 .and_then(|bytes| run_trained_patch(root_path, bytes, dry_run, verify));
-            emit_edit_outcome(outcome, json, None)?
+            emit_edit_outcome(outcome, json, None, root_path)?
         }
     };
     Ok(GrammarDispatch(code))
