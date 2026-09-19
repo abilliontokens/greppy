@@ -14,10 +14,9 @@ impl QueryProgress {
         let started = Instant::now();
         let thread = std::thread::Builder::new()
             .name("greppy-query-progress".into())
-            .spawn(move || loop {
-                match receiver.recv_timeout(interval) {
-                    Err(RecvTimeoutError::Timeout) => report(started.elapsed()),
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            .spawn(move || {
+                while let Err(RecvTimeoutError::Timeout) = receiver.recv_timeout(interval) {
+                    report(started.elapsed());
                 }
             })
             .ok();
