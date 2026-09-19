@@ -37,6 +37,7 @@ impl Drop for QueryProgress {
 pub(crate) fn for_command(command: Option<&crate::Command>) -> Option<QueryProgress> {
     use crate::Command;
     let name = match command? {
+        Command::Index { .. } => "index",
         Command::SearchGraph { .. } => "search-graph",
         Command::SearchSymbol { .. } => "search-symbol",
         Command::SearchPattern { .. } => "search-pattern",
@@ -81,7 +82,7 @@ mod tests {
         assert!(second >= first);
         drop(guard);
         while rx.try_recv().is_ok() {}
-        assert!(matches!(rx.recv(), Err(_)));
+        assert!(rx.recv().is_err());
     }
 
     #[test]
