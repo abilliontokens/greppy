@@ -232,8 +232,8 @@ impl ProgressReporter {
                 self.prognosis = forecast.map(|(prognosis, _)| prognosis);
                 self.forecast_deadline = forecast.map(|(_, deadline)| deadline);
             }
-            if let Some((Prognosis::Remaining(remaining), deadline)) = forecast {
-                should_report |= self.forecast_changed_substantially(deadline, remaining);
+            if let Some((Prognosis::Remaining(_), deadline)) = forecast {
+                should_report |= self.forecast_changed_substantially(deadline);
             } else if let Some((prognosis, _)) = forecast {
                 should_report |= previous_prognosis != Some(prognosis);
             } else if previous_prognosis.is_some() && self.prognosis.is_none() {
@@ -289,7 +289,7 @@ impl ProgressReporter {
         self.observe_at(command, job, elapsed, 0)
     }
 
-    fn forecast_changed_substantially(&self, deadline: Duration, remaining: Duration) -> bool {
+    fn forecast_changed_substantially(&self, deadline: Duration) -> bool {
         let (Some(previous_deadline), Some(previous_remaining)) =
             (self.reported_deadline, self.reported_remaining)
         else {
