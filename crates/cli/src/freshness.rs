@@ -751,6 +751,19 @@ fn observe_first_use_index(
     snapshot_ready: bool,
     owner_active: bool,
 ) -> FirstUseIndexObservation {
+    // The portable OS writer lock is the ownership authority. A foreground
+    // writer may have inherited an old background record and has not yet
+    // replaced or removed it, so historical state cannot overrule a verified
+    // current owner.
+    if owner_active {
+        return FirstUseIndexObservation::Pending;
+    }
+    // Publication is authoritative after the owner releases its lock. A
+    // foreground writer is allowed to publish without owning the historical
+    // background record, which may therefore remain stale.
+    if snapshot_ready {
+        return FirstUseIndexObservation::Published;
+    }
     if let Some(job) = job {
         let state = job
             .get("state")
@@ -764,25 +777,13 @@ fn observe_first_use_index(
                     .to_owned(),
             );
         }
-        if owner_active {
-            return FirstUseIndexObservation::Pending;
-        }
-        if snapshot_ready && state == "complete" {
-            return FirstUseIndexObservation::Published;
-        }
         return FirstUseIndexObservation::Failed(format!(
             "job owner exited before publishing a snapshot (last state: {state})"
         ));
     }
-    if snapshot_ready {
-        FirstUseIndexObservation::Published
-    } else if owner_active {
-        FirstUseIndexObservation::Pending
-    } else {
-        FirstUseIndexObservation::Failed(
-            "job ended before publishing a snapshot or recording an error".into(),
-        )
-    }
+    FirstUseIndexObservation::Failed(
+        "job ended before publishing a snapshot or recording an error".into(),
+    )
 }
 
 fn first_use_snapshot_ready(effective_root: &std::path::Path) -> bool {
@@ -831,16 +832,10 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
             )
         })?;
         let job = read_background_job(launch.path());
-        // Publication removes the job record. Avoid opening SQLite on every
-        // poll while a live writer is still building the temporary snapshot;
-        // only an absent or explicitly complete record can make the active
-        // database relevant to this decision.
-        let publication_possible = job.as_ref().is_none_or(|job| {
-            job.get("state")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|state| state == "complete")
-        });
-        let snapshot_ready = publication_possible && first_use_snapshot_ready(effective_root);
+        // Never reopen SQLite while its verified writer is active. Once the
+        // lock is released, publication outranks a historical job record,
+        // including a stale failed/nonterminal record left by another owner.
+        let snapshot_ready = !owner_active && first_use_snapshot_ready(effective_root);
         match observe_first_use_index(job.as_ref(), snapshot_ready, owner_active) {
             FirstUseIndexObservation::Pending => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1117,6 +1112,29 @@ mod refresh_wait_tests {
             FirstUseIndexObservation::Failed(detail)
                 if detail.contains("owner exited") && detail.contains("launching")
         ));
+    }
+
+    #[test]
+    fn foreground_writer_and_publication_override_stale_job_state() {
+        for stale in [
+            serde_json::json!({
+                "state": "failed",
+                "pid": 7,
+                "last_error": "historical failure"
+            }),
+            serde_json::json!({"state": "indexing", "pid": 7}),
+        ] {
+            assert_eq!(
+                observe_first_use_index(Some(&stale), false, true),
+                FirstUseIndexObservation::Pending,
+                "verified foreground writer owns progress despite stale record"
+            );
+            assert_eq!(
+                observe_first_use_index(Some(&stale), true, false),
+                FirstUseIndexObservation::Published,
+                "published snapshot wins after foreground writer releases"
+            );
+        }
     }
 
     #[test]

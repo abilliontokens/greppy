@@ -338,21 +338,19 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
     let background_job = read_background_job(&background_job_path(&effective_root));
     let effective_root_string = effective_root.to_string_lossy().into_owned();
     let writer_active = workspace_writer_active(Some(&effective_root_string));
-    let job_state = background_job.as_ref().map(|job| {
-        if job
-            .get("pid")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|pid| process_is_alive(pid as u32))
-        {
-            "refreshing"
-        } else {
-            "failed"
-        }
-    });
+    let spawn_active = background_job_spawn_active(&effective_root);
     let background_state = if writer_active {
         Some("refreshing")
+    } else if spawn_active {
+        Some("starting")
     } else {
-        job_state
+        background_job.as_ref().map(|job| {
+            if job.get("state").and_then(serde_json::Value::as_str) == Some("failed") {
+                "failed"
+            } else {
+                "abandoned"
+            }
+        })
     };
     // `status` must never queue behind the writer it is meant to observe.
     // Opening the previous graph and running integrity/freshness checks can be
@@ -375,7 +373,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
         let message = if progress_stalled {
             let phase = phase.unwrap_or("unknown");
             format!(
-                "index build has published no progress update for {}s (phase={phase}); it may be stalled; inspect the exact background_job PID, terminate only that process if it is no longer making progress, then rerun `greppy index`; the OS lock releases with its owner",
+                "index build has published no progress update for {}s (phase={phase}); it may be stalled; inspect the index invocation that owns writer_lock and its logs; background_job.pid is diagnostic only and must not be signaled without separate ownership proof; the OS lock releases when its actual owner exits",
                 progress_age_seconds.unwrap_or(0)
             )
         } else if background_job.is_some() {
@@ -389,6 +387,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "healthy": false,
             "store_exists": store_path.exists(),
             "writer_active": true,
+            "startup_active": spawn_active,
             "root_path": effective_root,
             "store_path": store_path,
             "writer_lock": writer_lock,
@@ -462,6 +461,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "healthy": false,
             "store_exists": false,
             "writer_active": false,
+            "startup_active": spawn_active,
             "root_path": effective_root,
             "store_path": store_path,
             "store_format": store_format,
@@ -537,6 +537,7 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
                 "healthy": false,
                 "store_exists": true,
                 "writer_active": false,
+                "startup_active": spawn_active,
                 "root_path": effective_root,
                 "store_path": store_path,
                 "store_format": store_format,
@@ -708,6 +709,8 @@ pub(crate) fn dispatch_index_health(command: &str, json: bool, root: Option<&str
             "status": status_label,
             "healthy": healthy,
             "store_exists": true,
+            "writer_active": false,
+            "startup_active": spawn_active,
             "root_path": effective_root,
             "store_path": store_path,
             "store_format": store_format,

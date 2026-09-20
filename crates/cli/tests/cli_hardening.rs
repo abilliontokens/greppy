@@ -2760,7 +2760,8 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
         stalled["message"]
             .as_str()
             .is_some_and(|message| message.contains("may be stalled")
-                && message.contains("terminate only that process")),
+                && message.contains("writer_lock")
+                && message.contains("must not be signaled without separate ownership proof")),
         "stalled status needs bounded recovery guidance: {stalled}"
     );
     std::fs::remove_file(job_path).unwrap();
@@ -2897,6 +2898,16 @@ fn first_use_replaces_stale_job_whose_pid_was_reused() {
     )
     .unwrap();
 
+    let (status_code, status_out, status_err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_ne!(
+        status_code, 75,
+        "reused PID without writer ownership is not active: {status_out}\n{status_err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&status_out).unwrap();
+    assert_eq!(status["writer_active"], false);
+    assert_eq!(status["startup_active"], false);
+    assert_eq!(status["background_state"], "abandoned");
+
     let (code, out, err) = run(&["search-symbol", "stale_pid_marker"], &repo, &store);
     assert_eq!(
         code, 0,
@@ -2949,6 +2960,64 @@ fn second_first_use_caller_waits_for_the_real_writer_and_completes() {
             String::from_utf8_lossy(&output.stdout).contains("two_caller_marker"),
             "{output:?}"
         );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn first_use_query_ignores_stale_record_while_foreground_writer_publishes() {
+    for (tag, stale_state) in [("failed", "failed"), ("nonterminal", "indexing")] {
+        let (repo, store, scratch) = make_repo(
+            &format!("first-use-foreground-{tag}"),
+            "foreground_owner_marker",
+        );
+        let ready = scratch.0.join(format!("foreground-{tag}-ready"));
+        let mut writer = Command::new(bin())
+            .args(["index", "."])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "750")
+            .env_remove("GREPPY_DISCOVER_INCLUDE")
+            .env_remove("GREPPY_DISCOVER_EXCLUDE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn foreground writer");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(writer.try_wait().unwrap().is_none(), "writer exited early");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "foreground writer did not reach publication hold"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let db = find_graph_db(&store).expect("foreground writer creates graph.db");
+        std::fs::write(
+            db.parent().unwrap().join("index.job"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "greppy.background-job.v2",
+                "kind": "index",
+                "pid": std::process::id(),
+                "started_at_unix_secs": 1,
+                "state": stale_state,
+                "last_error": (stale_state == "failed").then_some("historical failure")
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (code, out, err) = run(&["search-symbol", "foreground_owner_marker"], &repo, &store);
+        assert_eq!(
+            code, 0,
+            "verified writer/publication must override stale {stale_state} record: {out}\n{err}"
+        );
+        assert!(out.contains("foreground_owner_marker"), "{out}\n{err}");
+        let writer = writer.wait_with_output().unwrap();
+        assert_eq!(writer.status.code(), Some(0), "{writer:?}");
     }
 }
 

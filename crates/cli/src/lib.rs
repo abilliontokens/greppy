@@ -4114,6 +4114,18 @@ fn background_job_writer_active(root: &std::path::Path) -> bool {
     )
 }
 
+fn background_job_spawn_active(root: &std::path::Path) -> bool {
+    let hash = greppy_core::workspace::workspace_hash(root);
+    matches!(
+        greppy_core::cache::acquire_named_lock(
+            &format!("workspace-{hash}.job-spawn"),
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        ),
+        Ok(None)
+    )
+}
+
 fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
     use std::io::Write;
 
