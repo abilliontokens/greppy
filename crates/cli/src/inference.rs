@@ -406,7 +406,10 @@ pub(crate) fn embedding_device_preference(
 fn enforce_product_gpu(
     preference: greppy_embed_native::DevicePreference,
 ) -> Result<greppy_embed_native::DevicePreference> {
-    #[cfg(all(any(target_os = "macos", target_os = "linux"), not(feature = "cpu-only")))]
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    ))]
     if preference == greppy_embed_native::DevicePreference::Cpu {
         return Err(Error::Invalid(
             "CPU inference is disabled in product builds; use the platform GPU by removing \

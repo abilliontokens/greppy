@@ -848,7 +848,10 @@ fn embedding_device_preference_obeys_cli_and_env() {
     );
     let explicit_cpu = embedding_device_preference(Some("cpu"), false);
     let no_gpu_cpu = embedding_device_preference(None, true);
-    if cfg!(all(any(target_os = "macos", target_os = "linux"), not(feature = "cpu-only"))) {
+    if cfg!(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    )) {
         assert!(matches!(
             explicit_cpu,
             Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
@@ -874,7 +877,10 @@ fn embedding_device_preference_obeys_cli_and_env() {
         std::env::set_var(ENV_DEVICE, "cpu");
     }
     let summary_explicit_cpu = qwen_summary_device_preference();
-    if cfg!(all(any(target_os = "macos", target_os = "linux"), not(feature = "cpu-only"))) {
+    if cfg!(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    )) {
         assert!(matches!(
             summary_explicit_cpu,
             Err(Error::Invalid(message)) if message.contains("GREPPY_DEVICE=cpu")
@@ -892,7 +898,10 @@ fn embedding_device_preference_obeys_cli_and_env() {
     }
     let env_cpu = embedding_device_preference(Some("cuda"), false);
     let summary_env_cpu = qwen_summary_device_preference();
-    if cfg!(all(any(target_os = "macos", target_os = "linux"), not(feature = "cpu-only"))) {
+    if cfg!(all(
+        any(target_os = "macos", target_os = "linux"),
+        not(feature = "cpu-only")
+    )) {
         assert!(matches!(
             env_cpu,
             Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
