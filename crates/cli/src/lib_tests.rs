@@ -800,19 +800,41 @@ fn embedding_device_preference_obeys_cli_and_env() {
         inference_device_identity(&greppy_embed_native::DevicePreference::Cuda),
         "cuda:2"
     );
-    assert_eq!(
-        embedding_device_preference(Some("cpu"), true).unwrap(),
-        greppy_embed_native::DevicePreference::Cpu
-    );
+    let explicit_cpu = embedding_device_preference(Some("cpu"), true);
+    if cfg!(all(target_os = "macos", not(feature = "cpu-only"))) {
+        assert!(matches!(
+            explicit_cpu,
+            Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
+        ));
+    } else {
+        assert_eq!(
+            explicit_cpu.unwrap(),
+            greppy_embed_native::DevicePreference::Cpu
+        );
+    }
 
     // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {
         std::env::set_var(ENV_NO_GPU, "1");
     }
-    assert_eq!(
-        embedding_device_preference(Some("cuda"), false).unwrap(),
-        greppy_embed_native::DevicePreference::Cpu
-    );
+    let env_cpu = embedding_device_preference(Some("cuda"), false);
+    let summary_env_cpu = qwen_summary_device_preference();
+    if cfg!(all(target_os = "macos", not(feature = "cpu-only"))) {
+        assert!(matches!(
+            env_cpu,
+            Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
+        ));
+        assert!(matches!(
+            summary_env_cpu,
+            Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
+        ));
+    } else {
+        assert_eq!(env_cpu.unwrap(), greppy_embed_native::DevicePreference::Cpu);
+        assert_eq!(
+            summary_env_cpu.unwrap(),
+            greppy_qwen35_native::DevicePreference::Cpu
+        );
+    }
 
     // SAFETY: serialized by TEST_ENV_LOCK and restored by EnvRestore.
     unsafe {

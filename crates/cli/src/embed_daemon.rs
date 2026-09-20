@@ -495,6 +495,7 @@ pub(super) fn daemon_main(socket: String, cfg: super::EmbeddingModelConfig, prew
         policy,
         prewarm,
         || super::load_embedding_model(&cfg, None).map_err(|error| error.to_string()),
+        |model| model.backend_name().to_string(),
         |raw| validate(raw, &model_key),
         |raw, model| respond(raw, &model_key, model),
         "embed-daemon",
