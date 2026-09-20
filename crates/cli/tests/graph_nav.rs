@@ -301,6 +301,71 @@ fn who_calls_honours_the_module_qualifier_over_a_same_file_twin() {
 }
 
 #[test]
+fn index_upgrade_repairs_old_call_edges_without_source_edits() {
+    let (repo, store_dir) = make_graph_repo("old-call-edges");
+    let src = repo.join("src");
+    std::fs::write(src.join("lib.rs"), "mod store;\nmod app;\n").unwrap();
+    std::fs::write(src.join("store.rs"), "pub fn resolve_root() -> u32 { 1 }\n").unwrap();
+    std::fs::write(src.join("app.rs"), "use crate::store;\npub fn resolve_root() -> u32 { 2 }\npub fn use_store_root() -> u32 { store::resolve_root() }\n").unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let db = find_graph_db(&store_dir).unwrap();
+    {
+        let store = greppy_store::Store::open(&db).unwrap();
+        // Simulate the persisted v5 defect, keeping raw callee_path metadata
+        // and unchanged file hashes so a no-op incremental run cannot repair it.
+        store
+            .conn()
+            .execute(
+                "UPDATE workspace_state SET indexer_version = 'greppy-indexer-v5'",
+                [],
+            )
+            .unwrap();
+        let changed = store.conn().execute(
+            "UPDATE edges SET target_id = (SELECT id FROM nodes WHERE name = 'resolve_root' AND file_path = 'src/app.rs')
+             WHERE edge_type = 'CALLS' AND source_id = (SELECT id FROM nodes WHERE name = 'use_store_root' AND file_path = 'src/app.rs')",
+            [],
+        ).unwrap();
+        assert_eq!(
+            changed, 1,
+            "seed the wrong same-file twin as the persisted target"
+        );
+    }
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(
+        code, 0,
+        "upgrade must rebuild persisted edges: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["who-calls", "src/store.rs::resolve_root"],
+        &repo,
+        &store_dir,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("use_store_root"),
+        "missing real caller after upgrade: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["who-calls", "src/app.rs::resolve_root"],
+        &repo,
+        &store_dir,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        !out.contains("use_store_root"),
+        "stale wrong edge survived migration: {out}\n{err}"
+    );
+    let store =
+        greppy_store::Store::open_with(&db, greppy_store::OpenOptions::read_only()).unwrap();
+    assert!(store
+        .list_workspace_states()
+        .unwrap()
+        .iter()
+        .all(|state| state.indexer_version == greppy_core::INDEXER_VERSION_BASE));
+}
+
+#[test]
 fn who_calls_lists_cross_file_caller_with_file_line() {
     let (repo, store) = index_fixture("whocalls");
 
