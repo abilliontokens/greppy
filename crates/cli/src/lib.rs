@@ -4107,6 +4107,13 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+fn background_job_writer_active(root: &std::path::Path) -> bool {
+    matches!(
+        greppy_freshness::try_acquire(&workspace_locator::store_path(root)),
+        Err(greppy_freshness::LockError::Held { .. })
+    )
+}
+
 fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
     use std::io::Write;
 
@@ -4605,13 +4612,21 @@ pub(crate) enum BackgroundJobLaunch {
     },
     Attached {
         path: std::path::PathBuf,
+        root: std::path::PathBuf,
     },
 }
 
 impl BackgroundJobLaunch {
     pub(crate) fn path(&self) -> &std::path::Path {
         match self {
-            Self::Owned { path, .. } | Self::Attached { path } => path,
+            Self::Owned { path, .. } | Self::Attached { path, .. } => path,
+        }
+    }
+
+    pub(crate) fn owner_is_active(&mut self) -> std::io::Result<bool> {
+        match self {
+            Self::Owned { child, .. } => child.try_wait().map(|status| status.is_none()),
+            Self::Attached { root, .. } => Ok(background_job_writer_active(root)),
         }
     }
 }
@@ -4645,15 +4660,11 @@ fn spawn_background_job_handle(
         return None;
     };
     let job_path = background_job_path(&root);
-    if let Some(job) = read_background_job(&job_path) {
-        if job
-            .get("pid")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|pid| u32::try_from(pid).ok())
-            .is_some_and(process_is_alive)
-        {
-            return Some(BackgroundJobLaunch::Attached { path: job_path });
-        }
+    if background_job_writer_active(&root) {
+        return Some(BackgroundJobLaunch::Attached {
+            path: job_path,
+            root,
+        });
     }
     let target_generation = greppy_store::Store::open_with(
         &workspace_locator::store_path(&root),
@@ -4726,6 +4737,12 @@ fn spawn_background_job_handle(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    #[cfg(debug_assertions)]
+    if std::env::var_os("GREPPY_TEST_BACKGROUND_SPAWN_FAIL").is_some() {
+        command = std::process::Command::new(
+            root.join("__greppy_deliberately_missing_background_indexer__"),
+        );
+    }
     if let Some(cfg) = embedding_cfg {
         command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
     }
@@ -4766,6 +4783,41 @@ fn spawn_background_job_handle(
         let _ = child.kill();
         let _ = child.wait();
         return None;
+    }
+    // The spawn lock remains held until the child either owns the portable
+    // workspace writer lock or has exited. A later launcher can therefore use
+    // that OS lock as the ownership identity without a PID/start-time race.
+    // There is intentionally no elapsed-time takeover: process exit and lock
+    // acquisition are the only state transitions.
+    loop {
+        if background_job_writer_active(&root) {
+            break;
+        }
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let recorded_failure = read_background_job(&job_path).is_some_and(|job| {
+                        job.get("state").and_then(serde_json::Value::as_str) == Some("failed")
+                    });
+                    if !recorded_failure {
+                        value["state"] = serde_json::json!("failed");
+                        value["last_error"] = serde_json::json!(format!(
+                            "background {kind} exited before acquiring the workspace writer lock: {status}"
+                        ));
+                        let _ = write_background_job(&job_path, &value);
+                    }
+                }
+                break;
+            }
+            Err(error) => {
+                value["state"] = serde_json::json!("failed");
+                value["last_error"] =
+                    serde_json::json!(format!("observe background {kind} startup: {error}"));
+                let _ = write_background_job(&job_path, &value);
+                break;
+            }
+        }
     }
     Some(BackgroundJobLaunch::Owned {
         child,

@@ -508,15 +508,7 @@ pub(crate) fn workspace_writer_active(root: Option<&str>) -> bool {
     let Ok(root) = resolve_root(root) else {
         return false;
     };
-    let hash = greppy_core::workspace::workspace_hash(&root);
-    matches!(
-        greppy_core::cache::acquire_named_lock(
-            &format!("workspace-{hash}.writer"),
-            greppy_core::cache::LockMode::Exclusive,
-            true,
-        ),
-        Ok(None)
-    )
+    background_job_writer_active(&root)
 }
 
 pub(crate) fn auto_reindex_inline_allowed(
@@ -757,7 +749,7 @@ enum FirstUseIndexObservation {
 fn observe_first_use_index(
     job: Option<&serde_json::Value>,
     snapshot_ready: bool,
-    owned_child_alive: bool,
+    owner_active: bool,
 ) -> FirstUseIndexObservation {
     if let Some(job) = job {
         let state = job
@@ -772,12 +764,7 @@ fn observe_first_use_index(
                     .to_owned(),
             );
         }
-        let published_owner_alive = job
-            .get("pid")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|pid| u32::try_from(pid).ok())
-            .is_some_and(process_is_alive);
-        if owned_child_alive || published_owner_alive {
+        if owner_active {
             return FirstUseIndexObservation::Pending;
         }
         if snapshot_ready && state == "complete" {
@@ -789,7 +776,7 @@ fn observe_first_use_index(
     }
     if snapshot_ready {
         FirstUseIndexObservation::Published
-    } else if owned_child_alive {
+    } else if owner_active {
         FirstUseIndexObservation::Pending
     } else {
         FirstUseIndexObservation::Failed(
@@ -834,22 +821,15 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
             ))
         })?;
     loop {
-        let owned_child_alive = match &mut launch {
-            BackgroundJobLaunch::Owned { child, .. } => match child.try_wait() {
-                Ok(None) => true,
-                Ok(Some(_)) => false,
-                Err(error) => {
-                    return Err(Error::io(
-                        format!(
-                            "observe first-use index process for {}",
-                            effective_root.display()
-                        ),
-                        error,
-                    ))
-                }
-            },
-            BackgroundJobLaunch::Attached { .. } => false,
-        };
+        let owner_active = launch.owner_is_active().map_err(|error| {
+            Error::io(
+                format!(
+                    "observe first-use index owner for {}",
+                    effective_root.display()
+                ),
+                error,
+            )
+        })?;
         let job = read_background_job(launch.path());
         // Publication removes the job record. Avoid opening SQLite on every
         // poll while a live writer is still building the temporary snapshot;
@@ -861,7 +841,7 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
                 .is_some_and(|state| state == "complete")
         });
         let snapshot_ready = publication_possible && first_use_snapshot_ready(effective_root);
-        match observe_first_use_index(job.as_ref(), snapshot_ready, owned_child_alive) {
+        match observe_first_use_index(job.as_ref(), snapshot_ready, owner_active) {
             FirstUseIndexObservation::Pending => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -1140,14 +1120,19 @@ mod refresh_wait_tests {
     }
 
     #[test]
-    fn second_caller_attaches_to_a_healthy_published_owner() {
+    fn second_caller_waits_only_for_a_verified_owner() {
         let job = serde_json::json!({
             "state": "loading_model",
             "pid": std::process::id()
         });
         assert_eq!(
-            observe_first_use_index(Some(&job), false, false),
+            observe_first_use_index(Some(&job), false, true),
             FirstUseIndexObservation::Pending
         );
+        assert!(matches!(
+            observe_first_use_index(Some(&job), false, false),
+            FirstUseIndexObservation::Failed(detail)
+                if detail.contains("owner exited")
+        ));
     }
 }

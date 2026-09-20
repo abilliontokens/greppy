@@ -2872,6 +2872,107 @@ fn check_first_use_query_waits_for_healthy_slow_index(seed_pack: bool) {
     assert!(!err.contains("retry after"), "stderr={err:?}");
 }
 
+#[test]
+fn first_use_replaces_stale_job_whose_pid_was_reused() {
+    let (repo, store, _scratch) = make_repo("first-use-stale-pid", "stale_pid_marker");
+    let hash = greppy_core::workspace::workspace_hash(&repo);
+    let db = store
+        .join("workspaces")
+        .join("v2")
+        .join(hash)
+        .join("graph.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    drop(greppy_store::Store::open(&db).expect("create cold graph store"));
+    let job_path = db.parent().unwrap().join("index.job");
+    std::fs::write(
+        &job_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "greppy.background-job.v2",
+            "kind": "index",
+            "pid": std::process::id(),
+            "started_at_unix_secs": 1,
+            "state": "indexing"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (code, out, err) = run(&["search-symbol", "stale_pid_marker"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "a live unrelated PID must not own a first-use job: {out}\n{err}"
+    );
+    assert!(out.contains("stale_pid_marker"), "{out}\n{err}");
+    assert!(!job_path.exists(), "successful publication removes the job");
+}
+
+#[cfg(unix)]
+#[test]
+fn second_first_use_caller_waits_for_the_real_writer_and_completes() {
+    let (repo, store, scratch) = make_repo("first-use-two-callers", "two_caller_marker");
+    let ready = scratch.0.join("first-use-two-callers-ready");
+    let spawn = || {
+        let mut command = Command::new(bin());
+        command
+            .args(["search-symbol", "two_caller_marker"])
+            .current_dir(&repo)
+            .env("GREPPY_STORE_DIR", &store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+            .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+            .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "750")
+            .env_remove("GREPPY_DISCOVER_INCLUDE")
+            .env_remove("GREPPY_DISCOVER_EXCLUDE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command.spawn().expect("spawn first-use query")
+    };
+    let mut first = spawn();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(
+            first.try_wait().unwrap().is_none(),
+            "first query exited early"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first writer did not reach publication hold"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let second = spawn();
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    for output in [first, second] {
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("two_caller_marker"),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
+fn first_use_background_spawn_failure_returns_without_handshake_deadlock() {
+    let (repo, store, _scratch) = make_repo("first-use-spawn-fail", "spawn_fail_marker");
+    let started = std::time::Instant::now();
+    let (code, out, err) = run_with_env(
+        &["search-symbol", "spawn_fail_marker"],
+        &repo,
+        &store,
+        &[("GREPPY_TEST_BACKGROUND_SPAWN_FAIL", "1")],
+    );
+    assert_ne!(
+        code, 0,
+        "spawn failpoint unexpectedly succeeded: {out} {err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "spawn failure deadlocked the ownership handshake"
+    );
+    assert!(err.contains("spawn background index"), "{out}\n{err}");
+}
+
 #[cfg(unix)]
 #[test]
 fn foreground_index_publishes_observable_progress_while_building() {
