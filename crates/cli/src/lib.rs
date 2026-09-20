@@ -3863,7 +3863,7 @@ fn nav_freshness_json(
                     (false, "unknown", reasons)
                 }
             };
-            serde_json::json!({
+            let mut freshness = serde_json::json!({
                 "fresh": fresh,
                 "state": state_name,
                 "reasons": reasons,
@@ -3880,7 +3880,21 @@ fn nav_freshness_json(
                     "include": ENV_DISCOVER_INCLUDE,
                     "exclude": ENV_DISCOVER_EXCLUDE,
                 },
-            })
+            });
+            // An active writer prevents persisting a metadata-only fingerprint
+            // update, not reading content-equivalent graph rows. The completed
+            // inventory proof above must establish zero changed files and no
+            // root, scope, indexer-version or unknown-state drift. Keep the
+            // pending metadata visible rather than pretending it was persisted.
+            if metadata_only_fingerprint_drift(&freshness) && workspace_writer_active(root) {
+                freshness["metadata_drift_reasons"] = freshness["reasons"].clone();
+                freshness["metadata_refresh_pending"] = serde_json::json!(true);
+                freshness["source"] = serde_json::json!("verified_published_snapshot");
+                freshness["fresh"] = serde_json::json!(true);
+                freshness["state"] = serde_json::json!("fresh");
+                freshness["reasons"] = serde_json::json!([]);
+            }
+            freshness
         }
         Err(e) => serde_json::json!({
             "fresh": false,

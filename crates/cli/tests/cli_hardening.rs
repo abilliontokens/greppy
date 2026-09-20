@@ -2768,6 +2768,97 @@ fn read_queries_refuse_lifecycle_contention_without_silent_wait() {
 }
 
 #[test]
+fn graph_queries_serve_verified_contents_during_metadata_only_refresh() {
+    let (repo, store, _scratch) = make_real_git_repo("query-during-metadata-refresh");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index failed: {out}\n{err}");
+    // A commit changes the fingerprint without changing any indexed source.
+    git(&repo, &["commit", "--allow-empty", "-m", "metadata only"]);
+    let mut writer = hold_index_before_publish(&repo, &store, "metadata-refresh");
+    for args in [
+        vec![
+            "search-symbol",
+            "clean_committed_marker",
+            "--json",
+            "--diagnostics",
+        ],
+        vec![
+            "who-calls",
+            "clean_committed_marker",
+            "--json",
+            "--diagnostics",
+        ],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(
+            code, 0,
+            "{args:?} must use the verified active graph: {out}\n{err}"
+        );
+        let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_ne!(result["status"], "skipped_stale_index", "{result}");
+        assert_eq!(
+            result["freshness"]["metadata_refresh_pending"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["freshness"]["source"], "verified_published_snapshot",
+            "{result}"
+        );
+        assert!(
+            result["freshness"]["metadata_drift_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str().unwrap().starts_with("head_oid changed")),
+            "{result}"
+        );
+        if args[0] == "search-symbol" {
+            assert!(
+                result["hits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit["name"] == "clean_committed_marker"),
+                "{result}"
+            );
+        }
+        assert!(
+            writer.child.try_wait().unwrap().is_none(),
+            "query must finish while the real indexer remains active"
+        );
+    }
+    // Actual source changes still must not be represented as fresh graph data.
+    std::fs::write(repo.join("src/lib.rs"), "pub fn changed_marker() {}\n").unwrap();
+    let (code, out, err) = run(
+        &["search-symbol", "clean_committed_marker", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        code, 75,
+        "changed source must not silently reuse old rows: {out}\n{err}"
+    );
+    drop(writer);
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "refresh must recover after prior writer stops: {out}\n{err}"
+    );
+    let (code, out, err) = run(
+        &["search-symbol", "changed_marker", "--json", "--diagnostics"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "new graph must be queryable: {out}\n{err}");
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(result["freshness"]["fresh"], true, "{result}");
+    assert!(
+        result["freshness"]["metadata_refresh_pending"].is_null(),
+        "{result}"
+    );
+}
+
+#[test]
 fn r3_old_lock_contents_without_os_lock_are_harmless() {
     let (repo, store, _scratch) = make_repo("r3-stale-lock", "stale_lock_marker");
 
