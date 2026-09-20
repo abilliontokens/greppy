@@ -1883,6 +1883,7 @@ impl Daemon {
             .and_then(|session| session.locator_snapshots.get(page)).cloned();
         let mut tree = self.engine_call_timed_with_recovery("page.observe", json!({
             "page": page, "snapshot": proposed,
+            "expected_snapshot": previous.as_ref().map(|snapshot| snapshot.token.as_str()),
             "ref_first": range.first, "ref_last": range.last,
             "query": query, "include_html": include_html,
         }), timeout, recover_worker)?;

@@ -2388,6 +2388,7 @@ impl ContentEngine {
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
                 let snapshot = params.get("snapshot").and_then(|value| value.as_str());
+                let expected_snapshot = params.get("expected_snapshot").and_then(|value| value.as_str());
                 let first = params
                     .get("ref_first")
                     .and_then(|value| value.as_u64())
@@ -2404,7 +2405,7 @@ impl ContentEngine {
                     .unwrap_or(false);
                 match self.evaluate(
                     webview,
-                    &observe_script(snapshot, first, last, query, include_html),
+                    &observe_script(snapshot, first, last, query, include_html, expected_snapshot),
                 )? {
                     JSValue::String(text) => serde_json::from_str(&text)
                         .map_err(|error| io::Error::other(format!("observe json: {error}"))),
@@ -4946,7 +4947,7 @@ mod serialize_tests {
     }
 }
 
-const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml) {
+const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml, expectedSnapshot) {
   __GREPPY_NATIVE_LABEL_TEXT__
   __GREPPY_SELECT_CHOICES__
   __GREPPY_WORKING_SCOPE__
@@ -4965,7 +4966,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
   const referenceAttributes = [];
   let registry = null;
   if (snapshot != null) {
-    registry = (__GREPPY_REF_REGISTRY__)(document, window.__greppyObservedRefs, snapshot, first, last);
+    registry = (__GREPPY_REF_REGISTRY__)(document, window.__greppyObservedRefs, snapshot, first, last, expectedSnapshot);
     window.__greppyObservedRefs = registry;
     snapshot = registry.snapshot;
     if (document.documentElement && document.documentElement.getAttribute(snapshotAttr) !== snapshot) {
@@ -5112,7 +5113,7 @@ const OBSERVE_JS: &str = r#"(function(snapshot, first, last, query, includeHtml)
     if (includeHtml) tree.scoped_html = selectedScope.roots.map(function(node) { return node.outerHTML; }).join('\n');
   }
   return JSON.stringify(tree);
-})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__, __GREPPY_QUERY__, __GREPPY_INCLUDE_HTML__)"#;
+})(__GREPPY_SNAPSHOT__, __GREPPY_REF_FIRST__, __GREPPY_REF_LAST__, __GREPPY_QUERY__, __GREPPY_INCLUDE_HTML__, __GREPPY_EXPECTED_SNAPSHOT__)"#;
 
 fn observe_script(
     snapshot: Option<&str>,
@@ -5120,6 +5121,7 @@ fn observe_script(
     last: u64,
     query: Option<&str>,
     include_html: bool,
+    expected_snapshot: Option<&str>,
 ) -> String {
     let encoded = serde_json::to_string(&snapshot).expect("snapshot token serializes");
     OBSERVE_JS
@@ -5154,6 +5156,10 @@ fn observe_script(
         .replace("__GREPPY_REF_FIRST__", &first.to_string())
         .replace("__GREPPY_REF_LAST__", &last.to_string())
         .replace("__GREPPY_SNAPSHOT__", &encoded)
+        .replace(
+            "__GREPPY_EXPECTED_SNAPSHOT__",
+            &serde_json::to_string(&expected_snapshot).expect("expected snapshot serializes"),
+        )
         .replace(
             "__GREPPY_INCLUDE_HTML__",
             if include_html { "true" } else { "false" },

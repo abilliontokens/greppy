@@ -3929,6 +3929,62 @@ box.addEventListener('change', function() { changes += 1; render(); });\
 }
 
 #[test]
+fn observed_refs_renew_after_history_restoration() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-history-refs-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_history_refs", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |operation: &str, payload| {
+        unix_request(&socket, &Request::new("run_history_refs", operation, payload), Duration::from_secs(30))
+            .expect("history request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    assert_eq!(created.status, "ok", "{created:?}");
+    let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let first = "data:text/html,%3Ctitle%3EHistoryA%3C/title%3E%3Cinput%20id='marker'%20value='A'%3E";
+    let second = "data:text/html,%3Ctitle%3EHistoryB%3C/title%3E%3Cinput%20id='marker'%20value='B'%3E";
+    let opened = call("web.goto", json!({"session_id":session,"url":first}));
+    assert_eq!(opened.status, "ok", "{opened:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    let old_ref = observed.result.as_ref().unwrap()["actionables"][0]["ref"].as_str().unwrap();
+    let old_number: u64 = old_ref.trim_start_matches('@').parse().unwrap();
+    let moved = call("web.goto", json!({"session_id":session,"url":second}));
+    assert_eq!(moved.status, "ok", "{moved:?}");
+    for (operation, title, value) in [
+        ("web.back", "HistoryA", "A"),
+        ("web.forward", "HistoryB", "B"),
+        ("web.back", "HistoryA", "A"),
+    ] {
+        let moved = call(operation, json!({"session_id":session}));
+        assert_eq!(moved.status, "ok", "{moved:?}");
+        let receipt = &moved.result.as_ref().unwrap()["page_state"];
+        assert_eq!(receipt["status"], "available", "history must return usable page state: {moved:?}");
+        assert_eq!(receipt["snapshot"]["title"], title, "{moved:?}");
+        let observed = call("web.observe", json!({"session_id":session,"query":"css=#marker"}));
+        assert_eq!(observed.status, "ok", "restored scope must stay observable: {observed:?}");
+        let node = &observed.result.as_ref().unwrap()["actionables"][0];
+        assert_eq!(node["value"], value, "{observed:?}");
+        assert_ne!(node["ref"], old_ref, "navigation must not revive expired handles");
+    }
+    let stale = call("web.fill", json!({"session_id":session,
+        "selector":{"type":"ref","value":old_number},"value":"must-not-write"}));
+    assert_ne!(stale.status, "ok", "expired pre-navigation ref must fail: {stale:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "{observed:?}");
+    let fresh = observed.result.as_ref().unwrap()["actionables"][0]["ref"].as_str().unwrap();
+    let fresh_number: u64 = fresh.trim_start_matches('@').parse().unwrap();
+    let filled = call("web.fill", json!({"session_id":session,
+        "selector":{"type":"ref","value":fresh_number},"value":"restored-write"}));
+    assert_eq!(filled.status, "ok", "new restored-page ref must work: {filled:?}");
+    let verified = call("web.evaluate", json!({"session_id":session,"source":"document.getElementById('marker').value"}));
+    assert_eq!(verified.status, "ok", "{verified:?}");
+    assert_eq!(verified.result.as_ref().unwrap()["value"], "restored-write");
+    let closed = call("web.session.close", json!({"session_id":session}));
+    assert_eq!(closed.status, "ok", "{closed:?}");
+}
+
+#[test]
 fn observed_refs_drive_locators_and_expire_on_navigation() {
     let fixture = serve_fixture(
         "<!DOCTYPE html><html><body><input id=\"name\" value=\"\"><button onclick=\"document.body.setAttribute('data-clicked','yes')\">go</button></body></html>",
