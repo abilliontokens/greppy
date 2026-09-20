@@ -675,7 +675,7 @@ fn search_pattern_json_auto_reindexes_and_reports_current_state() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "healed index returns a bounded no-match status for the OLD marker; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
@@ -738,7 +738,7 @@ fn search_pattern_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "old marker returns a bounded no-match status from live fallback; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
@@ -1950,7 +1950,7 @@ fn r3_atomic_snapshot_second_success_does_not_retain_full_backup() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "retired symbol returns a bounded miss; stderr={err}"
     );
     let v: serde_json::Value =
@@ -2026,7 +2026,7 @@ fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "replaced symbol returns a bounded miss; stderr={err}"
     );
     let v: serde_json::Value =
@@ -2297,7 +2297,7 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         &store,
     );
     assert_eq!(
-        code, 0,
+        code, 1,
         "pre-crash symbol returns a bounded miss; stderr={err}"
     );
     let v: serde_json::Value =
