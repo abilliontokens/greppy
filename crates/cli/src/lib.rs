@@ -688,6 +688,13 @@ fn unknown_verb_refusal(argv: &[std::ffi::OsString]) -> Option<String> {
     {
         return Some(format!("error: unrecognized subcommand '{verb}'"));
     }
+    // An explicit ripgrep token owns every following option. In particular,
+    // `--json` is a valid ripgrep output flag as well as a Greppy navigation
+    // flag; diagnosing it here prevented `greppy rg --json ...` from ever
+    // reaching the byte-exact passthrough dispatcher.
+    if matches!(verb, "rg" | "ripgrep") {
+        return None;
+    }
     if let Some(flag) = rest
         .iter()
         .skip(1)
