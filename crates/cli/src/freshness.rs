@@ -677,24 +677,10 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
     // (Query commands only — the grep passthrough path never reaches here,
     // so the byte-exact passthrough contract is untouched.)
     if !path.exists() {
-        let shown_root = root.unwrap_or(".");
         if auto_reindex_enabled() {
-            let started = spawn_background_index(root, "first-use");
-            // First use has no snapshot that can become usable during a
-            // bounded join. Return as soon as the durable background job is
-            // launched instead of adding the stale-refresh wait to process
-            // spawn/dynamic-link latency. The caller gets the job status
-            // command below and can retry while the indexer continues in its
-            // independent process group.
-            if !path.exists() {
-                return Err(Error::Lock(format!(
-                    "first-use index {} for {}; no snapshot is ready yet; retry after `greppy index status --json` reports healthy=true (or run `greppy index {}` in the foreground)",
-                    if started { "started" } else { "is already running" },
-                    effective_root.display(),
-                    shown_root
-                )));
-            }
+            wait_for_first_use_index(root, &effective_root)?;
         } else {
+            let shown_root = root.unwrap_or(".");
             eprintln!(
                 "greppy: no index for {} — run `greppy index {}` first",
                 effective_root.display(),
@@ -723,13 +709,8 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
             .is_none()
     {
         drop(store);
-        let started = spawn_background_index(root, "first-use");
-        return Err(Error::Lock(format!(
-            "first-use index {} for {}; no snapshot is ready yet; retry after `greppy index status --json` reports healthy=true (or run `greppy index {}` in the foreground)",
-            if started { "started" } else { "is already running" },
-            effective_root.display(),
-            root.unwrap_or(".")
-        )));
+        wait_for_first_use_index(root, &effective_root)?;
+        return open_default_store(root);
     }
     let _ = workspace_locator::ensure_db_mode(&path);
     // Feature B: record that this store was just used to serve a query.
@@ -764,6 +745,137 @@ pub(crate) fn open_default_store(root: Option<&str>) -> Result<greppy_store::Sto
         }
     }
     Ok(store)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FirstUseIndexObservation {
+    Pending,
+    Published,
+    Failed(String),
+}
+
+fn observe_first_use_index(
+    job: Option<&serde_json::Value>,
+    snapshot_ready: bool,
+    owned_child_alive: bool,
+) -> FirstUseIndexObservation {
+    if let Some(job) = job {
+        let state = job
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        if state == "failed" {
+            return FirstUseIndexObservation::Failed(
+                job.get("last_error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("no error was recorded")
+                    .to_owned(),
+            );
+        }
+        let published_owner_alive = job
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .is_some_and(process_is_alive);
+        if owned_child_alive
+            || published_owner_alive
+            || (state == "launching" && job["pid"].is_null())
+        {
+            return FirstUseIndexObservation::Pending;
+        }
+        if snapshot_ready && state == "complete" {
+            return FirstUseIndexObservation::Published;
+        }
+        return FirstUseIndexObservation::Failed(format!(
+            "job owner exited before publishing a snapshot (last state: {state})"
+        ));
+    }
+    if snapshot_ready {
+        FirstUseIndexObservation::Published
+    } else if owned_child_alive {
+        FirstUseIndexObservation::Pending
+    } else {
+        FirstUseIndexObservation::Failed(
+            "job ended before publishing a snapshot or recording an error".into(),
+        )
+    }
+}
+
+fn first_use_snapshot_ready(effective_root: &std::path::Path) -> bool {
+    greppy_store::Store::open_with(
+        &workspace_locator::store_path(effective_root),
+        greppy_store::OpenOptions::read_only(),
+    )
+    .ok()
+    .and_then(|store| {
+        store
+            .get_workspace_state(effective_root.to_string_lossy().as_ref())
+            .ok()
+            .flatten()
+    })
+    .is_some()
+}
+
+/// A normal first query owns completion of the index it starts. There is no
+/// elapsed-time cutoff: a slow but live cold start (including model asset
+/// materialization) remains attached, while a failed or dead owner terminates
+/// immediately with the recorded cause. Process interruption still cancels
+/// the waiting query; the detached indexer keeps its existing durable contract.
+fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path) -> Result<()> {
+    let mut launch =
+        spawn_background_job_handle(root, "first-use", "index", None).ok_or_else(|| {
+            let detail = read_background_job(&background_job_path(effective_root))
+                .and_then(|job| {
+                    job.get("last_error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "the index process could not be started".into());
+            Error::Index(format!(
+                "first-use index failed for {}: {detail}",
+                effective_root.display()
+            ))
+        })?;
+    loop {
+        let owned_child_alive = match &mut launch {
+            BackgroundJobLaunch::Owned { child, .. } => match child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(_)) => false,
+                Err(error) => {
+                    return Err(Error::io(
+                        format!(
+                            "observe first-use index process for {}",
+                            effective_root.display()
+                        ),
+                        error,
+                    ))
+                }
+            },
+            BackgroundJobLaunch::Attached { .. } => false,
+        };
+        let job = read_background_job(launch.path());
+        match observe_first_use_index(
+            job.as_ref(),
+            first_use_snapshot_ready(effective_root),
+            owned_child_alive,
+        ) {
+            FirstUseIndexObservation::Pending => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            FirstUseIndexObservation::Published => {
+                if let BackgroundJobLaunch::Owned { child, .. } = &mut launch {
+                    let _ = child.wait();
+                }
+                return Ok(());
+            }
+            FirstUseIndexObservation::Failed(detail) => {
+                return Err(Error::Index(format!(
+                    "first-use index failed for {}: {detail}",
+                    effective_root.display()
+                )));
+            }
+        }
+    }
 }
 
 pub(crate) fn open_default_store_query_writer(root: Option<&str>) -> Result<greppy_store::Store> {
@@ -962,7 +1074,7 @@ pub(crate) fn cleanup_sqlite_sidecars(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod refresh_wait_tests {
-    use super::background_refresh_is_pending;
+    use super::{background_refresh_is_pending, observe_first_use_index, FirstUseIndexObservation};
 
     #[test]
     fn launch_record_without_writer_lock_is_still_pending() {
@@ -979,5 +1091,42 @@ mod refresh_wait_tests {
             "pid": null,
             "last_error": "fixture"
         })));
+    }
+
+    #[test]
+    fn healthy_slow_first_use_remains_pending_until_publication() {
+        let job = serde_json::json!({
+            "state": "loading_model",
+            "pid": null,
+            "completed_spans": 0,
+            "total_spans": 2
+        });
+        assert_eq!(
+            observe_first_use_index(Some(&job), false, true),
+            FirstUseIndexObservation::Pending
+        );
+        assert_eq!(
+            observe_first_use_index(None, true, false),
+            FirstUseIndexObservation::Published
+        );
+    }
+
+    #[test]
+    fn failed_and_dead_first_use_jobs_keep_their_failure_contract() {
+        let failed = serde_json::json!({
+            "state": "failed",
+            "pid": null,
+            "last_error": "fixture model load failed"
+        });
+        assert_eq!(
+            observe_first_use_index(Some(&failed), false, false),
+            FirstUseIndexObservation::Failed("fixture model load failed".into())
+        );
+        let dead = serde_json::json!({"state": "indexing", "pid": null});
+        assert!(matches!(
+            observe_first_use_index(Some(&dead), false, false),
+            FirstUseIndexObservation::Failed(detail)
+                if detail.contains("owner exited") && detail.contains("indexing")
+        ));
     }
 }
