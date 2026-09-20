@@ -44,6 +44,31 @@ fn index(repo: &Path, store: &Path) {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
 }
 
+fn only_graph_db_below(root: &Path) -> PathBuf {
+    fn visit(path: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                visit(&child, found);
+            } else if child.file_name().is_some_and(|name| name == "graph.db") {
+                found.push(child);
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    visit(root, &mut found);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected one graph.db below {root:?}: {found:?}"
+    );
+    found.pop().unwrap()
+}
+
 #[test]
 fn symbol_reads_never_mix_stale_spans_with_shifted_source() {
     let (repo, store) = fresh_workspace("shifted-source");
@@ -260,6 +285,72 @@ fn read_file_pages_and_expand_continues_at_the_named_line() {
         "{expanded}"
     );
     assert!(expanded.ends_with(" continues at 801\n"), "{expanded}");
+}
+
+#[test]
+fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
+    let (repo, store) = fresh_workspace("missing-linked-base");
+    let content = (1..=805)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    std::fs::write(repo.join("long.txt"), &content).unwrap();
+
+    // Initialize only the small continuation store. No graph index is built.
+    let (init_code, init_out, init_err) = run(
+        &repo,
+        &store,
+        &["read-file", "long.txt", "--lines", "1:1", "--handle"],
+    );
+    assert_eq!(init_code, 0, "{init_out}\n{init_err}");
+    assert!(init_out.contains("handle: geh2:"), "{init_out}");
+
+    let graph_db = only_graph_db_below(&store);
+    let missing_base = store.join("cleaned-base").join("graph.db");
+    let binding = serde_json::json!({
+        "version": 1,
+        "base_path": missing_base,
+        "base_commit": "0123456789abcdef0123456789abcdef01234567",
+        "project": "missing-linked-base",
+    });
+    rusqlite::Connection::open(&graph_db)
+        .unwrap()
+        .execute(
+            "INSERT INTO schema_meta(key, value) VALUES(?1, ?2)\n             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("store_cow.binding.v1", binding.to_string()),
+        )
+        .unwrap();
+
+    let (code, stdout, stderr) = run(&repo, &store, &["read-file", "long.txt", "--handle"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.starts_with("long.txt:1-400\nline 1\n"), "{stdout}");
+    assert!(stdout.contains("line 400\nhandle: geh2:"), "{stdout}");
+    assert!(!stdout.contains("line 401\n"), "{stdout}");
+    let id = stdout
+        .lines()
+        .find_map(|line| line.split("greppy expand ").nth(1))
+        .and_then(|tail| tail.split_whitespace().next())
+        .expect("continuation id");
+
+    let (expand_code, expanded, expand_err) = run(&repo, &store, &["expand", id]);
+    assert_eq!(expand_code, 0, "{expanded}\n{expand_err}");
+    assert!(
+        expanded.starts_with("long.txt:401-800\nline 401\n"),
+        "{expanded}"
+    );
+    assert!(!expanded.contains("line 400\n"), "{expanded}");
+    assert!(!expanded.contains("line 801\n"), "{expanded}");
+
+    let (range_code, range_out, range_err) = run(
+        &repo,
+        &store,
+        &["read-file", "long.txt", "--lines", "800:805", "--handle"],
+    );
+    assert_eq!(range_code, 0, "{range_out}\n{range_err}");
+    assert!(
+        range_out.starts_with("long.txt:800-805\nline 800\n"),
+        "{range_out}"
+    );
+    assert!(range_out.contains("line 805\nhandle: geh2:"), "{range_out}");
 }
 
 #[test]

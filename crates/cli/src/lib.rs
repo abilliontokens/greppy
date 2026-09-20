@@ -5570,18 +5570,28 @@ fn dispatch_expand(id: Option<&str>, json: bool, root: Option<&str>) -> Result<i
     if id.is_empty() {
         return Err(Error::Invalid("expand requires an id".into()));
     }
+    let lookup_id = resolve_expand_alias(root, id).unwrap_or_else(|| id.to_string());
+    // File and command-output continuations live in the workspace-local pack
+    // store and do not depend on graph completeness. Serve them before opening
+    // a linked-worktree overlay, whose immutable Base may have been cleaned up.
+    let pack_store = open_default_store_pack_writer(root)?;
+    if let Some(pack) = pack_store.get_expand_pack(&lookup_id)? {
+        #[cfg(feature = "bash-smart")]
+        if pack.command == "bash-smart" {
+            return bash_smart::expand(&pack_store, pack, json);
+        }
+        if pack.command == "read-file" {
+            return dispatch_read_expand(&pack_store, &pack, json, root);
+        }
+    }
+    drop(pack_store);
     let mut store = open_default_store_query_writer(root)?;
     maybe_reindex_stale(&mut store, root)?;
-    let lookup_id = resolve_expand_alias(root, id).unwrap_or_else(|| id.to_string());
     let Some(pack) = store.get_expand_pack(&lookup_id)? else {
         println!("expand: id not found or expired: {id}");
         return Ok(1);
     };
-    #[cfg(feature = "bash-smart")]
-    if pack.command == "bash-smart" {
-        return bash_smart::expand(&store, pack, json);
-    }
-    if matches!(pack.command.as_str(), "read-smart" | "read-file") {
+    if pack.command == "read-smart" {
         return dispatch_read_expand(&store, &pack, json, root);
     }
     let mut payload_text = pack.payload_text.clone();
