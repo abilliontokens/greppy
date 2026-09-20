@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-pub(super) const PROTOCOL_VERSION: u32 = 3;
+// Version 4 separates clients requiring actual backend status and strict macOS
+// Metal loading from live version 3 daemons, which could silently use CPU.
+pub(super) const PROTOCOL_VERSION: u32 = 4;
 const READER_WORKERS: usize = 4;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2181,6 +2183,18 @@ mod tests {
         assert_eq!(a.address(), b.address());
         assert_ne!(a.address(), c.address());
         assert!(a.address().contains("summary-"));
+    }
+
+    #[test]
+    fn new_clients_do_not_reuse_pre_gpu_contract_daemons() {
+        // Captured version 3 endpoint identities for the same Auto model.
+        // Reusing either would bypass the new loaded-backend/Metal contract.
+        for (kind, legacy) in [
+            ("embedding", "fe9209ef93b6fe7c4784c35e0eafac45"),
+            ("summary", "33cb66d9a4b281f23aa5491fc007924d"),
+        ] {
+            assert_ne!(endpoint_digest(kind, "model|prompt|auto", None), legacy);
+        }
     }
 
     #[test]
