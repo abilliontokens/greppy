@@ -1,9 +1,8 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
+#[allow(dead_code)]
 #[path = "../../build-support/localize_js_static.rs"]
 mod localize_js_static;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod tests {
     use super::localize_js_static::{
         local_icu_comdat_signatures, redefine_linux_archive_symbols, verify_local_icu_comdat_absent,
