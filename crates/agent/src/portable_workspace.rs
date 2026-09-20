@@ -1345,6 +1345,7 @@ fn apply_from_core(
             ),
         });
     }
+    test_apply_hook("apply-after-baseline-validation", None);
 
     let index_path = git_path(&canonical_target, "index")?;
     let index_before = hash_optional_file(&index_path)?;
@@ -1385,6 +1386,7 @@ fn apply_from_core(
         // This narrows, but cannot eliminate, the race with an uncooperative
         // writer between observation and replacement. Recovery remains
         // conservative and never treats an unknown state as ours.
+        ensure_safe_path_ancestors(&canonical_target, path, ref_name)?;
         if visible_path_state(&canonical_target.join(path))? != expected.baseline {
             return Err(WorkspaceError::Conflict {
                 ref_name: ref_name.into(),
@@ -1410,7 +1412,12 @@ fn apply_from_core(
             test_crash_point("apply-after-first-path");
         }
     }
-    if let Err(error) = materialize_hardlink_groups(&canonical_target, &proposal.hardlink_groups) {
+    if let Err(error) = materialize_hardlink_groups_checked(
+        &canonical_target,
+        &proposal.hardlink_groups,
+        &journal.path_states,
+        ref_name,
+    ) {
         restore_apply_journal(core, &journal_path, &journal)?;
         return Err(error);
     }
@@ -1726,7 +1733,7 @@ fn apply_path_expectations(
         .map(|path| {
             Ok(ApplyPathExpectation {
                 path: path.clone(),
-                baseline: visible_path_state(&repository.join(path))?,
+                baseline: pinned_baseline_path_state(repository, proposal, path)?,
                 final_state: git_tree_path_state(repository, &proposal.final_tree, path)?,
             })
         })
@@ -1740,16 +1747,15 @@ fn journal_path_expectations(
     journal_path: &Path,
 ) -> Result<Vec<ApplyPathExpectation>, WorkspaceError> {
     if journal.path_states.is_empty() {
-        // Schema-1 journals predate per-path states. Their pinned baseline and
-        // final trees are still sufficient for conservative classification;
-        // never fall back to unconditional restoration.
+        // Schema-1 journals predate per-path states. Reconstruct them from the
+        // pinned proposal rather than trusting the current working tree.
         return journal
             .affected_paths
             .iter()
             .map(|path| {
                 Ok(ApplyPathExpectation {
                     path: path.clone(),
-                    baseline: git_tree_path_state(repository, &proposal.baseline_tree, path)?,
+                    baseline: pinned_baseline_path_state(repository, proposal, path)?,
                     final_state: git_tree_path_state(repository, &proposal.final_tree, path)?,
                 })
             })
@@ -1763,6 +1769,7 @@ fn journal_path_expectations(
     }
     for (path, expected) in journal.affected_paths.iter().zip(&journal.path_states) {
         if expected.path != *path
+            || expected.baseline != pinned_baseline_path_state(repository, proposal, path)?
             || expected.final_state != git_tree_path_state(repository, &proposal.final_tree, path)?
         {
             return Err(WorkspaceError::Tampered {
@@ -1772,6 +1779,40 @@ fn journal_path_expectations(
         }
     }
     Ok(journal.path_states.clone())
+}
+
+fn pinned_baseline_path_state(
+    repository: &Path,
+    proposal: &ProposalRecord,
+    path: &str,
+) -> Result<ApplyPathState, WorkspaceError> {
+    validate_apply_path(path)?;
+    if let Some(entry) = proposal
+        .baseline
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+    {
+        return Ok(match entry.kind {
+            EntryKind::Tombstone => ApplyPathState::Missing,
+            EntryKind::File => ApplyPathState::File {
+                content_hash: entry.content_hash.clone(),
+                mode: expected_file_mode(entry.mode),
+            },
+            EntryKind::Symlink => ApplyPathState::Symlink {
+                target_hash: entry.content_hash.clone(),
+            },
+        });
+    }
+    if proposal
+        .baseline
+        .directories
+        .iter()
+        .any(|directory| directory.path == path)
+    {
+        return Ok(ApplyPathState::Directory);
+    }
+    git_tree_path_state(repository, &proposal.baseline_tree, path)
 }
 
 fn git_tree_path_state(
@@ -1827,11 +1868,11 @@ fn git_tree_path_state(
     match mode {
         "100644" => Ok(ApplyPathState::File {
             content_hash: hash,
-            mode: 0o644,
+            mode: expected_file_mode(0o644),
         }),
         "100755" => Ok(ApplyPathState::File {
             content_hash: hash,
-            mode: 0o755,
+            mode: expected_file_mode(0o755),
         }),
         "120000" => Ok(ApplyPathState::Symlink { target_hash: hash }),
         _ => Err(WorkspaceError::Tampered {
@@ -1895,6 +1936,16 @@ fn visible_file_mode(_metadata: &fs::Metadata) -> u32 {
     0o644
 }
 
+#[cfg(unix)]
+fn expected_file_mode(mode: u32) -> u32 {
+    mode & 0o777
+}
+
+#[cfg(windows)]
+fn expected_file_mode(_mode: u32) -> u32 {
+    0o644
+}
+
 fn ensure_paths_match_baseline(
     repository: &Path,
     ref_name: &str,
@@ -1902,6 +1953,7 @@ fn ensure_paths_match_baseline(
 ) -> Result<(), WorkspaceError> {
     let mut conflicts = Vec::new();
     for expected in expectations {
+        ensure_safe_path_ancestors(repository, &expected.path, ref_name)?;
         if visible_path_state(&repository.join(&expected.path))? != expected.baseline {
             conflicts.push(expected.path.clone());
         }
@@ -1933,6 +1985,7 @@ fn classify_recovery_paths(
     let mut classified = Vec::with_capacity(expectations.len());
     let mut conflicts = Vec::new();
     for expected in expectations {
+        ensure_safe_path_ancestors(repository, &expected.path, ref_name)?;
         let observed = visible_path_state(&repository.join(&expected.path))?;
         if observed == expected.baseline {
             classified.push((expected.path.clone(), RecoveryPathClass::Baseline));
@@ -2019,6 +2072,38 @@ fn validate_apply_path(path: &str) -> Result<(), WorkspaceError> {
             path: value.into(),
             detail: "proposal contains an unsafe apply path".into(),
         });
+    }
+    Ok(())
+}
+
+fn ensure_safe_path_ancestors(
+    repository: &Path,
+    relative: &str,
+    ref_name: &str,
+) -> Result<(), WorkspaceError> {
+    validate_apply_path(relative)?;
+    let mut ancestor = repository.to_path_buf();
+    let Some(parent) = Path::new(relative).parent() else {
+        return Ok(());
+    };
+    for component in parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        ancestor.push(component);
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(WorkspaceError::Conflict {
+                    ref_name: ref_name.into(),
+                    detail: format!(
+                        "apply preserved a substituted non-directory ancestor of {relative}"
+                    ),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
@@ -2154,6 +2239,7 @@ fn restore_apply_journal(
                 path: journal_path.to_path_buf(),
                 detail: format!("apply journal has no state for {path}"),
             })?;
+        ensure_safe_path_ancestors(&repository, path, &journal.ref_name)?;
         let observed = visible_path_state(&repository.join(path))?;
         if observed != expectation.baseline && observed != expectation.final_state {
             let _ = fs::remove_file(&index);
@@ -2168,6 +2254,7 @@ fn restore_apply_journal(
             .iter()
             .find(|expected| expected.path == *path)
             .expect("restore paths were derived from expectations");
+        ensure_safe_path_ancestors(&repository, path, &journal.ref_name)?;
         let observed = visible_path_state(&repository.join(path))?;
         if observed != expectation.baseline && observed != expectation.final_state {
             let _ = fs::remove_file(&index);
@@ -2175,6 +2262,17 @@ fn restore_apply_journal(
                 ref_name: journal.ref_name.clone(),
                 detail: format!("apply recovery preserved a late external change to {path}"),
             });
+        }
+        // Dirty, untracked, and deleted paths have an exact raw baseline in
+        // the proposal CAS. Restore those directly below, once, instead of
+        // first writing a Git-normalized approximation with checkout-index.
+        if proposal
+            .baseline
+            .entries
+            .iter()
+            .any(|entry| entry.path == *path)
+        {
+            continue;
         }
         if expectation.baseline == ApplyPathState::Missing {
             remove_visible_path(&repository.join(path))?;
@@ -2487,6 +2585,79 @@ fn materialize_hardlink_groups(
             }
             let temporary = temporary_apply_path(&target);
             fs::hard_link(&source, &temporary)?;
+            if let Err(error) = replace_visible_path(&temporary, &target) {
+                let _ = fs::remove_file(&temporary);
+                return Err(error.into());
+            }
+            if let Some(parent) = target.parent() {
+                sync_directory(parent)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_hardlink_groups_checked(
+    repository: &Path,
+    groups: &[Vec<String>],
+    expectations: &[ApplyPathExpectation],
+    ref_name: &str,
+) -> Result<(), WorkspaceError> {
+    for group in groups {
+        for relative in group {
+            ensure_safe_path_ancestors(repository, relative, ref_name)?;
+            let expected = expectations
+                .iter()
+                .find(|expected| expected.path == *relative)
+                .ok_or_else(|| WorkspaceError::Tampered {
+                    path: repository.join(relative),
+                    detail: "proposal hardlink path has no apply expectation".into(),
+                })?;
+            if visible_path_state(&repository.join(relative))? != expected.final_state {
+                return Err(WorkspaceError::Conflict {
+                    ref_name: ref_name.into(),
+                    detail: format!("proposal hardlink path changed before relinking: {relative}"),
+                });
+            }
+        }
+        let source_relative = group.first().ok_or_else(|| WorkspaceError::Tampered {
+            path: repository.to_path_buf(),
+            detail: "proposal hardlink group is empty".into(),
+        })?;
+        let source = repository.join(source_relative);
+        for relative in &group[1..] {
+            ensure_safe_path_ancestors(repository, source_relative, ref_name)?;
+            ensure_safe_path_ancestors(repository, relative, ref_name)?;
+            let target = repository.join(relative);
+            let source_expected = expectations
+                .iter()
+                .find(|expected| expected.path == *source_relative)
+                .expect("group expectations were validated above");
+            let target_expected = expectations
+                .iter()
+                .find(|expected| expected.path == **relative)
+                .expect("group expectations were validated above");
+            if visible_path_state(&source)? != source_expected.final_state
+                || visible_path_state(&target)? != target_expected.final_state
+            {
+                return Err(WorkspaceError::Conflict {
+                    ref_name: ref_name.into(),
+                    detail: format!("proposal hardlink group changed before relinking {relative}"),
+                });
+            }
+            let temporary = temporary_apply_path(&target);
+            fs::hard_link(&source, &temporary)?;
+            ensure_safe_path_ancestors(repository, source_relative, ref_name)?;
+            ensure_safe_path_ancestors(repository, relative, ref_name)?;
+            if visible_path_state(&source)? != source_expected.final_state
+                || visible_path_state(&target)? != target_expected.final_state
+            {
+                let _ = fs::remove_file(&temporary);
+                return Err(WorkspaceError::Conflict {
+                    ref_name: ref_name.into(),
+                    detail: format!("proposal hardlink group changed while relinking {relative}"),
+                });
+            }
             if let Err(error) = replace_visible_path(&temporary, &target) {
                 let _ = fs::remove_file(&temporary);
                 return Err(error.into());
@@ -3977,8 +4148,13 @@ mod tests {
         git(&repo, &["config", "user.email", "test@example.test"]);
         git(&repo, &["config", "user.name", "Test"]);
         fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        fs::create_dir(repo.join("nested")).unwrap();
+        fs::write(repo.join("nested/tracked.txt"), "nested base\n").unwrap();
         fs::write(repo.join(".gitignore"), "cache/\n").unwrap();
-        git(&repo, &["add", "tracked.txt", ".gitignore"]);
+        git(
+            &repo,
+            &["add", "tracked.txt", "nested/tracked.txt", ".gitignore"],
+        );
         git(&repo, &["commit", "-qm", "base"]);
         // Exercise the Windows/Git-for-Windows checkout conversion explicitly
         // on every host. Recovery must restore the captured dirty bytes, not
@@ -4058,6 +4234,8 @@ mod tests {
         fs::create_dir_all(&worktree).unwrap();
         fs::write(worktree.join(".gitignore"), "cache/\n").unwrap();
         fs::write(worktree.join("tracked.txt"), "dirty\n").unwrap();
+        fs::create_dir(worktree.join("nested")).unwrap();
+        fs::write(worktree.join("nested/tracked.txt"), "nested base\n").unwrap();
         fs::write(worktree.join("untracked.txt"), "user\n").unwrap();
         fs::write(worktree.join("baseline-linked-a.txt"), "baseline-linked\n").unwrap();
         fs::hard_link(
@@ -4269,6 +4447,20 @@ mod tests {
             .core
             .write(&workspace.handle, "tracked.txt", 0, b"agent\n")
             .unwrap();
+        fs::write(
+            workspace.worktree_path().join("nested/tracked.txt"),
+            "nested agent\n",
+        )
+        .unwrap();
+        workspace
+            .core
+            .write(
+                &workspace.handle,
+                "nested/tracked.txt",
+                0,
+                b"nested agent\n",
+            )
+            .unwrap();
         fs::write(workspace.worktree_path().join("linked-a.txt"), b"linked\n").unwrap();
         fs::hard_link(
             workspace.worktree_path().join("linked-a.txt"),
@@ -4458,10 +4650,14 @@ mod tests {
 
         fs::remove_file(repo.join("baseline-linked-b.txt")).unwrap();
         fs::write(repo.join("baseline-linked-b.txt"), b"baseline-linked\n").unwrap();
+        // A same-content topology break is indistinguishable from an external
+        // relink or our own interrupted replacement. Fail closed and retain
+        // the journal rather than claiming every such crash is recoverable.
         assert!(matches!(
             recover_apply_journals(&recovery_core),
             Err(WorkspaceError::Conflict { .. })
         ));
+        assert!(journal_path.exists());
         assert_eq!(
             fs::read(repo.join("baseline-linked-b.txt")).unwrap(),
             b"baseline-linked\n"
@@ -4501,7 +4697,7 @@ mod tests {
 
         let hook_repo = repo.clone();
         *APPLY_TEST_HOOK.lock().unwrap() = Some(Box::new(move |point, _| {
-            if point == "apply-before-preflight" {
+            if point == "apply-after-baseline-validation" {
                 fs::write(hook_repo.join("tracked.txt"), b"external prewrite\n").unwrap();
             }
         }));
@@ -4514,8 +4710,56 @@ mod tests {
             fs::read(repo.join("tracked.txt")).unwrap(),
             b"external prewrite\n"
         );
+        let prewrite_journal_path = fs::read_dir(recovery_core.root().join("apply-journals"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .unwrap();
+        let prewrite_journal_bytes = fs::read(&prewrite_journal_path).unwrap();
+        let mut tampered_states: ApplyJournal =
+            serde_json::from_slice(&prewrite_journal_bytes).unwrap();
+        tampered_states.path_states[0].baseline = ApplyPathState::Directory;
+        fs::write(
+            &prewrite_journal_path,
+            serde_json::to_vec(&tampered_states).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            recover_apply_journals(&recovery_core),
+            Err(WorkspaceError::Tampered { .. })
+        ));
+        fs::write(&prewrite_journal_path, prewrite_journal_bytes).unwrap();
         fs::write(repo.join("tracked.txt"), b"dirty\n").unwrap();
         recover_apply_journals(&recovery_core).unwrap();
+
+        #[cfg(unix)]
+        {
+            let outside = temp.path().join("outside-nested");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("tracked.txt"), b"outside sentinel\n").unwrap();
+            let hook_repo = repo.clone();
+            let hook_outside = outside.clone();
+            *APPLY_TEST_HOOK.lock().unwrap() = Some(Box::new(move |point, _| {
+                if point == "apply-before-preflight" {
+                    fs::remove_dir_all(hook_repo.join("nested")).unwrap();
+                    std::os::unix::fs::symlink(&hook_outside, hook_repo.join("nested")).unwrap();
+                }
+            }));
+            assert!(matches!(
+                apply_proposal(&repo, &ref_name),
+                Err(WorkspaceError::Conflict { .. })
+            ));
+            *APPLY_TEST_HOOK.lock().unwrap() = None;
+            assert_eq!(
+                fs::read(outside.join("tracked.txt")).unwrap(),
+                b"outside sentinel\n"
+            );
+            fs::remove_file(repo.join("nested")).unwrap();
+            fs::create_dir(repo.join("nested")).unwrap();
+            fs::write(repo.join("nested/tracked.txt"), b"nested base\n").unwrap();
+            recover_apply_journals(&recovery_core).unwrap();
+        }
 
         let hook_repo = repo.clone();
         *APPLY_TEST_HOOK.lock().unwrap() = Some(Box::new(move |point, path| {
@@ -4535,6 +4779,25 @@ mod tests {
         materialize_git_tree_entry(&repo, &proposal.final_tree, "tracked.txt").unwrap();
         recover_apply_journals(&recovery_core).unwrap();
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
+
+        let hook_repo = repo.clone();
+        *APPLY_TEST_HOOK.lock().unwrap() = Some(Box::new(move |point, path| {
+            if point == "apply-after-path" && path == Some("linked-b.txt") {
+                fs::write(hook_repo.join("linked-b.txt"), b"external hardlink\n").unwrap();
+            }
+        }));
+        assert!(matches!(
+            apply_proposal(&repo, &ref_name),
+            Err(WorkspaceError::Conflict { .. })
+        ));
+        *APPLY_TEST_HOOK.lock().unwrap() = None;
+        assert_eq!(
+            fs::read(repo.join("linked-b.txt")).unwrap(),
+            b"external hardlink\n"
+        );
+        materialize_git_tree_entry(&repo, &proposal.final_tree, "linked-b.txt").unwrap();
+        recover_apply_journals(&recovery_core).unwrap();
+        assert!(!repo.join("linked-b.txt").exists());
 
         abort_apply_child(&data, &repo, &ref_name);
         assert_eq!(fs::read(&index).unwrap(), index_before);
