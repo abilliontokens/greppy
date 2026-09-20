@@ -3439,20 +3439,22 @@ fn web_goto_does_not_treat_ordinary_page_text_as_a_servo_error() {
 import {{ chromium }} from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
-const response = await page.goto({url:?});
+await page.goto({url:?});
 const marker = await page.locator('#loaded').textContent();
+if (marker !== "ordinary-page-loaded") throw new Error(`wrong page marker: ${{marker}}`);
+console.log(marker);
 await browser.close();
-return {{ ok: response.ok(), marker }};
 "#
         ),
         None,
         Duration::from_secs(30),
     );
     assert_eq!(ran.status, "ok", "{ran:?}");
-    assert_eq!(ran.result.as_ref().unwrap()["value"]["ok"], true, "{ran:?}");
-    assert_eq!(
-        ran.result.as_ref().unwrap()["value"]["marker"],
-        "ordinary-page-loaded",
+    assert!(
+        ran.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ordinary-page-loaded"),
         "{ran:?}"
     );
 }
@@ -3496,7 +3498,9 @@ import {{ chromium }} from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
 await page.goto({:?}, {{ waitUntil: {:?} }});
-return await page.locator({marker:?}).textContent();
+const marker = await page.locator({marker:?}).textContent();
+if (marker !== "parser-finished") throw new Error(`wrong page marker: ${{marker}}`);
+console.log(marker);
 "#,
                 format!("{}{path}", fixture.origin),
                 wait_until,
@@ -3515,9 +3519,11 @@ return await page.locator({marker:?}).textContent();
             .recv_timeout(Duration::from_secs(10))
             .unwrap_or_else(|error| panic!("{name} navigation did not complete: {error}"));
         assert_eq!(completed.status, "ok", "{completed:?}");
-        assert_eq!(
-            completed.result.as_ref().unwrap()["value"],
-            "parser-finished",
+        assert!(
+            completed.result.as_ref().unwrap()["stdout"]
+                .as_str()
+                .unwrap_or("")
+                .contains("parser-finished"),
             "{completed:?}"
         );
         worker.join().expect("join async navigation run");
@@ -3536,7 +3542,8 @@ const marker = await page.locator('#parsed').textContent();
 await page.evaluate((url) => fetch(url).then(() => true), {:?});
 await page.waitForLoadState("load");
 await page.evaluate((url) => fetch(url).then(() => true), {:?});
-return marker;
+if (marker !== "dom-content-loaded") throw new Error(`wrong page marker: ${{marker}}`);
+console.log(marker);
 "#,
             format!("{}/dcl-before-load", fixture.origin),
             format!("{}/dcl-returned", fixture.origin),
@@ -3558,9 +3565,11 @@ return marker;
         .recv_timeout(Duration::from_secs(10))
         .unwrap_or_else(|error| panic!("load-state navigation did not complete: {error}"));
     assert_eq!(completed.status, "ok", "{completed:?}");
-    assert_eq!(
-        completed.result.as_ref().unwrap()["value"],
-        "dom-content-loaded",
+    assert!(
+        completed.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("dom-content-loaded"),
         "{completed:?}"
     );
     worker.join().expect("join async load-state run");
