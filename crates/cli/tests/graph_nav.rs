@@ -1054,6 +1054,16 @@ fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
         )
         .unwrap();
     }
+    for scope in ["a", "b"] {
+        std::fs::create_dir_all(repo.join("src").join(scope)).unwrap();
+        for index in 0..2 {
+            std::fs::write(
+                repo.join(format!("src/{scope}/path_{index}.rs")),
+                "pub fn path_match() {}\n",
+            )
+            .unwrap();
+        }
+    }
     std::fs::write(
         repo.join("src/kinds.rs"),
         "pub struct ContractKind;\npub fn makeContractKind() {}\n",
@@ -1100,6 +1110,35 @@ fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
     );
 
     for command in ["search-symbol", "search-pattern"] {
+        let args = [command, "path_match", "--path", "src/b", "--limit", "1"];
+        let (code, text, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "{text}\n{err}");
+        assert!(text.contains("src/b/path_0.rs:1"), "{text}");
+        assert!(!text.contains("src/a/"), "{text}");
+        let mut json_args = args.to_vec();
+        json_args.push("--json");
+        let (code, out, err) = run(&json_args, &repo, &store);
+        assert_eq!(code, 0, "{out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["total_exact"], 2,
+            "count must exclude other directory: {out}"
+        );
+        assert_eq!(value["shown"], 1, "{out}");
+        assert_eq!(value["omitted"], 1, "{out}");
+        let location = if command == "search-symbol" {
+            format!(
+                "{}:{}",
+                value["hits"][0]["file_path"].as_str().unwrap(),
+                value["hits"][0]["start_line"].as_u64().unwrap()
+            )
+        } else {
+            value["hits"][0]["matches"][0]["location"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(location, "src/b/path_0.rs:1");
         let (code, out, err) = run(
             &[command, "ContractKind", "--kind", "struct", "--json"],
             &repo,
@@ -1126,6 +1165,12 @@ fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
                 if json {
                     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
                     assert_eq!(value["total_exact"], 0, "{out}");
+                    let status_key = if command == "search-symbol" {
+                        "status"
+                    } else {
+                        "result_status"
+                    };
+                    assert_eq!(value[status_key], "no_matches", "{out}");
                     assert_eq!(value["hits"].as_array().unwrap().len(), 0, "{out}");
                 } else {
                     assert!(out.contains("no_matches"), "{out}");
@@ -1145,6 +1190,10 @@ fn search_pattern_limited_summary_does_not_expand_omitted_files() {
         )
         .unwrap();
     }
+    // Name-order scanning would put this file first, but the shared result
+    // order prefers files with fewer matches. Exercise a real ranking split.
+    std::fs::write(repo.join("src/summary_00.rs"),
+        "pub fn limited_summary_marker() {}\n// limited_summary_marker\n// limited_summary_marker\n").unwrap();
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "{out}\n{err}");
     let (code, out, err) = run(
@@ -1153,7 +1202,37 @@ fn search_pattern_limited_summary_does_not_expand_omitted_files() {
         &store,
     );
     assert_eq!(code, 0, "{out}\n{err}");
-    assert!(out.contains("30 matches in 30 files; showing 3"), "{out}");
+    assert!(out.contains("32 matches in 30 files; showing 3"), "{out}");
+    let text_locations = out
+        .lines()
+        .filter(|line| line.starts_with("src/summary_"))
+        .map(|line| line.split_whitespace().next().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let (code, json, err) = run(
+        &[
+            "search-pattern",
+            "limited_summary_marker",
+            "--limit",
+            "3",
+            "--json",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{json}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["total_exact"], 32, "{json}");
+    let json_locations = value["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["matches"][0]["location"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_locations, json_locations,
+        "both formats must rank the same rows"
+    );
+    assert_eq!(text_locations[0], "src/summary_01.rs:1");
     assert!(
         !out.contains("src/summary_29.rs"),
         "omitted paths must not leak through the summary: {out}"
