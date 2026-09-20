@@ -127,8 +127,7 @@ function navigationTimeout(ownerTimeout, options, prefix) {
     if (
       options.waitUntil != null &&
       options.waitUntil !== "load" &&
-      options.waitUntil !== "domcontentloaded" &&
-      options.waitUntil !== "commit"
+      options.waitUntil !== "domcontentloaded"
     ) {
       throwUnsupported(`${prefix}.waitUntil`);
     }
@@ -2339,7 +2338,7 @@ class Page {
   }
 
   _emitLoad(waitUntil = "load") {
-    if (waitUntil !== "commit") this._emit("domcontentloaded", this);
+    this._emit("domcontentloaded", this);
     if (waitUntil === "load") this._emit("load", this);
   }
 

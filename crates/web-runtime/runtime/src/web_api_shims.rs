@@ -25,16 +25,15 @@ const SHIM_JS: &str = r#"(function () {
   // Servo's HeadParsed signal only says that the head has been parsed. Keep
   // the DOMContentLoaded milestone separate so navigation waits do not return
   // while the parser or a deferred script is still running.
-  var lifecycle = { domContentLoaded: document.readyState !== 'loading' };
-  Object.defineProperty(globalThis, '__greppyLifecycle', {
-    value: lifecycle,
+  var domContentLoaded = document.readyState === 'complete';
+  Object.defineProperty(globalThis, '__greppyDOMContentLoaded', {
+    get: function () { return domContentLoaded; },
     configurable: false,
     enumerable: false,
-    writable: false,
   });
-  if (!lifecycle.domContentLoaded) {
-    document.addEventListener('DOMContentLoaded', function () {
-      lifecycle.domContentLoaded = true;
+  if (!domContentLoaded) {
+    document.addEventListener('DOMContentLoaded', function (event) {
+      if (event.isTrusted) domContentLoaded = true;
     }, { once: true });
   }
 
@@ -127,7 +126,7 @@ mod tests {
             "requestIdleCallback",
             "cancelIdleCallback",
             "serviceWorker",
-            "__greppyLifecycle",
+            "__greppyDOMContentLoaded",
             "DOMContentLoaded",
         ] {
             assert!(

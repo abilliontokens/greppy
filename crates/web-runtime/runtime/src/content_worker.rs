@@ -1011,7 +1011,6 @@ impl ContentEngine {
     ) -> bool {
         match (webview.load_status(), until) {
             (LoadStatus::Complete, _) => true,
-            (LoadStatus::HeadParsed, WaitUntil::Commit) => true,
             // HeadParsed is earlier than DOMContentLoaded. In particular,
             // readyState `interactive` is also too early while deferred
             // scripts are still pending, so use the document-start listener
@@ -1022,7 +1021,7 @@ impl ContentEngine {
                 *last_js = Instant::now();
                 match self.evaluate_until(
                     webview.clone(),
-                    "Boolean(globalThis.__greppyLifecycle && globalThis.__greppyLifecycle.domContentLoaded)",
+                    "globalThis.__greppyDOMContentLoaded === true",
                     Duration::from_millis(150),
                 ) {
                     Ok(JSValue::Boolean(loaded)) => loaded,
@@ -1980,7 +1979,7 @@ impl ContentEngine {
                 let loading = webview.clone();
                 let expected = url.clone();
                 let denied = Rc::clone(&delegate);
-                let until = WaitUntil::from_params(&params);
+                let until = WaitUntil::from_params(&params)?;
                 let engine = &*self;
                 let mut last_stamp = Instant::now() - Duration::from_millis(200);
                 if !self.spin_until_loaded_until(&loading, call_timeout(&params), until, || {
@@ -2105,6 +2104,11 @@ impl ContentEngine {
                     Ok(JSValue::Boolean(matches)) => matches,
                     _ => false,
                 };
+                // Servo 0.5 exposes no typed transport-failure callback for a
+                // pass-through WebResourceLoad. A missing recorded response is
+                // also normal for some CONNECT-tunnel traffic, so keep this as
+                // a deliberately narrow structural fallback matching Servo's
+                // baked-in neterror.html instead of classifying body text.
                 if recorded_status.is_none() && servo_error_shell {
                     return Err(io::Error::other(format!(
                         "navigation failed: {}",
@@ -2789,7 +2793,7 @@ impl ContentEngine {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
                 let loading = webview.clone();
-                let until = WaitUntil::from_params(&params);
+                let until = WaitUntil::from_params(&params)?;
                 if !self.spin_until_loaded_until(&loading, call_timeout(&params), until, || true)? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -4446,17 +4450,14 @@ mod serialize_tests {
     #[test]
     fn wait_until_keeps_navigation_milestones_distinct() {
         assert_eq!(
-            WaitUntil::from_params(&json!({ "waitUntil": "load" })),
+            WaitUntil::from_params(&json!({ "waitUntil": "load" })).unwrap(),
             WaitUntil::Load
         );
         assert_eq!(
-            WaitUntil::from_params(&json!({ "waitUntil": "domcontentloaded" })),
+            WaitUntil::from_params(&json!({ "waitUntil": "domcontentloaded" })).unwrap(),
             WaitUntil::DomContentLoaded
         );
-        assert_eq!(
-            WaitUntil::from_params(&json!({ "waitUntil": "commit" })),
-            WaitUntil::Commit
-        );
+        assert!(WaitUntil::from_params(&json!({ "waitUntil": "commit" })).is_err());
     }
 
     #[test]
@@ -5468,15 +5469,17 @@ pub fn run() -> io::Result<()> {
 enum WaitUntil {
     Load,
     DomContentLoaded,
-    Commit,
 }
 
 impl WaitUntil {
-    fn from_params(params: &serde_json::Value) -> Self {
+    fn from_params(params: &serde_json::Value) -> io::Result<Self> {
         match params.get("waitUntil").and_then(|value| value.as_str()) {
-            Some("domcontentloaded") => Self::DomContentLoaded,
-            Some("commit") => Self::Commit,
-            _ => Self::Load,
+            Some("domcontentloaded") => Ok(Self::DomContentLoaded),
+            None | Some("load") => Ok(Self::Load),
+            Some(value) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported waitUntil value `{value}`"),
+            )),
         }
     }
 }
