@@ -6989,7 +6989,6 @@ struct SearchCodeMatchLine {
 
 #[derive(Debug)]
 struct SearchCodeDefinitionEntry {
-    node_id: i64,
     qualified_name: String,
     file: String,
     start_line: i64,
@@ -6997,12 +6996,6 @@ struct SearchCodeDefinitionEntry {
     source: String,
     handle: String,
     matches: Vec<SearchCodeMatchLine>,
-}
-
-#[derive(Debug)]
-enum SearchCodeEntry {
-    Definition(SearchCodeDefinitionEntry),
-    Unenclosed(SearchCodeMatchLine),
 }
 
 fn parse_search_code_match(hit: &greppy_search::CodeHit) -> Option<SearchCodeMatchLine> {
@@ -7103,11 +7096,22 @@ fn live_grep_code_hits_pattern(
     root_path: &std::path::Path,
     fixed: bool,
 ) -> Result<Vec<greppy_search::CodeHit>> {
+    live_grep_code_hits_pattern_scoped(query, root_path, fixed, &QueryPathFilters::default())
+}
+
+fn live_grep_code_hits_pattern_scoped(
+    query: &str,
+    root_path: &std::path::Path,
+    fixed: bool,
+    path_filters: &QueryPathFilters,
+) -> Result<Vec<greppy_search::CodeHit>> {
     let overrides = discover_overrides_from_env()?;
-    let entries = greppy_discover::walk_with_policy_and_overrides(
+    let prefixes = path_filters.repo_prefixes();
+    let entries = greppy_discover::walk_scoped_with_policy_and_overrides(
         root_path,
         &greppy_discover::SkipPolicy::walk_default(),
         &overrides,
+        (!path_filters.is_empty()).then_some(prefixes.as_slice()),
     )?;
     let paths = entries
         .into_iter()
@@ -7496,6 +7500,13 @@ impl QueryPathFilters {
             .iter()
             .map(|filter| filter.shown.as_str())
             .collect::<Vec<_>>())
+    }
+
+    fn repo_prefixes(&self) -> Vec<String> {
+        self.filters
+            .iter()
+            .filter_map(|filter| filter.repo_prefix.clone())
+            .collect()
     }
 }
 
