@@ -276,6 +276,46 @@ mod tests {
     }
 
     #[test]
+    fn css_named_container_queries_are_valid_without_weakening_syntax_errors() {
+        let valid = br#"@container mail-content-editor (max-width: 460px) {
+  .editor { color: red; }
+}
+@container sidebar style(--theme: dark) {
+  .message { display: block; }
+}
+"#;
+        assert_eq!(
+            syntax_counts(Language::Css, valid),
+            Some(SyntaxCounts {
+                errors: 0,
+                missing: 0
+            })
+        );
+        assert_eq!(first_syntax_diagnostic(Language::Css, valid), None);
+
+        let malformed_query = br#"@container mail-content-editor (max-width 460px) {
+  .editor { color: red; }
+}
+"#;
+        let query_counts = syntax_counts(Language::Css, malformed_query).unwrap();
+        assert!(
+            query_counts.errors + query_counts.missing > 0,
+            "malformed container query must remain an atomic edit failure"
+        );
+        assert!(first_syntax_diagnostic(Language::Css, malformed_query).is_some());
+
+        let malformed_body = br#"@container mail-content-editor (max-width: 460px) {
+  .editor { color: red; }
+"#;
+        let body_counts = syntax_counts(Language::Css, malformed_body).unwrap();
+        assert!(
+            body_counts.errors + body_counts.missing > 0,
+            "malformed container body must remain an atomic edit failure"
+        );
+        assert!(first_syntax_diagnostic(Language::Css, malformed_body).is_some());
+    }
+
+    #[test]
     fn applies_high_to_low_without_shifting() {
         let s = snap(b"aaa bbb ccc");
         let applied =
