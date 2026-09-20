@@ -2025,7 +2025,7 @@ fn ensure_baseline_hardlink_integrity(
             return Err(WorkspaceError::Conflict {
                 ref_name: ref_name.into(),
                 detail: format!(
-                    "apply recovery preserved an externally changed hardlink group: {}",
+                    "apply recovery preserved an externally changed hardlink group whose members no longer share one filesystem identity: {}",
                     group.join(", ")
                 ),
             });
@@ -2052,9 +2052,43 @@ fn hardlink_group_matches(repository: &Path, group: &[String]) -> Result<bool, W
 }
 
 #[cfg(windows)]
-fn hardlink_group_matches(_repository: &Path, _group: &[String]) -> Result<bool, WorkspaceError> {
-    // Windows lacks a stable std-only file identity. Content/type checks still
-    // protect bytes; topology verification remains best-effort on this target.
+fn hardlink_group_matches(repository: &Path, group: &[String]) -> Result<bool, WorkspaceError> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    fn identity(path: &Path) -> Result<(u32, u64), WorkspaceError> {
+        let file = fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)?;
+        let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        let success = unsafe {
+            GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr())
+        };
+        if success == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let information = unsafe { information.assume_init() };
+        Ok((
+            information.dwVolumeSerialNumber,
+            ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
+        ))
+    }
+
+    let Some(first) = group.first() else {
+        return Ok(false);
+    };
+    let expected = identity(&repository.join(first))?;
+    for path in &group[1..] {
+        if identity(&repository.join(path))? != expected {
+            return Ok(false);
+        }
+    }
     Ok(true)
 }
 
