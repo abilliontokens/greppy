@@ -1,5 +1,5 @@
 use crate::policy::{decide_url, NetworkProfile, SharedProfile, UrlDecision};
-use crate::policy_proxy::PolicyProxy;
+use crate::policy_proxy::{PolicyProxy, REQUEST_ID_HEADER};
 use crate::protocol::{
     read_message, timeout_ms_from_json, write_message, Message, WorkerKind, MAX_FRAME_BYTES,
 };
@@ -35,6 +35,7 @@ const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
 const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
 const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js");
+static NEXT_NETWORK_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 struct SlowOp<'a> {
     method: &'a str,
@@ -335,7 +336,6 @@ struct Delegate {
     routes: RefCell<Vec<RouteRule>>,
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<Vec<serde_json::Value>>,
-    next_request_id: Cell<u64>,
     downloads: RefCell<Vec<serde_json::Value>>,
     popups: RefCell<Vec<(WebView, WebView)>>,
     opener_id: RefCell<Option<String>>,
@@ -379,7 +379,6 @@ impl Delegate {
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
             requests: RefCell::new(Vec::new()),
-            next_request_id: Cell::new(1),
             downloads: RefCell::new(Vec::new()),
             popups: RefCell::new(Vec::new()),
             last_dialogs: RefCell::new(Vec::new()),
@@ -556,8 +555,7 @@ impl WebViewDelegate for Delegate {
 
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
         let url = load.request.url.to_string();
-        let request_id = self.next_request_id.get();
-        self.next_request_id.set(request_id.saturating_add(1));
+        let request_id = NEXT_NETWORK_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let mut headers: Vec<serde_json::Value> = load
             .request
             .headers
@@ -629,7 +627,8 @@ impl WebViewDelegate for Delegate {
                 )
             });
         let Some((action, body, status, content_type, continue_headers)) = matched else {
-            let extras = extra_request_headers(&self.extra_headers.borrow());
+            let mut extras = extra_request_headers(&self.extra_headers.borrow());
+            add_proxy_request_id(&mut extras, &url, request_id);
             if !extras.is_empty() {
                 load.continue_with_headers(extras);
             }
@@ -698,7 +697,8 @@ impl WebViewDelegate for Delegate {
             "continue" => {
                 let mut merged = self.extra_headers.borrow().clone();
                 merged.extend(continue_headers);
-                let extras = extra_request_headers(&merged);
+                let mut extras = extra_request_headers(&merged);
+                add_proxy_request_id(&mut extras, &url, request_id);
                 if extras.is_empty() {
                     return;
                 }
@@ -706,6 +706,15 @@ impl WebViewDelegate for Delegate {
             }
             _ => {}
         }
+    }
+}
+
+fn add_proxy_request_id(headers: &mut http::HeaderMap, url: &str, request_id: u64) {
+    if !url.starts_with("http://") {
+        return;
+    }
+    if let Ok(value) = http::HeaderValue::from_str(&request_id.to_string()) {
+        headers.insert(http::HeaderName::from_static(REQUEST_ID_HEADER), value);
     }
 }
 
@@ -3281,7 +3290,21 @@ impl ContentEngine {
             }
             "page.responses" => {
                 let page_id = required_str(&params, "page")?;
-                Ok(json!({ "responses": self.page(&page_id)?.1.last_responses.borrow().clone() }))
+                let delegate = &self.page(&page_id)?.1;
+                let request_ids: Vec<u64> = delegate
+                    .requests
+                    .borrow()
+                    .iter()
+                    .filter_map(|request| request.get("requestId").and_then(|id| id.as_u64()))
+                    .collect();
+                let mut responses = delegate.last_responses.borrow().clone();
+                responses.extend(self._proxy.responses().into_iter().filter(|response| {
+                    response
+                        .get("requestId")
+                        .and_then(|id| id.as_u64())
+                        .is_some_and(|id| request_ids.contains(&id))
+                }));
+                Ok(json!({ "responses": responses }))
             }
             "page.downloads" => {
                 let page_id = required_str(&params, "page")?;
