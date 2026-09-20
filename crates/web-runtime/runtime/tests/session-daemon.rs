@@ -10,7 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use web_runtime::worker::give_child_attach_token;
@@ -715,6 +715,118 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
+struct NavigationLifecycleFixture {
+    origin: String,
+    events: std::sync::mpsc::Receiver<String>,
+    releases: Arc<(Mutex<HashSet<String>>, Condvar)>,
+}
+
+impl NavigationLifecycleFixture {
+    fn release(&self, path: &str) {
+        let (released, wake) = &*self.releases;
+        released.lock().unwrap().insert(path.to_owned());
+        wake.notify_all();
+    }
+
+    fn wait_for(&self, path: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = self
+                .events
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("waiting for fixture request {path}: {error}"));
+            if event == path {
+                return;
+            }
+        }
+    }
+}
+
+fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind lifecycle fixture");
+    let address = listener.local_addr().expect("lifecycle fixture addr");
+    let (events_tx, events) = std::sync::mpsc::channel();
+    let releases = Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
+    let server_releases = Arc::clone(&releases);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let events_tx = events_tx.clone();
+            let releases = Arc::clone(&server_releases);
+            thread::spawn(move || {
+                let mut buffer = [0_u8; 2048];
+                let n = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_owned();
+                let _ = events_tx.send(path.clone());
+                if path == "/commit" {
+                    let prefix = b"<!doctype html><html><head></head><body>";
+                    let tail = b"<p>commit-tail</p></body></html>";
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        prefix.len() + tail.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(prefix);
+                    let _ = stream.flush();
+                    let _ = events_tx.send("/commit-body".to_owned());
+                    let (released, wake) = &*releases;
+                    let mut released = released.lock().unwrap();
+                    while !released.contains("/commit-body") {
+                        released = wake.wait(released).unwrap();
+                    }
+                    let _ = stream.write_all(tail);
+                    return;
+                }
+                if path.contains("-gate.") {
+                    let (released, wake) = &*releases;
+                    let mut released = released.lock().unwrap();
+                    while !released.contains(&path) {
+                        released = wake.wait(released).unwrap();
+                    }
+                }
+                let (content_type, body): (&str, Vec<u8>) = match path.as_str() {
+                    "/parser" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><head></head><body><script src='/parser-gate.js'></script><p id='late'>parser-finished</p></body></html>".to_vec(),
+                    ),
+                    "/defer" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><head><script defer src='/defer-gate.js'></script></head><body><p id='parsed'>parser-finished</p></body></html>".to_vec(),
+                    ),
+                    "/load" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><body><p id='parsed'>parser-finished</p><img src='/load-gate.png'></body></html>".to_vec(),
+                    ),
+                    path if path.ends_with(".js") => ("text/javascript", b"void 0;".to_vec()),
+                    path if path.ends_with(".png") => ("image/png", Vec::new()),
+                    _ => ("text/plain", b"not found".to_vec()),
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            });
+        }
+    });
+    NavigationLifecycleFixture {
+        origin: format!("http://{address}"),
+        events,
+        releases,
+    }
+}
+
 fn serve_site() -> String {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -799,6 +911,54 @@ fn run_playwright_source(
         Duration::from_secs(5),
     );
     ran
+}
+
+fn run_playwright_source_async(
+    socket: PathBuf,
+    run_id: &str,
+    source: String,
+) -> std::sync::mpsc::Receiver<greppy_web_client::Response> {
+    let run_id = run_id.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let created = unix_request(
+            &socket,
+            &Request::new(
+                &run_id,
+                "web.session.create",
+                json!({ "profile": "project" }),
+            ),
+            Duration::from_secs(30),
+        )
+        .expect("create async navigation session");
+        let session_id = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut run = Request::new(
+            &run_id,
+            "web.run",
+            json!({
+                "session_id": session_id.clone(),
+                "script_source": "inline",
+                "script_text": source,
+            }),
+        );
+        run.deadline_ms = 30_000;
+        let response = unix_request(&socket, &run, Duration::from_secs(35))
+            .expect("run async navigation script");
+        let _ = tx.send(response);
+        let _ = unix_request(
+            &socket,
+            &Request::new(
+                &run_id,
+                "web.session.close",
+                json!({ "session_id": session_id }),
+            ),
+            Duration::from_secs(5),
+        );
+    });
+    rx
 }
 
 fn run_playwright_source_with_limits(
@@ -3203,6 +3363,138 @@ fn web_goto_navigates_a_fixture() {
         ),
         Duration::from_secs(5),
     );
+}
+
+#[test]
+fn web_goto_does_not_treat_ordinary_page_text_as_a_servo_error() {
+    let fixture = serve_fixture(
+        "<!DOCTYPE html><html><head><title>Quoted documentation</title></head><body><p>Documentation may say: Could not load the requested page.</p><p id=loaded>ordinary-page-loaded</p></body></html>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-goto-error-phrase-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_goto_error_phrase", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let ran = run_playwright_source(
+        &socket,
+        "run_goto_error_phrase",
+        &format!(
+            r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const response = await page.goto({fixture:?});
+const marker = await page.locator('#loaded').textContent();
+await browser.close();
+return {{ ok: response.ok(), marker }};
+"#
+        ),
+        None,
+        Duration::from_secs(30),
+    );
+    assert_eq!(ran.status, "ok", "{ran:?}");
+    assert_eq!(ran.result.as_ref().unwrap()["value"]["ok"], true, "{ran:?}");
+    assert_eq!(
+        ran.result.as_ref().unwrap()["value"]["marker"],
+        "ordinary-page-loaded",
+        "{ran:?}"
+    );
+}
+
+#[test]
+fn page_goto_observes_commit_domcontentloaded_and_load_separately() {
+    let fixture = serve_navigation_lifecycle_fixture();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-navigation-lifecycle-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_navigation_lifecycle", |command| {
+        command.arg("--fixture-url").arg(&fixture.origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+
+    let commit = run_playwright_source_async(
+        socket.clone(),
+        "run_navigation_commit",
+        format!(
+            r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({:?}, {{ waitUntil: "commit" }});
+return "committed";
+"#,
+            format!("{}/commit", fixture.origin)
+        ),
+    );
+    fixture.wait_for("/commit-body");
+    let committed = commit
+        .recv_timeout(Duration::from_secs(10))
+        .expect("commit must resolve while parser is held");
+    assert_eq!(committed.status, "ok", "{committed:?}");
+    assert_eq!(
+        committed.result.as_ref().unwrap()["value"],
+        "committed",
+        "{committed:?}"
+    );
+    fixture.release("/commit-body");
+
+    for (name, path, gate, wait_until, marker) in [
+        (
+            "parser",
+            "/parser",
+            "/parser-gate.js",
+            "domcontentloaded",
+            "#late",
+        ),
+        (
+            "defer",
+            "/defer",
+            "/defer-gate.js",
+            "domcontentloaded",
+            "#parsed",
+        ),
+        ("load", "/load", "/load-gate.png", "load", "#parsed"),
+    ] {
+        let navigation = run_playwright_source_async(
+            socket.clone(),
+            &format!("run_navigation_{name}"),
+            format!(
+                r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({:?}, {{ waitUntil: {:?} }});
+return await page.locator({marker:?}).textContent();
+"#,
+                format!("{}{path}", fixture.origin),
+                wait_until,
+            ),
+        );
+        fixture.wait_for(gate);
+        assert!(
+            matches!(
+                navigation.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "{wait_until} returned before gated {name} lifecycle work completed"
+        );
+        fixture.release(gate);
+        let completed = navigation
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|error| panic!("{name} navigation did not complete: {error}"));
+        assert_eq!(completed.status, "ok", "{completed:?}");
+        assert_eq!(
+            completed.result.as_ref().unwrap()["value"],
+            "parser-finished",
+            "{completed:?}"
+        );
+    }
 }
 
 #[test]

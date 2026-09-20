@@ -1000,11 +1000,9 @@ impl ContentEngine {
 
     /// How far a navigation must get before `goto` returns.
     ///
-    /// Playwright lets the caller choose; the runtime used to wait for the
-    /// full load in every case. On a page whose sub-resource never finishes,
-    /// `readyState` stays `loading` forever, so `goto` timed out on a document
-    /// that was parsed, titled and fully readable -- three pages of the pinned
-    /// corpus fail exactly this way.
+    /// Playwright lets the caller choose. Servo exposes the response-commit
+    /// boundary as HeadParsed and the full-load boundary as Complete; the
+    /// document-start lifecycle receipt supplies the distinct middle boundary.
     fn load_committed_for(
         &self,
         webview: &WebView,
@@ -1013,31 +1011,21 @@ impl ContentEngine {
     ) -> bool {
         match (webview.load_status(), until) {
             (LoadStatus::Complete, _) => true,
-            // The document is parsed: the DOM is there and can be read, which
-            // is exactly what `domcontentloaded` promises.
-            (LoadStatus::HeadParsed, WaitUntil::DomContentLoaded) => true,
-            _ => self.load_committed(webview, last_js),
-        }
-    }
-
-    fn load_committed(&self, webview: &WebView, last_js: &mut Instant) -> bool {
-        match webview.load_status() {
-            LoadStatus::Complete => true,
-            // Poll readyState at 25ms, not 200ms. Large documents sit in
-            // HeadParsed for their whole parse; on the release build the
-            // 200ms cadence alone cost ~1.3s of a 2.1s navigation commit
-            // (nav-trace, page 044) while each evaluate costs well under a
-            // millisecond of CPU.
-            LoadStatus::HeadParsed if last_js.elapsed() >= Duration::from_millis(25) => {
+            (LoadStatus::HeadParsed, WaitUntil::Commit) => true,
+            // HeadParsed is earlier than DOMContentLoaded. In particular,
+            // readyState `interactive` is also too early while deferred
+            // scripts are still pending, so use the document-start listener
+            // installed by the user-content bundle as the lifecycle receipt.
+            (LoadStatus::HeadParsed, WaitUntil::DomContentLoaded)
+                if last_js.elapsed() >= Duration::from_millis(25) =>
+            {
                 *last_js = Instant::now();
                 match self.evaluate_until(
                     webview.clone(),
-                    "document.readyState",
+                    "Boolean(globalThis.__greppyLifecycle && globalThis.__greppyLifecycle.domContentLoaded)",
                     Duration::from_millis(150),
                 ) {
-                    Ok(JSValue::String(state)) => {
-                        load_status_allows_navigation(LoadStatus::HeadParsed, Some(&state))
-                    }
+                    Ok(JSValue::Boolean(loaded)) => loaded,
                     _ => false,
                 }
             }
@@ -2110,10 +2098,18 @@ impl ContentEngine {
                     Ok(JSValue::String(text)) => Some(text),
                     _ => None,
                 };
-                if let Some(text) = &text {
-                    if text.contains("Could not load the requested page") {
-                        return Err(io::Error::other(format!("navigation failed: {text}")));
-                    }
+                let servo_error_shell = match self.evaluate(
+                    webview.clone(),
+                    "document.title === 'Error loading page' && document.body && document.body.children.length === 1 && document.body.firstElementChild.tagName === 'P' && document.body.firstElementChild.innerText.startsWith('Could not load the requested page:')",
+                ) {
+                    Ok(JSValue::Boolean(matches)) => matches,
+                    _ => false,
+                };
+                if recorded_status.is_none() && servo_error_shell {
+                    return Err(io::Error::other(format!(
+                        "navigation failed: {}",
+                        text.as_deref().unwrap_or("Servo network error")
+                    )));
                 }
                 let html =
                     match self.evaluate(webview.clone(), "document.documentElement.outerHTML") {
@@ -2784,13 +2780,17 @@ impl ContentEngine {
                 if let Some(timeout) = params.get("timeout") {
                     goto_params["timeout"] = timeout.clone();
                 }
+                if let Some(wait_until) = params.get("waitUntil") {
+                    goto_params["waitUntil"] = wait_until.clone();
+                }
                 self.handle("page.goto", goto_params)
             }
             "page.waitForLoadState" => {
                 let page_id = required_str(&params, "page")?;
                 let (webview, _) = self.page(&page_id)?.clone();
                 let loading = webview.clone();
-                if !self.spin_until_loaded(&loading, call_timeout(&params), || true)? {
+                let until = WaitUntil::from_params(&params);
+                if !self.spin_until_loaded_until(&loading, call_timeout(&params), until, || true)? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out waiting for load state",
@@ -4236,14 +4236,6 @@ fn click_at(
     )
 }
 
-fn load_status_allows_navigation(status: LoadStatus, ready_state: Option<&str>) -> bool {
-    match status {
-        LoadStatus::Complete => true,
-        LoadStatus::HeadParsed => matches!(ready_state, Some("complete") | Some("interactive")),
-        LoadStatus::Started => false,
-    }
-}
-
 fn urls_match(current: &Url, expected: &Url) -> bool {
     current.scheme() == expected.scheme()
         && current.host() == expected.host()
@@ -4452,25 +4444,19 @@ mod serialize_tests {
     }
 
     #[test]
-    fn headparsed_with_interactive_ready_state_commits_navigation() {
-        assert!(load_status_allows_navigation(LoadStatus::Complete, None));
-        assert!(load_status_allows_navigation(
-            LoadStatus::HeadParsed,
-            Some("interactive")
-        ));
-        assert!(load_status_allows_navigation(
-            LoadStatus::HeadParsed,
-            Some("complete")
-        ));
-        assert!(!load_status_allows_navigation(
-            LoadStatus::HeadParsed,
-            Some("loading")
-        ));
-        assert!(!load_status_allows_navigation(LoadStatus::HeadParsed, None));
-        assert!(!load_status_allows_navigation(
-            LoadStatus::Started,
-            Some("complete")
-        ));
+    fn wait_until_keeps_navigation_milestones_distinct() {
+        assert_eq!(
+            WaitUntil::from_params(&json!({ "waitUntil": "load" })),
+            WaitUntil::Load
+        );
+        assert_eq!(
+            WaitUntil::from_params(&json!({ "waitUntil": "domcontentloaded" })),
+            WaitUntil::DomContentLoaded
+        );
+        assert_eq!(
+            WaitUntil::from_params(&json!({ "waitUntil": "commit" })),
+            WaitUntil::Commit
+        );
     }
 
     #[test]
@@ -5482,12 +5468,14 @@ pub fn run() -> io::Result<()> {
 enum WaitUntil {
     Load,
     DomContentLoaded,
+    Commit,
 }
 
 impl WaitUntil {
     fn from_params(params: &serde_json::Value) -> Self {
         match params.get("waitUntil").and_then(|value| value.as_str()) {
-            Some("domcontentloaded") | Some("commit") => Self::DomContentLoaded,
+            Some("domcontentloaded") => Self::DomContentLoaded,
+            Some("commit") => Self::Commit,
             _ => Self::Load,
         }
     }
