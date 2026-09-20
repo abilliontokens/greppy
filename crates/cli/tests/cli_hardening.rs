@@ -2995,9 +2995,25 @@ fn first_use_query_ignores_stale_record_while_foreground_writer_publishes() {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        let db = find_graph_db(&store).expect("foreground writer creates graph.db");
+        let hash = greppy_core::workspace::workspace_hash(&repo);
+        let job_path = store
+            .join("workspaces")
+            .join("v2")
+            .join(hash)
+            .join("index.job");
+        let original_job: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+        assert_eq!(
+            original_job["pid"].as_u64(),
+            Some(u64::from(writer.id())),
+            "canonical progress record must belong to the foreground writer"
+        );
+        assert_eq!(
+            original_job["state"], "syncing_snapshot",
+            "ready failpoint must expose the foreground writer's pre-publication record"
+        );
         std::fs::write(
-            db.parent().unwrap().join("index.job"),
+            &job_path,
             serde_json::to_vec(&serde_json::json!({
                 "schema_version": "greppy.background-job.v2",
                 "kind": "index",
