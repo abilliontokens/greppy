@@ -52,7 +52,9 @@ struct JobProgress {
 impl JobProgress {
     fn read(path: &std::path::Path) -> Option<Self> {
         let value = crate::read_background_job(path)?;
-        Self::from_value(&value)
+        let progress = Self::from_value(&value)?;
+        let owner = progress.pid.and_then(|pid| u32::try_from(pid).ok())?;
+        crate::process_is_alive(owner).then_some(progress)
     }
 
     fn from_value(value: &serde_json::Value) -> Option<Self> {
@@ -325,7 +327,6 @@ pub(crate) fn for_command(
         }
         Command::SearchGraph { .. } => ("search-graph", configured_root),
         Command::SearchSymbol { .. } => ("search-symbol", configured_root),
-        Command::SearchPattern { .. } => ("search-pattern", configured_root),
         Command::Search { .. } => ("search", configured_root),
         Command::Context { .. } => ("context", configured_root),
         Command::WhoCalls { .. } => ("who-calls", configured_root),
@@ -584,5 +585,37 @@ mod tests {
         });
         drop(guard);
         assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn live_pattern_search_does_not_subscribe_to_graph_index_progress() {
+        let cli =
+            <crate::Cli as clap::Parser>::try_parse_from(["greppy", "search-pattern", "needle"])
+                .unwrap();
+        assert!(for_command(cli.command.as_ref(), None).is_none());
+    }
+
+    #[test]
+    fn job_progress_requires_a_live_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index.job");
+        let value = |pid| {
+            serde_json::json!({
+                "state": "classifying_files",
+                "completed_spans": 1,
+                "total_spans": 2,
+                "progress_unit": "files",
+                "pid": pid,
+                "started_at_unix_secs": 1
+            })
+        };
+
+        crate::write_background_job(&path, &value(std::process::id())).unwrap();
+        assert!(JobProgress::read(&path).is_some());
+
+        // u32::MAX is outside the process-id range supported by our target
+        // platforms, so this record cannot identify a live job owner.
+        crate::write_background_job(&path, &value(u32::MAX)).unwrap();
+        assert!(JobProgress::read(&path).is_none());
     }
 }
