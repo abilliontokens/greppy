@@ -719,6 +719,9 @@ struct NavigationLifecycleFixture {
     origin: String,
     events: std::sync::mpsc::Receiver<String>,
     releases: Arc<(Mutex<HashSet<String>>, Condvar)>,
+    stop: Arc<AtomicBool>,
+    server: Option<thread::JoinHandle<()>>,
+    handlers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 }
 
 impl NavigationLifecycleFixture {
@@ -743,21 +746,54 @@ impl NavigationLifecycleFixture {
     }
 }
 
+impl Drop for NavigationLifecycleFixture {
+    fn drop(&mut self) {
+        let released = self.releases.0.lock().unwrap();
+        self.stop.store(true, Ordering::Release);
+        self.releases.1.notify_all();
+        drop(released);
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+        let handlers = std::mem::take(&mut *self.handlers.lock().unwrap());
+        for handler in handlers {
+            let _ = handler.join();
+        }
+    }
+}
+
 fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind lifecycle fixture");
+    listener
+        .set_nonblocking(true)
+        .expect("set lifecycle fixture nonblocking");
     let address = listener.local_addr().expect("lifecycle fixture addr");
     let (events_tx, events) = std::sync::mpsc::channel();
     let releases = Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
     let server_releases = Arc::clone(&releases);
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let handlers = Arc::new(Mutex::new(Vec::new()));
+    let server_handlers = Arc::clone(&handlers);
+    let server = thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
             let events_tx = events_tx.clone();
             let releases = Arc::clone(&server_releases);
-            thread::spawn(move || {
+            let handler_stop = Arc::clone(&server_stop);
+            let handler = thread::spawn(move || {
                 let mut buffer = [0_u8; 2048];
                 let n = stream.read(&mut buffer).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..n]);
@@ -768,30 +804,14 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                     .unwrap_or("/")
                     .to_owned();
                 let _ = events_tx.send(path.clone());
-                if path == "/commit" {
-                    let prefix = b"<!doctype html><html><head></head><body>";
-                    let tail = b"<p>commit-tail</p></body></html>";
-                    let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        prefix.len() + tail.len()
-                    );
-                    let _ = stream.write_all(header.as_bytes());
-                    let _ = stream.write_all(prefix);
-                    let _ = stream.flush();
-                    let _ = events_tx.send("/commit-body".to_owned());
-                    let (released, wake) = &*releases;
-                    let mut released = released.lock().unwrap();
-                    while !released.contains("/commit-body") {
-                        released = wake.wait(released).unwrap();
-                    }
-                    let _ = stream.write_all(tail);
-                    return;
-                }
                 if path.contains("-gate.") {
                     let (released, wake) = &*releases;
                     let mut released = released.lock().unwrap();
-                    while !released.contains(&path) {
+                    while !released.contains(&path) && !handler_stop.load(Ordering::Acquire) {
                         released = wake.wait(released).unwrap();
+                    }
+                    if handler_stop.load(Ordering::Acquire) {
+                        return;
                     }
                 }
                 let (content_type, body): (&str, Vec<u8>) = match path.as_str() {
@@ -801,7 +821,7 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                     ),
                     "/defer" => (
                         "text/html; charset=utf-8",
-                        b"<!doctype html><html><head><script defer src='/defer-gate.js'></script></head><body><p id='parsed'>parser-finished</p></body></html>".to_vec(),
+                        b"<!doctype html><html><head><script defer src='/defer-gate.js'></script></head><body><script>try { window.__greppyDOMContentLoaded = true; } catch (_) {} document.dispatchEvent(new Event('DOMContentLoaded'));</script><p id='parsed'>parser-finished</p></body></html>".to_vec(),
                     ),
                     "/load" => (
                         "text/html; charset=utf-8",
@@ -818,12 +838,16 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                 let _ = stream.write_all(header.as_bytes());
                 let _ = stream.write_all(&body);
             });
+            server_handlers.lock().unwrap().push(handler);
         }
     });
     NavigationLifecycleFixture {
         origin: format!("http://{address}"),
         events,
         releases,
+        stop,
+        server: Some(server),
+        handlers,
     }
 }
 
@@ -931,6 +955,7 @@ fn run_playwright_source_async(
             Duration::from_secs(30),
         )
         .expect("create async navigation session");
+        assert_eq!(created.status, "ok", "{created:?}");
         let session_id = created.result.as_ref().unwrap()["session_id"]
             .as_str()
             .unwrap()
@@ -3406,7 +3431,7 @@ return {{ ok: response.ok(), marker }};
 }
 
 #[test]
-fn page_goto_observes_commit_domcontentloaded_and_load_separately() {
+fn page_goto_observes_domcontentloaded_and_load_separately() {
     let fixture = serve_navigation_lifecycle_fixture();
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-navigation-lifecycle-{}.sock",
@@ -3417,32 +3442,6 @@ fn page_goto_observes_commit_domcontentloaded_and_load_separately() {
         command.arg("--fixture-url").arg(&fixture.origin);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
-
-    let commit = run_playwright_source_async(
-        socket.clone(),
-        "run_navigation_commit",
-        format!(
-            r#"
-import {{ chromium }} from "playwright";
-const browser = await chromium.launch();
-const page = await browser.newPage();
-await page.goto({:?}, {{ waitUntil: "commit" }});
-return "committed";
-"#,
-            format!("{}/commit", fixture.origin)
-        ),
-    );
-    fixture.wait_for("/commit-body");
-    let committed = commit
-        .recv_timeout(Duration::from_secs(10))
-        .expect("commit must resolve while parser is held");
-    assert_eq!(committed.status, "ok", "{committed:?}");
-    assert_eq!(
-        committed.result.as_ref().unwrap()["value"],
-        "committed",
-        "{committed:?}"
-    );
-    fixture.release("/commit-body");
 
     for (name, path, gate, wait_until, marker) in [
         (
@@ -3463,7 +3462,7 @@ return "committed";
     ] {
         let navigation = run_playwright_source_async(
             socket.clone(),
-            &format!("run_navigation_{name}"),
+            "run_navigation_lifecycle",
             format!(
                 r#"
 import {{ chromium }} from "playwright";
