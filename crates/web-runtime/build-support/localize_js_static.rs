@@ -227,7 +227,9 @@ fn namespace_linux_engine_symbols(
         .chain(icu_capi_rlibs.iter())
         .chain(mozjs_rlibs.iter())
     {
-        redefine_linux_archive_symbols(archive, &diplomat_symbols, "greppy_sm_")?;
+        let present = archive_symbol_names(archive)?;
+        let pending = pending_symbols(&diplomat_symbols, &present);
+        redefine_linux_archive_symbols(archive, &pending, "greppy_sm_")?;
     }
     for archive in &old_diplomat {
         verify_symbols_absent(archive, &diplomat_symbols, "diplomat-runtime")?;
@@ -423,6 +425,17 @@ fn build_roots() -> Vec<PathBuf> {
 }
 
 fn localize_archive(archive: &Path) -> Result<(), String> {
+    let defined = defined_symbols(archive)?;
+    let renames = if cfg!(windows) {
+        WINDOWS_RENAME_SYMBOLS
+    } else if cfg!(target_os = "linux") {
+        LINUX_RENAME_SYMBOLS
+    } else {
+        RENAME_SYMBOLS
+    };
+    if !needs_localization(&defined, renames)? {
+        return Ok(());
+    }
     let parent = archive
         .parent()
         .ok_or_else(|| format!("archive has no parent: {}", archive.display()))?;
@@ -462,6 +475,62 @@ fn localize_archive(archive: &Path) -> Result<(), String> {
         let _ = Command::new("ranlib").arg(archive).status();
     }
     Ok(())
+}
+
+fn needs_localization(
+    defined: &BTreeSet<String>,
+    renames: &[(&str, &str)],
+) -> Result<bool, String> {
+    if renames.iter().any(|(from, _)| defined.contains(*from)) {
+        return Ok(true);
+    }
+    let missing = renames
+        .iter()
+        .filter(|(_, to)| !defined.contains(*to))
+        .map(|(from, to)| format!("{from} or {to}"))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    Err(format!(
+        "SpiderMonkey archive is missing expected original or localized symbols: {missing:?}"
+    ))
+}
+
+fn pending_symbols(requested: &BTreeSet<String>, defined: &BTreeSet<String>) -> BTreeSet<String> {
+    requested.intersection(defined).cloned().collect()
+}
+
+#[cfg(test)]
+mod idempotence_tests {
+    use super::*;
+
+    #[test]
+    fn already_renamed_symbols_do_not_require_archive_localization() {
+        let defined = RENAME_SYMBOLS
+            .iter()
+            .map(|(_, to)| (*to).to_owned())
+            .collect();
+        assert!(!needs_localization(&defined, RENAME_SYMBOLS).unwrap());
+    }
+
+    #[test]
+    fn linux_namespace_pass_selects_undefined_references() {
+        let requested = BTreeSet::from(["diplomat_alloc".to_owned(), "diplomat_free".to_owned()]);
+        let reference_only_archive = parse_nm_symbol_names(
+            "caller.o:\n                 U diplomat_alloc\n                 U diplomat_free\n",
+        );
+        assert_eq!(
+            pending_symbols(&requested, &reference_only_archive),
+            requested
+        );
+    }
+
+    #[test]
+    fn invalid_archive_is_not_silently_treated_as_localized() {
+        let error = needs_localization(&BTreeSet::new(), RENAME_SYMBOLS).unwrap_err();
+        assert!(error.contains("missing expected original or localized symbols"));
+    }
 }
 
 fn archive_tool() -> &'static str {
@@ -590,6 +659,39 @@ fn defined_globals(archive: &Path) -> Result<BTreeSet<String>, String> {
 
 fn defined_symbols(archive: &Path) -> Result<BTreeSet<String>, String> {
     defined_symbols_with(archive, &[])
+}
+
+fn archive_symbol_names(archive: &Path) -> Result<BTreeSet<String>, String> {
+    let output = Command::new("nm")
+        .arg(archive)
+        .output()
+        .map_err(|e| format!("nm {}: {e}", archive.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "nm {} failed: {}\n{}",
+            archive.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(parse_nm_symbol_names(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_nm_symbol_names(output: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            let (kind, name) = match parts.as_slice() {
+                [kind, name] => (*kind, *name),
+                [.., kind, name] => (*kind, *name),
+                _ => return None,
+            };
+            (is_defined_symbol_kind(kind) || kind == "U").then(|| name.to_owned())
+        })
+        .collect()
 }
 
 fn defined_symbols_with(archive: &Path, extra: &[&str]) -> Result<BTreeSet<String>, String> {
