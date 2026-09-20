@@ -1728,7 +1728,7 @@ mod scope_tests {
         std::fs::create_dir_all(&parent).unwrap();
         let artifacts = tempfile::Builder::new()
             .prefix("screenshot-export-test-")
-            .tempdir_in(parent)
+            .tempdir_in(&parent)
             .unwrap();
         let run_id = artifacts.path().file_name().unwrap().to_str().unwrap();
         let image = vec![42u8; 32_768];
