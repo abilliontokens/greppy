@@ -32,9 +32,12 @@ const SHIM_JS: &str = r#"(function () {
     enumerable: false,
   });
   if (!domContentLoaded) {
-    document.addEventListener('DOMContentLoaded', function (event) {
-      if (event.isTrusted) domContentLoaded = true;
-    }, { once: true });
+    var recordDOMContentLoaded = function recordDOMContentLoaded(event) {
+      if (!event.isTrusted) return;
+      domContentLoaded = true;
+      document.removeEventListener('DOMContentLoaded', recordDOMContentLoaded);
+    };
+    document.addEventListener('DOMContentLoaded', recordDOMContentLoaded);
   }
 
   // requestIdleCallback: Servo has no implementation at all. Deferred work is
