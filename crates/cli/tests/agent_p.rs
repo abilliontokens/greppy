@@ -156,10 +156,10 @@ fn spawn_edit_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_edit\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
         "\n",
         "event: content_block_start\n",
-        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_edit\",\"name\":\"bash\",\"input\":{}}}\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_edit\",\"name\":\"greppy\",\"input\":{}}}\n",
         "\n",
         "event: content_block_delta\n",
-        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"printf 'partial\\\\n' > hello.txt\\\"}\"}}\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"args\\\":[\\\"write\\\",\\\"hello.txt\\\",\\\"partial\\\\n\\\"]}\"}}\n",
         "\n",
         "event: content_block_stop\n",
         "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
@@ -474,9 +474,9 @@ fn greppy_p_incomplete_proposal_is_not_applied_and_keeps_recovery_state() {
     assert_eq!(result["stop"], "turn limit reached");
     assert_eq!(result["turns"], 1);
     assert_eq!(result["applied"], false);
-    let proposal = result["proposal_ref"]
-        .as_str()
-        .expect("partial proposal must remain inspectable");
+    let proposal = result["proposal_ref"].as_str().unwrap_or_else(|| {
+        panic!("partial proposal must remain inspectable; stdout={stdout}\nstderr={stderr}")
+    });
     assert!(!proposal.is_empty(), "{result}");
     assert_eq!(
         std::fs::read_to_string(repo.join("hello.txt")).unwrap(),
