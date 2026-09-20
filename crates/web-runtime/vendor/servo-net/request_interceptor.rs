@@ -43,7 +43,7 @@ impl RequestInterceptor {
                 redirect_count: request.redirect_count,
             },
             method: request.method.clone(),
-            url: request.url().into_url(),
+            url: request.current_url().into_url(),
             headers: request.headers.clone(),
             destination: request.destination,
             referrer_url: request.referrer.to_url().map(|url| url.as_url().clone()),
