@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[path = "support/portable_provider.rs"]
 mod portable_provider;
-use portable_provider::spawn_fake_provider;
+use portable_provider::{spawn_fake_provider, spawn_fake_provider_with_edits};
 
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_greppy"))
@@ -427,7 +427,11 @@ fn greppy_p_incomplete_proposal_is_not_applied_and_keeps_recovery_state() {
     init_repo(&repo);
     let store = unique_temp("partial-proposal-store");
     let provider_root = unique_temp("partial-proposal-provider");
-    let provider = spawn_fake_provider(&provider_root, &repo);
+    let provider = spawn_fake_provider_with_edits(
+        &provider_root,
+        &repo,
+        vec![(PathBuf::from("hello.txt"), b"partial\n".to_vec())],
+    );
     let (endpoint, stop, handle) = spawn_edit_gateway();
 
     let output = Command::new(binary_path())
@@ -500,7 +504,7 @@ fn greppy_p_incomplete_proposal_is_not_applied_and_keeps_recovery_state() {
     );
     let kept = stderr
         .lines()
-        .find_map(|line| line.strip_prefix("worktree kept: "))
+        .find_map(|line| line.strip_prefix("worktree kept for debugging: "))
         .map(PathBuf::from)
         .expect("incomplete run must report its retained worktree");
     assert!(
