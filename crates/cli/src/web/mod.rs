@@ -658,8 +658,8 @@ mod tests {
             })
         ));
 
-        let cli = Cli::try_parse_from(["greppy", "web", "run", "--script-file", "spec.mjs"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["greppy", "web", "run", "--script-file", "spec.mjs"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Web {

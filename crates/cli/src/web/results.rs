@@ -203,7 +203,15 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
             script_stdin,
             timeout,
             json,
-        } => run(root, session, script_file, script_stdin, timeout, mode, json),
+        } => run(
+            root,
+            session,
+            script_file,
+            script_stdin,
+            timeout,
+            mode,
+            json,
+        ),
         ResultsCommand::Observe {
             query,
             session,
