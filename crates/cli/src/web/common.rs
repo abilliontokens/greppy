@@ -435,11 +435,11 @@ pub(super) fn screenshot(
                             "retry greppy web doctor",
                         ),
                     ),
-                    Ok(response) => {
+                    Ok(mut response) => {
                         if response.status == "ok" {
                             if let Some(dest) = output.as_deref() {
                                 if let Err(error) =
-                                    export_screenshot_artifact(&ctx.run_id, &response, dest)
+                                    export_screenshot_artifact(&ctx.run_id, &mut response, dest)
                                 {
                                     return emit_error(json, error);
                                 }
@@ -464,7 +464,7 @@ pub(super) fn artifact_store_root(run_id: &str) -> PathBuf {
 
 pub(super) fn export_screenshot_artifact(
     run_id: &str,
-    response: &Response,
+    response: &mut Response,
     dest: &str,
 ) -> std::result::Result<(), ErrorObject> {
     let object_path = response
@@ -496,7 +496,21 @@ pub(super) fn export_screenshot_artifact(
             "retry greppy web screenshot",
         )
     })?;
-    export_regular_file(Path::new(dest), &bytes)
+    export_regular_file(Path::new(dest), &bytes)?;
+    // --output delivers the image as a file. Keep its receipt and artifact
+    // identity, without duplicating the image bytes into the agent context.
+    // Only change the reply after the export succeeds.
+    if let Some(result) = response
+        .result
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        result.remove("png_base64");
+        result.remove("cursor");
+        result.remove("truncated");
+        result.insert("output_path".into(), json!(dest));
+    }
+    Ok(())
 }
 
 pub(super) fn lexical_output_path(dest: &Path) -> std::result::Result<PathBuf, ErrorObject> {
@@ -1703,6 +1717,58 @@ mod scope_tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_export_returns_file_receipt_without_inline_image() {
+        let parent = artifact_store_root("placeholder")
+            .parent()
+            .unwrap()
+            .to_owned();
+        std::fs::create_dir_all(&parent).unwrap();
+        let artifacts = tempfile::Builder::new()
+            .prefix("screenshot-export-test-")
+            .tempdir_in(parent)
+            .unwrap();
+        let run_id = artifacts.path().file_name().unwrap().to_str().unwrap();
+        let image = vec![42u8; 32_768];
+        std::fs::write(artifacts.path().join("image.png"), &image).unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let dest = output.path().join("saved.png");
+        let request = Request::new(run_id, "web.screenshot", json!({}));
+        let mut response = Response::ok(
+            &request,
+            json!({
+                "object_path": "image.png", "digest": "test-digest",
+                "byte_count": image.len(), "media_type": "image/png",
+                "png_base64": "A".repeat(43_692),
+                "truncated": true, "cursor": "sha256:test-digest:0"
+            }),
+        );
+        response.artifacts.push(json!({"object_path": "image.png"}));
+        let original = response.clone();
+        export_screenshot_artifact(run_id, &mut response, dest.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), image);
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result["output_path"], dest.to_str().unwrap());
+        assert_eq!(result["byte_count"], image.len());
+        assert_eq!(result["digest"], "test-digest");
+        assert!(result.get("png_base64").is_none());
+        assert!(result.get("cursor").is_none());
+        assert!(result.get("truncated").is_none());
+        assert_eq!(response.artifacts, original.artifacts);
+        assert!(serde_json::to_vec(&response).unwrap().len() < 2_000);
+
+        // A failed export must preserve the original inline result and must
+        // not advertise an output file that was never written.
+        let mut failure = original;
+        let before = serde_json::to_value(&failure).unwrap();
+        assert!(
+            export_screenshot_artifact(run_id, &mut failure, output.path().to_str().unwrap())
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&failure).unwrap(), before);
+    }
 
     #[test]
     fn page_error_text_cannot_become_a_missing_session_signal() {
