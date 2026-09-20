@@ -2959,12 +2959,56 @@ fn network_query_filters_enriched_response_records() {
     assert!(
         requests[0]["url"]
             .as_str()
-            .is_some_and(|url| url.ends_with("/missing")),
+            .is_some_and(|url| url.ends_with("/same")),
         "{filtered:?}"
     );
     assert_eq!(requests[0]["status"], 404);
     assert_eq!(requests[0]["ok"], false);
     assert_eq!(requests[0]["byteLength"], 7);
+
+    let successful = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status=200 url~/same$/" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network successful occurrence");
+    let successes = successful.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("successful network requests");
+    assert_eq!(successes.len(), 1, "{successful:?}");
+    assert_ne!(
+        successes[0]["requestId"], requests[0]["requestId"],
+        "repeated URL occurrences must retain distinct response identities"
+    );
+
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "filter": "failed" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network failed records");
+    let failures = failed.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("failed network requests");
+    assert_eq!(failures.len(), 2, "{failed:?}");
+    let transport = failures
+        .iter()
+        .find(|record| {
+            record["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("/failed"))
+        })
+        .expect("failed transport record");
+    assert!(transport.get("status").is_none(), "{transport:?}");
+    assert!(transport["failure"]["errorText"].is_string(), "{transport:?}");
 }
 
 #[test]

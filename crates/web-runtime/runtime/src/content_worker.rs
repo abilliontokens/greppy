@@ -335,6 +335,7 @@ struct Delegate {
     routes: RefCell<Vec<RouteRule>>,
     file_paths: RefCell<Vec<std::path::PathBuf>>,
     requests: RefCell<Vec<serde_json::Value>>,
+    next_request_id: Cell<u64>,
     downloads: RefCell<Vec<serde_json::Value>>,
     popups: RefCell<Vec<(WebView, WebView)>>,
     opener_id: RefCell<Option<String>>,
@@ -378,6 +379,7 @@ impl Delegate {
             routes: RefCell::new(Vec::new()),
             file_paths: RefCell::new(Vec::new()),
             requests: RefCell::new(Vec::new()),
+            next_request_id: Cell::new(1),
             downloads: RefCell::new(Vec::new()),
             popups: RefCell::new(Vec::new()),
             last_dialogs: RefCell::new(Vec::new()),
@@ -401,13 +403,13 @@ impl Delegate {
         }
     }
 
-    fn mark_request_failure(&self, url: &str, error_text: &str) {
+    fn mark_request_failure(&self, request_id: u64, error_text: &str) {
         if let Some(row) = self
             .requests
             .borrow_mut()
             .iter_mut()
             .rev()
-            .find(|row| row.get("url").and_then(|value| value.as_str()) == Some(url))
+            .find(|row| row.get("requestId").and_then(|value| value.as_u64()) == Some(request_id))
         {
             row["failure"] = json!({ "errorText": error_text });
             self.wake.wake();
@@ -554,6 +556,8 @@ impl WebViewDelegate for Delegate {
 
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
         let url = load.request.url.to_string();
+        let request_id = self.next_request_id.get();
+        self.next_request_id.set(request_id.saturating_add(1));
         let mut headers: Vec<serde_json::Value> = load
             .request
             .headers
@@ -592,6 +596,7 @@ impl WebViewDelegate for Delegate {
             UrlDecision::Allow => None,
         };
         self.requests.borrow_mut().push(json!({
+            "requestId": request_id,
             "url": url,
             "method": load.request.method.to_string(),
             "main_frame": load.request.is_for_main_frame,
@@ -633,7 +638,7 @@ impl WebViewDelegate for Delegate {
         let request_url = load.request.url.clone();
         match action.as_str() {
             "abort" => {
-                self.mark_request_failure(&url, "net::ERR_FAILED");
+                self.mark_request_failure(request_id, "net::ERR_FAILED");
                 if load.request.is_for_main_frame {
                     *self.denied_navigation.borrow_mut() = Some("net::ERR_FAILED".to_owned());
                 }
@@ -659,6 +664,7 @@ impl WebViewDelegate for Delegate {
                 let status_text = status_code.canonical_reason().unwrap_or("").to_owned();
                 let body_b64 = base64_encode(&body);
                 self.last_responses.borrow_mut().push(json!({
+                    "requestId": request_id,
                     "url": request_url.to_string(),
                     "status": status,
                     "statusText": status_text,
