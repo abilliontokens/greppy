@@ -409,6 +409,7 @@ jobs:
       - name: battle suite + soak
         env:
           GREPPY_BIN: ${{ github.workspace }}/target/debug/greppy
+          GREPPY_DEVICE: ${{ runner.os == 'Linux' && 'cpu' || 'auto' }}
           BATTLE_SOAK: "1"
           BATTLE_SOAK_ITERS: "100"
           BATTLE_SOAK_FILES: "40"
