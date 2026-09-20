@@ -2866,11 +2866,11 @@ mod patch_rollback_tests {
         }
         let grouped = parse_trained_patch(
             b"--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-one\n+ONE\n@@ -3 +3 @@\n-two\n+TWO\n",
-        ).unwrap();
+        ).unwrap_or_else(|refusal| panic!("{}", refusal.message));
         assert_eq!(grouped.len(), 1);
         let (after, _) =
             apply_trained_patch_file("example.txt", b"one\nkeep\ntwo\n", &grouped[0].hunks)
-                .unwrap();
+                .unwrap_or_else(|refusal| panic!("{}", refusal.message));
         assert_eq!(after, b"ONE\nkeep\nTWO\n");
     }
 
