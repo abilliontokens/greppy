@@ -407,12 +407,10 @@ impl Delegate {
     }
 
     fn mark_request_failure(&self, request_id: &str, error_text: &str) {
-        if let Some(row) = self
-            .requests
-            .borrow_mut()
-            .iter_mut()
-            .rev()
-            .find(|row| row.get("requestId").and_then(|value| value.as_str()) == Some(request_id))
+        if let Some(row) =
+            self.requests.borrow_mut().iter_mut().rev().find(|row| {
+                row.get("requestId").and_then(|value| value.as_str()) == Some(request_id)
+            })
         {
             row["failure"] = json!({ "errorText": error_text });
             self.wake.wake();
@@ -559,7 +557,10 @@ impl WebViewDelegate for Delegate {
 
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
         let url = load.request.url.to_string();
-        let request_id = format!("{}:{}", load.request.id.fetch_id, load.request.id.redirect_count);
+        let request_id = format!(
+            "{}:{}",
+            load.request.id.fetch_id, load.request.id.redirect_count
+        );
         let mut headers: Vec<serde_json::Value> = load
             .request
             .headers
@@ -607,7 +608,11 @@ impl WebViewDelegate for Delegate {
             "headers": headers,
             "failure": failure.as_ref().map(|error_text| json!({ "errorText": error_text })),
         }));
-        retain_bounded(&mut requests, &self.dropped_requests, MAX_NETWORK_RECORDS_PER_PAGE);
+        retain_bounded(
+            &mut requests,
+            &self.dropped_requests,
+            MAX_NETWORK_RECORDS_PER_PAGE,
+        );
         drop(requests);
         self.wake.wake();
         if let UrlDecision::Deny { reason } = policy {
@@ -681,7 +686,11 @@ impl WebViewDelegate for Delegate {
                         "content-type": content_type,
                     },
                 }));
-                retain_bounded(&mut responses, &self.dropped_responses, MAX_NETWORK_RECORDS_PER_PAGE);
+                retain_bounded(
+                    &mut responses,
+                    &self.dropped_responses,
+                    MAX_NETWORK_RECORDS_PER_PAGE,
+                );
                 drop(responses);
                 self.wake.wake();
                 let lower = content_type.to_ascii_lowercase();
@@ -721,9 +730,16 @@ impl WebViewDelegate for Delegate {
         response: WebResourceResponseCompleted,
     ) {
         let request_id = format!("{}:{}", response.id.fetch_id, response.id.redirect_count);
-        let headers: serde_json::Map<String, serde_json::Value> = response.headers.iter().filter_map(|(name, value)| {
-            value.to_str().ok().map(|value| (name.as_str().to_owned(), json!(value)))
-        }).collect();
+        let headers: serde_json::Map<String, serde_json::Value> = response
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), json!(value)))
+            })
+            .collect();
         let mut row = json!({
             "requestId": request_id,
             "url": response.url.to_string(),
@@ -747,7 +763,11 @@ impl WebViewDelegate for Delegate {
             merge_terminal_response(existing, row);
         } else {
             responses.push(row);
-            retain_bounded(&mut responses, &self.dropped_responses, MAX_NETWORK_RECORDS_PER_PAGE);
+            retain_bounded(
+                &mut responses,
+                &self.dropped_responses,
+                MAX_NETWORK_RECORDS_PER_PAGE,
+            );
         }
         self.wake.wake();
     }
@@ -771,10 +791,24 @@ fn network_retention_metadata(retained: usize, dropped: u64) -> serde_json::Valu
 }
 
 fn response_information_score(response: &serde_json::Value) -> usize {
-    let failure = response.get("failure").is_some_and(|value| !value.is_null()) as usize * 1_000;
-    let status = response.get("status").and_then(|value| value.as_u64()).is_some() as usize * 100;
-    let headers = response.get("headers").and_then(|value| value.as_object()).map_or(0, |value| value.len() * 10);
-    let body = response.get("bodyBytes").and_then(|value| value.as_u64()).is_some() as usize * 10;
+    let failure = response
+        .get("failure")
+        .is_some_and(|value| !value.is_null()) as usize
+        * 1_000;
+    let status = response
+        .get("status")
+        .and_then(|value| value.as_u64())
+        .is_some() as usize
+        * 100;
+    let headers = response
+        .get("headers")
+        .and_then(|value| value.as_object())
+        .map_or(0, |value| value.len() * 10);
+    let body = response
+        .get("bodyBytes")
+        .and_then(|value| value.as_u64())
+        .is_some() as usize
+        * 10;
     failure + status + headers + body
 }
 
@@ -786,8 +820,12 @@ fn merge_terminal_response(existing: &mut serde_json::Value, incoming: serde_jso
     } else {
         (existing.clone(), incoming)
     };
-    let Some(richer_object) = richer.as_object_mut() else { return };
-    let Some(other_object) = other.as_object() else { return };
+    let Some(richer_object) = richer.as_object_mut() else {
+        return;
+    };
+    let Some(other_object) = other.as_object() else {
+        return;
+    };
     for (key, value) in other_object {
         let missing = richer_object.get(key).is_none_or(|current| {
             current.is_null()
@@ -800,7 +838,10 @@ fn merge_terminal_response(existing: &mut serde_json::Value, incoming: serde_jso
     }
     for key in ["bodyBytes", "byteLength"] {
         if let Some(maximum) = [richer_object.get(key), other_object.get(key)]
-            .into_iter().flatten().filter_map(serde_json::Value::as_u64).max()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_u64)
+            .max()
         {
             richer_object.insert(key.to_owned(), json!(maximum));
         }
@@ -4665,12 +4706,15 @@ mod serialize_tests {
         retain_bounded(&mut records, &dropped, 2);
         assert_eq!(records, vec![json!(3), json!(4)]);
         assert_eq!(dropped.get(), 2);
-        assert_eq!(network_retention_metadata(records.len(), dropped.get()), json!({
-            "limit": MAX_NETWORK_RECORDS_PER_PAGE,
-            "retained": 2,
-            "dropped": 2,
-            "complete": false,
-        }));
+        assert_eq!(
+            network_retention_metadata(records.len(), dropped.get()),
+            json!({
+                "limit": MAX_NETWORK_RECORDS_PER_PAGE,
+                "retained": 2,
+                "dropped": 2,
+                "complete": false,
+            })
+        );
     }
 
     #[test]

@@ -699,9 +699,7 @@ fn enrich_network_records(mut requests: Value, responses: &Value) -> Value {
         };
         let Some(response) = response_rows
             .iter()
-            .find(|response| {
-                response.get("requestId").and_then(Value::as_str) == Some(request_id)
-            })
+            .find(|response| response.get("requestId").and_then(Value::as_str) == Some(request_id))
         else {
             continue;
         };
@@ -709,7 +707,15 @@ fn enrich_network_records(mut requests: Value, responses: &Value) -> Value {
         let Some(object) = request.as_object_mut() else {
             continue;
         };
-        for key in ["status", "statusText", "ok", "byteLength", "bodyBytes", "fromCache", "failure"] {
+        for key in [
+            "status",
+            "statusText",
+            "ok",
+            "byteLength",
+            "bodyBytes",
+            "fromCache",
+            "failure",
+        ] {
             if let Some(value) = response.get(key) {
                 object.insert(key.to_owned(), value.clone());
             }
@@ -722,7 +728,9 @@ fn enrich_network_records(mut requests: Value, responses: &Value) -> Value {
 }
 
 fn network_record_failed(record: &Value) -> bool {
-    record.get("failure").is_some_and(|failure| !failure.is_null())
+    record
+        .get("failure")
+        .is_some_and(|failure| !failure.is_null())
         || record.get("ok").and_then(Value::as_bool) == Some(false)
         || record
             .get("status")
@@ -2906,7 +2914,8 @@ impl Daemon {
                 if kind != "console" {
                     match self.engine_call("page.requests", json!({ "page": page })) {
                         Ok(value) => {
-                            request_retention = value.get("retention").cloned().unwrap_or(json!({}));
+                            request_retention =
+                                value.get("retention").cloned().unwrap_or(json!({}));
                             requests = value
                                 .get("requests")
                                 .cloned()
@@ -2919,16 +2928,21 @@ impl Daemon {
                     }
                 }
                 if kind == "network" {
-                    let responses = match self.engine_call("page.responses", json!({ "page": page })) {
-                        Ok(value) => {
-                            response_retention = value.get("retention").cloned().unwrap_or(json!({}));
-                            value.get("responses").cloned().unwrap_or_else(|| value.clone())
-                        }
-                        Err(error) => {
-                            self.finish_session(&session_id);
-                            return engine_error(request, error, 34);
-                        }
-                    };
+                    let responses =
+                        match self.engine_call("page.responses", json!({ "page": page })) {
+                            Ok(value) => {
+                                response_retention =
+                                    value.get("retention").cloned().unwrap_or(json!({}));
+                                value
+                                    .get("responses")
+                                    .cloned()
+                                    .unwrap_or_else(|| value.clone())
+                            }
+                            Err(error) => {
+                                self.finish_session(&session_id);
+                                return engine_error(request, error, 34);
+                            }
+                        };
                     requests = enrich_network_records(requests, &responses);
                     if request.payload.get("filter").and_then(Value::as_str) == Some("failed") {
                         requests = Value::Array(
@@ -2989,13 +3003,18 @@ impl Daemon {
                         object.insert("requests".into(), requests);
                     }
                     if kind == "network" {
-                        let complete = request_retention.get("complete").and_then(Value::as_bool) == Some(true)
-                            && response_retention.get("complete").and_then(Value::as_bool) == Some(true);
-                        object.insert("coverage".into(), json!({
-                            "complete": complete,
-                            "requests": request_retention,
-                            "responses": response_retention,
-                        }));
+                        let complete = request_retention.get("complete").and_then(Value::as_bool)
+                            == Some(true)
+                            && response_retention.get("complete").and_then(Value::as_bool)
+                                == Some(true);
+                        object.insert(
+                            "coverage".into(),
+                            json!({
+                                "complete": complete,
+                                "requests": request_retention,
+                                "responses": response_retention,
+                            }),
+                        );
                     }
                 }
                 Response::ok(request, result)
