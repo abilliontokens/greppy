@@ -3489,7 +3489,7 @@ fn bound_web_run_uses_only_the_named_sessions_active_page() {
                 "session_id": session_a,
                 "script_source": "inline",
                 "bind_session_page": true,
-                "script_text": r#"
+                "script_text": r##"
 const input = page.locator("#marker");
 const before = await input.inputValue();
 await input.fill("mutated-a");
@@ -3501,7 +3501,7 @@ console.log(JSON.stringify({
   pages: context.pages().length,
   contexts: browser.contexts().length,
 }));
-"#,
+"##,
             }),
         ),
         Duration::from_secs(30),
