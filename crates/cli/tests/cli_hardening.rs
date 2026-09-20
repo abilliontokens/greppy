@@ -2768,6 +2768,42 @@ fn read_queries_refuse_lifecycle_contention_without_silent_wait() {
 }
 
 #[test]
+fn impact_and_path_accept_the_same_file_selector_as_read() {
+    let (repo, store, _scratch) = make_repo("qualified-navigation", "qualified_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let selector = "lib.rs::qualified_marker";
+    for args in [
+        vec!["read", selector],
+        vec!["impact", selector, "--json", "--diagnostics"],
+        vec![
+            "impact",
+            selector,
+            "--direction",
+            "outgoing",
+            "--json",
+            "--diagnostics",
+        ],
+        vec![
+            "path",
+            "--from",
+            selector,
+            "--to",
+            selector,
+            "--json",
+            "--diagnostics",
+        ],
+    ] {
+        let (code, out, err) = run(&args, &repo, &store);
+        assert_eq!(code, 0, "{args:?}: {out}\n{err}");
+        if args[0] == "impact" {
+            let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(value["symbol_found"], true, "{value}");
+        }
+    }
+}
+
+#[test]
 fn graph_queries_serve_verified_contents_during_metadata_only_refresh() {
     let (repo, store, _scratch) = make_real_git_repo("query-during-metadata-refresh");
     let (code, out, err) = run(&["index", "."], &repo, &store);

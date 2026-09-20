@@ -1994,6 +1994,31 @@ fn qualified_query_resolves_to_owner_node() {
     );
 }
 
+#[test]
+fn file_qualified_single_and_multi_resolvers_agree() {
+    let store = store_with_defs(&[
+        ("Function", "src/first.rs", "Function", "run"),
+        ("Function", "src/second.rs", "Function", "run"),
+    ]);
+    let first = id_of(&store, "src/first.rs", "Function", "run");
+    for selector in ["src/first.rs::run", "src/first.rs::Function::run"] {
+        assert_eq!(
+            resolve_symbol_nodes(&store, Some(selector)).unwrap(),
+            vec![first]
+        );
+        assert_eq!(
+            resolve_symbol_id(&store, Some(selector)).unwrap(),
+            Some(first)
+        );
+    }
+    for selector in ["missing.rs::run", "src/first.rs::missing"] {
+        assert!(resolve_symbol_nodes(&store, Some(selector))
+            .unwrap()
+            .is_empty());
+        assert_eq!(resolve_symbol_id(&store, Some(selector)).unwrap(), None);
+    }
+}
+
 /// REGRESSION 2: never-guess. A qualified query whose `Owner.member`
 /// matches MORE THAN ONE node (same owner in two files) returns the
 /// full candidate set — never one arbitrary pick — and a query whose
