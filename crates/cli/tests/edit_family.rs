@@ -87,6 +87,60 @@ fn assert_file(path: &Path, expected: &str) {
 }
 
 #[test]
+fn replace_lines_accepts_complete_async_method_from_stdin() {
+    let fixture = Fixture::new("replace-lines-method");
+    let before = "struct Worker;\nimpl Worker {\n    fn start_subscription_task(&self) {\n        old();\n    }\n}\n";
+    let replacement = "    fn start_subscription_task(&self) -> tokio::task::JoinHandle<()> {\n        tokio::spawn(async move {\n            let Some(value) = Some(1) else { return; };\n            println!(\"{value}\");\n        })\n    }\n";
+    std::fs::write(fixture.repo.join("worker.rs"), before).unwrap();
+    let output = fixture.run_with_stdin(
+        &["replace-lines", "worker.rs", "3:5"],
+        replacement.as_bytes(),
+    );
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(
+        &fixture.repo.join("worker.rs"),
+        &format!("struct Worker;\nimpl Worker {{\n{replacement}}}\n"),
+    );
+}
+
+#[test]
+fn invalid_edit_reports_candidate_parser_location_without_writing() {
+    let fixture = Fixture::new("edit-parser-diagnostic");
+    let before = "fn before() {}\n";
+    std::fs::write(fixture.repo.join("item.rs"), before).unwrap();
+    for args in [
+        vec!["replace-lines", "item.rs", "1:1", "fn after( {}"],
+        vec!["write", "item.rs", "fn after( {}"],
+        vec![
+            "patch",
+            "--- a/item.rs\n+++ b/item.rs\n@@ -1 +1 @@\n-fn before() {}\n+fn after( {}\n",
+        ],
+    ] {
+        for json in [false, true] {
+            let mut command = args.clone();
+            if json {
+                command.push("--json");
+            }
+            let output = fixture.run(&command);
+            assert_eq!(output.status.code(), Some(13), "{}", combined(&output));
+            let message = if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["error"]["code"], "invalid_result");
+                assert_eq!(value["published"], false);
+                value["error"]["message"].as_str().unwrap().to_owned()
+            } else {
+                combined(&output)
+            };
+            assert!(message.contains("proposed item.rs:1:"), "{message}");
+            assert!(message.contains("tree-sitter:"), "{message}");
+            assert!(message.contains("nothing written"), "{message}");
+            assert!(message.contains("proposed result"), "{message}");
+            assert_file(&fixture.repo.join("item.rs"), before);
+        }
+    }
+}
+
+#[test]
 fn malformed_patch_reports_input_line_and_preserves_the_file() {
     let fixture = Fixture::new("patch-prefix-diagnostic");
     let original = "fn before() {}\n";

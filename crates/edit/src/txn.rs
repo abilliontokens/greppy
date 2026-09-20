@@ -140,6 +140,40 @@ pub struct SyntaxCounts {
     pub missing: usize,
 }
 
+/// First parser failure in the proposed content. Coordinates are one-based;
+/// columns count bytes, as in tree-sitter, rather than displayed characters.
+pub fn first_syntax_diagnostic(language: Language, content: &[u8]) -> Option<String> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            let start = node.start_position();
+            let reason = if node.is_missing() {
+                format!("missing `{}`", node.kind())
+            } else {
+                "unexpected syntax".to_string()
+            };
+            return Some(format!(
+                "{}:{} (tree-sitter: {reason}; column is a byte offset)",
+                start.row + 1,
+                start.column + 1
+            ));
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return None;
+            }
+        }
+    }
+}
+
 /// The kinds of the ancestor chain (parent -> root, leaf excluded) of the
 /// smallest node covering `range`. This is the structural CONTEXT the edited
 /// bytes live in.

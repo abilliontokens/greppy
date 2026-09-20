@@ -791,6 +791,36 @@ pub(crate) fn edit_positional_payload(
     Ok(bytes)
 }
 
+/// Validate a candidate without writing it. Parser locations refer to the
+/// proposed content, which may have different line numbers from the live file.
+fn edit_validate_syntax(path: &str, before: &[u8], after: &[u8]) -> EditResult<()> {
+    let language = greppy_edit::language_for_path(std::path::Path::new(path));
+    if !language.is_supported() {
+        return Ok(());
+    }
+    if let (Some(before), Some(counts)) = (
+        greppy_edit::txn::syntax_counts(language, before),
+        greppy_edit::txn::syntax_counts(language, after),
+    ) {
+        if counts.errors > before.errors || counts.missing > before.missing {
+            let location = greppy_edit::txn::first_syntax_diagnostic(language, after)
+                .map(|diagnostic| format!("{path}:{diagnostic}"))
+                .unwrap_or_else(|| path.to_string());
+            return Err(EditRefusal::new(
+                "invalid_result",
+                format!(
+                    "refused: syntax validation failed in proposed {location}; \
+                     errors {} -> {}, missing nodes {} -> {} — nothing written. \
+                     Location refers to the proposed result, not the unchanged file",
+                    before.errors, counts.errors, before.missing, counts.missing
+                ),
+                13,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Publish one file and answer with the record the contract promises: the
 /// file, every span it wrote, the resulting text, and a handle for the new
 /// span so the next edit needs no `read` in between.
@@ -837,21 +867,7 @@ pub(crate) fn edit_publish(
         edit_set_exact_receipt(&mut record, vec![exact_address], exact_required);
         return Ok(record);
     }
-    let language = greppy_edit::language_for_path(std::path::Path::new(&located.rel));
-    if language.is_supported() {
-        if let (Some(before), Some(after)) = (
-            greppy_edit::txn::syntax_counts(language, &located.content),
-            greppy_edit::txn::syntax_counts(language, &new_content),
-        ) {
-            if after.errors > before.errors || after.missing > before.missing {
-                return Err(EditRefusal::new(
-                    "invalid_result",
-                    "refused: the edit would break the file's syntax — nothing written",
-                    13,
-                ));
-            }
-        }
-    }
+    edit_validate_syntax(&located.rel, &located.content, &new_content)?;
     if dry_run {
         // A handle addresses bytes on disk. A dry run wrote none, so handing
         // one back would hand back an address that is already stale.
@@ -1807,23 +1823,7 @@ pub(crate) fn run_trained_write(
         }
     }
     let old = before.as_deref().unwrap_or_default();
-    let language = greppy_edit::language_for_path(std::path::Path::new(&rel));
-    if language.is_supported() {
-        if let (Some(before_counts), Some(after_counts)) = (
-            greppy_edit::txn::syntax_counts(language, old),
-            greppy_edit::txn::syntax_counts(language, &bytes),
-        ) {
-            if after_counts.errors > before_counts.errors
-                || after_counts.missing > before_counts.missing
-            {
-                return Err(EditRefusal::new(
-                    "invalid_result",
-                    "refused: the edit would break the file's syntax — nothing written",
-                    13,
-                ));
-            }
-        }
-    }
+    edit_validate_syntax(&rel, old, &bytes)?;
     let mut record = edit_whole_file_record(root_path, &rel, &bytes, old, !dry_run);
     if before.as_deref() == Some(bytes.as_slice()) {
         record.already_as_sent = !dry_run;
@@ -2162,23 +2162,7 @@ fn run_trained_patch_with_publish_hook(
     for file in parsed {
         let (rel, abs, content) = edit_read_file(root_path, &file.path)?;
         let (after, changed) = apply_trained_patch_file(&rel, &content, &file.hunks)?;
-        let language = greppy_edit::language_for_path(std::path::Path::new(&rel));
-        if language.is_supported() {
-            if let (Some(before_counts), Some(after_counts)) = (
-                greppy_edit::txn::syntax_counts(language, &content),
-                greppy_edit::txn::syntax_counts(language, &after),
-            ) {
-                if after_counts.errors > before_counts.errors
-                    || after_counts.missing > before_counts.missing
-                {
-                    return Err(EditRefusal::new(
-                        "invalid_result",
-                        "refused: the edit would break the file's syntax — nothing written",
-                        13,
-                    ));
-                }
-            }
-        }
+        edit_validate_syntax(&rel, &content, &after)?;
         planned.push((rel, abs, content, after, changed));
     }
     let already = planned
