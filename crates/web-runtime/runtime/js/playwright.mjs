@@ -127,7 +127,8 @@ function navigationTimeout(ownerTimeout, options, prefix) {
     if (
       options.waitUntil != null &&
       options.waitUntil !== "load" &&
-      options.waitUntil !== "domcontentloaded"
+      options.waitUntil !== "domcontentloaded" &&
+      options.waitUntil !== "commit"
     ) {
       throwUnsupported(`${prefix}.waitUntil`);
     }
@@ -1916,7 +1917,7 @@ class Page {
         this._dispatchNetworkUntilSettled(),
         this._dispatchFrames(),
       ]);
-      this._emitLoad();
+      this._emitLoad(waitUntil);
       return this._responseFromRecord({
         url: this._url,
         status: result.status == null ? 0 : Number(result.status),
@@ -2325,20 +2326,21 @@ class Page {
     navigationTimeout(this._timeout, options, "Page.setContent");
     await engineCall("page.setContent", { page: this._id, html: String(html) });
     await this._dispatchFrames();
-    this._emitLoad();
+    this._emitLoad("load");
   }
 
   async reload(options) {
     const timeout = navigationTimeout(this._timeout, options, "Page.reload");
-    await engineCall("page.reload", { page: this._id, timeout });
+    const waitUntil = (options && options.waitUntil) || "load";
+    await engineCall("page.reload", { page: this._id, timeout, waitUntil });
     await this._flushNavigation();
     await this._dispatchFrames();
-    this._emitLoad();
+    this._emitLoad(waitUntil);
   }
 
-  _emitLoad() {
-    this._emit("domcontentloaded", this);
-    this._emit("load", this);
+  _emitLoad(waitUntil = "load") {
+    if (waitUntil !== "commit") this._emit("domcontentloaded", this);
+    if (waitUntil === "load") this._emit("load", this);
   }
 
   async waitForTimeout(ms) {
@@ -2351,7 +2353,11 @@ class Page {
     }
     refuseLocatorOptions("Page.waitForLoadState", options, ["timeout"]);
     const timeout = (options && options.timeout) || this._timeout || 30_000;
-    await engineCall("page.waitForLoadState", { page: this._id, timeout });
+    await engineCall("page.waitForLoadState", {
+      page: this._id,
+      timeout,
+      waitUntil: state || "load",
+    });
   }
 
   waitForNavigation(options) {
