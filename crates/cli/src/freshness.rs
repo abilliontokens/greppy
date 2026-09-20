@@ -400,6 +400,13 @@ pub(crate) fn freshness_serve_decision_with_policy(
     _warn_on_stale: bool,
 ) -> FreshnessServe {
     let freshness = nav_freshness_json(store, root, project);
+    // A verified writer owns a newer snapshot that is not visible yet. Even
+    // if a cached/TTL freshness check says the currently published graph is
+    // fresh, serving it here can return definitions deleted by the source
+    // change that triggered the writer. Fail closed until publication.
+    if workspace_writer_active(root) {
+        return FreshnessServe::Refuse(refresh_state(freshness, true));
+    }
     if freshness_json_is_fresh(&freshness) {
         return FreshnessServe::Fresh(freshness);
     }
