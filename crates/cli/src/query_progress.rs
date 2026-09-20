@@ -44,11 +44,18 @@ struct JobProgress {
     total: u64,
     unit: String,
     pid: Option<u64>,
+    started_at_unix_secs: Option<u64>,
+    rate_milli_spans_per_second: u64,
+    eta_unix_secs: Option<u64>,
 }
 
 impl JobProgress {
     fn read(path: &std::path::Path) -> Option<Self> {
         let value = crate::read_background_job(path)?;
+        Self::from_value(&value)
+    }
+
+    fn from_value(value: &serde_json::Value) -> Option<Self> {
         Some(Self {
             state: value.get("state")?.as_str()?.to_owned(),
             completed: value
@@ -65,7 +72,28 @@ impl JobProgress {
                 .unwrap_or("items")
                 .to_owned(),
             pid: value.get("pid").and_then(serde_json::Value::as_u64),
+            started_at_unix_secs: value
+                .get("started_at_unix_secs")
+                .and_then(serde_json::Value::as_u64),
+            rate_milli_spans_per_second: value
+                .get("rate_milli_spans_per_second")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            eta_unix_secs: value
+                .get("eta_unix_secs")
+                .and_then(serde_json::Value::as_u64),
         })
+    }
+
+    fn published_forecast(&self, now_unix_secs: u64) -> Option<(Prognosis, Duration)> {
+        if self.state != "embedding" || self.rate_milli_spans_per_second == 0 {
+            return None;
+        }
+        let deadline = self.eta_unix_secs?;
+        Some((
+            Prognosis::Remaining(Duration::from_secs(deadline.saturating_sub(now_unix_secs))),
+            Duration::from_secs(deadline),
+        ))
     }
 }
 
@@ -110,12 +138,14 @@ fn round_up(value: u64, quantum: u64) -> u64 {
 struct ProgressReporter {
     state: Option<String>,
     pid: Option<u64>,
+    started_at_unix_secs: Option<u64>,
     total: u64,
     phase_started_at: Duration,
     phase_started_completed: u64,
     last_completed: u64,
     last_progress_at: Duration,
     prognosis: Option<Prognosis>,
+    forecast_deadline: Option<Duration>,
     reported_deadline: Option<Duration>,
     reported_remaining: Option<Duration>,
     stalled: bool,
@@ -123,11 +153,12 @@ struct ProgressReporter {
 }
 
 impl ProgressReporter {
-    fn observe(
+    fn observe_at(
         &mut self,
         command: &str,
         job: Option<JobProgress>,
         elapsed: Duration,
+        now_unix_secs: u64,
     ) -> Option<String> {
         let Some(job) = job else {
             if self.missing_reported {
@@ -142,6 +173,7 @@ impl ProgressReporter {
 
         let reset = self.state.as_deref() != Some(job.state.as_str())
             || self.pid != job.pid
+            || self.started_at_unix_secs != job.started_at_unix_secs
             || self.total != job.total
             || job.completed < self.last_completed;
         let progress_changed = !reset && job.completed != self.last_completed;
@@ -150,30 +182,57 @@ impl ProgressReporter {
         if reset {
             self.state = Some(job.state.clone());
             self.pid = job.pid;
+            self.started_at_unix_secs = job.started_at_unix_secs;
             self.total = job.total;
             self.phase_started_at = elapsed;
             self.phase_started_completed = job.completed;
             self.last_completed = job.completed;
             self.last_progress_at = elapsed;
-            self.prognosis =
-                (job.total > 0 && job.completed >= job.total).then_some(Prognosis::Complete);
+            let published = job.published_forecast(now_unix_secs);
+            self.prognosis = if job.total > 0 && job.completed >= job.total {
+                Some(Prognosis::Complete)
+            } else {
+                published.map(|(prognosis, _)| prognosis)
+            };
+            self.forecast_deadline = published.map(|(_, deadline)| deadline);
             self.reported_deadline = None;
             self.reported_remaining = None;
             self.stalled = false;
-        } else if progress_changed {
-            self.last_completed = job.completed;
-            self.last_progress_at = elapsed;
-            self.prognosis = job.total.checked_sub(job.completed).and_then(|remaining| {
-                Prognosis::from_measurement(
-                    remaining,
-                    job.completed.saturating_sub(self.phase_started_completed),
-                    elapsed.saturating_sub(self.phase_started_at),
-                )
-            });
-            if let Some(Prognosis::Remaining(remaining)) = self.prognosis {
-                let deadline = elapsed.saturating_add(remaining);
+        } else {
+            if progress_changed {
+                self.last_completed = job.completed;
+                self.last_progress_at = elapsed;
+            }
+            let previous_prognosis = self.prognosis;
+            let forecast = if job.state == "embedding" {
+                job.published_forecast(now_unix_secs)
+            } else if progress_changed {
+                job.total.checked_sub(job.completed).and_then(|remaining| {
+                    Prognosis::from_measurement(
+                        remaining,
+                        job.completed.saturating_sub(self.phase_started_completed),
+                        elapsed.saturating_sub(self.phase_started_at),
+                    )
+                    .map(|prognosis| {
+                        let deadline = match prognosis {
+                            Prognosis::Remaining(remaining) => elapsed.saturating_add(remaining),
+                            Prognosis::Complete => elapsed,
+                        };
+                        (prognosis, deadline)
+                    })
+                })
+            } else {
+                None
+            };
+            if job.state == "embedding" || forecast.is_some() {
+                self.prognosis = forecast.map(|(prognosis, _)| prognosis);
+                self.forecast_deadline = forecast.map(|(_, deadline)| deadline);
+            }
+            if let Some((Prognosis::Remaining(remaining), deadline)) = forecast {
                 should_report |= self.forecast_changed_substantially(deadline, remaining);
             } else if self.prognosis == Some(Prognosis::Complete) {
+                should_report = true;
+            } else if previous_prognosis.is_some() && self.prognosis.is_none() {
                 should_report = true;
             }
         }
@@ -190,7 +249,7 @@ impl ProgressReporter {
         }
 
         if let Some(Prognosis::Remaining(remaining)) = self.prognosis {
-            self.reported_deadline = Some(elapsed.saturating_add(remaining));
+            self.reported_deadline = self.forecast_deadline;
             self.reported_remaining = Some(remaining);
         }
 
@@ -214,6 +273,16 @@ impl ProgressReporter {
             "greppy: {command} — {}: {progress}; {prognosis}{pid}",
             job.state
         ))
+    }
+
+    #[cfg(test)]
+    fn observe(
+        &mut self,
+        command: &str,
+        job: Option<JobProgress>,
+        elapsed: Duration,
+    ) -> Option<String> {
+        self.observe_at(command, job, elapsed, 0)
     }
 
     fn forecast_changed_substantially(&self, deadline: Duration, remaining: Duration) -> bool {
@@ -272,7 +341,7 @@ pub(crate) fn for_command(
     let mut reporter = ProgressReporter::default();
     Some(QueryProgress::start(INITIAL_DELAY, move |elapsed| {
         let job = job_path.as_deref().and_then(JobProgress::read);
-        if let Some(line) = reporter.observe(name, job, elapsed) {
+        if let Some(line) = reporter.observe_at(name, job, elapsed, crate::unix_now_secs_cli()) {
             eprintln!("{line}");
         }
     }))
@@ -289,6 +358,9 @@ mod tests {
             total,
             unit: "spans".into(),
             pid: Some(42),
+            started_at_unix_secs: Some(1_000),
+            rate_milli_spans_per_second: 0,
+            eta_unix_secs: None,
         }
     }
 
@@ -298,7 +370,7 @@ mod tests {
         assert!(reporter
             .observe(
                 "search",
-                Some(job("embedding", 400, 1000)),
+                Some(job("indexing", 400, 1000)),
                 Duration::from_secs(2)
             )
             .unwrap()
@@ -307,7 +379,7 @@ mod tests {
         let update = reporter
             .observe(
                 "search",
-                Some(job("embedding", 500, 1000)),
+                Some(job("indexing", 500, 1000)),
                 Duration::from_secs(12),
             )
             .unwrap();
@@ -321,6 +393,52 @@ mod tests {
             )
             .unwrap();
         assert!(new_phase.contains("measuring phase ETA"), "{new_phase}");
+    }
+
+    #[test]
+    fn published_measured_eta_is_parsed_and_aged_from_its_deadline() {
+        let value = serde_json::json!({
+            "state": "embedding",
+            "completed_spans": 400,
+            "total_spans": 1000,
+            "progress_unit": "spans",
+            "pid": 42,
+            "started_at_unix_secs": 900,
+            "rate_milli_spans_per_second": 1_000,
+            "eta_seconds": 100,
+            "eta_unix_secs": 1_100
+        });
+        let parsed = JobProgress::from_value(&value).unwrap();
+        assert_eq!(parsed.started_at_unix_secs, Some(900));
+        assert_eq!(
+            parsed.published_forecast(1_040),
+            Some((
+                Prognosis::Remaining(Duration::from_secs(60)),
+                Duration::from_secs(1_100)
+            ))
+        );
+
+        let mut reporter = ProgressReporter::default();
+        let line = reporter
+            .observe_at(
+                "search",
+                Some(parsed.clone()),
+                Duration::from_secs(2),
+                1_040,
+            )
+            .unwrap();
+        assert!(line.contains("phase ETA about 60s"), "{line}");
+        assert!(reporter
+            .observe_at("search", Some(parsed), Duration::from_secs(12), 1_050)
+            .is_none());
+
+        let mut unmeasured = JobProgress::from_value(&value).unwrap();
+        unmeasured.rate_milli_spans_per_second = 0;
+        let mut reporter = ProgressReporter::default();
+        let line = reporter
+            .observe_at("search", Some(unmeasured), Duration::from_secs(2), 1_040)
+            .unwrap();
+        assert!(line.contains("measuring phase ETA"), "{line}");
     }
 
     #[test]
@@ -388,7 +506,7 @@ mod tests {
             .is_none());
 
         let mut replacement = job("counting", 0, 0);
-        replacement.pid = Some(43);
+        replacement.started_at_unix_secs = Some(1_001);
         let reset = reporter
             .observe("search", Some(replacement), Duration::from_secs(123))
             .unwrap();
