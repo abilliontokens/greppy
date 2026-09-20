@@ -800,16 +800,43 @@ fn embedding_device_preference_obeys_cli_and_env() {
         inference_device_identity(&greppy_embed_native::DevicePreference::Cuda),
         "cuda:2"
     );
-    let explicit_cpu = embedding_device_preference(Some("cpu"), true);
+    let explicit_cpu = embedding_device_preference(Some("cpu"), false);
+    let no_gpu_cpu = embedding_device_preference(None, true);
     if cfg!(all(target_os = "macos", not(feature = "cpu-only"))) {
         assert!(matches!(
             explicit_cpu,
             Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
         ));
+        assert!(matches!(
+            no_gpu_cpu,
+            Err(Error::Invalid(message)) if message.contains("use Metal")
+        ));
     } else {
         assert_eq!(
             explicit_cpu.unwrap(),
             greppy_embed_native::DevicePreference::Cpu
+        );
+        assert_eq!(
+            no_gpu_cpu.unwrap(),
+            greppy_embed_native::DevicePreference::Cpu
+        );
+    }
+
+    // Summary inference shares the production macOS contract and must reject
+    // an explicit CPU selector independently of the no-GPU switch.
+    unsafe {
+        std::env::set_var(ENV_DEVICE, "cpu");
+    }
+    let summary_explicit_cpu = qwen_summary_device_preference();
+    if cfg!(all(target_os = "macos", not(feature = "cpu-only"))) {
+        assert!(matches!(
+            summary_explicit_cpu,
+            Err(Error::Invalid(message)) if message.contains("GREPPY_DEVICE=cpu")
+        ));
+    } else {
+        assert_eq!(
+            summary_explicit_cpu.unwrap(),
+            greppy_qwen35_native::DevicePreference::Cpu
         );
     }
 

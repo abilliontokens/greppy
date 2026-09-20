@@ -409,8 +409,8 @@ fn enforce_macos_production_gpu(
     #[cfg(all(target_os = "macos", not(feature = "cpu-only")))]
     if preference == greppy_embed_native::DevicePreference::Cpu {
         return Err(Error::Invalid(
-            "CPU inference is disabled in production macOS builds; use Metal, or rebuild with \
-             --features cpu-only for CI and diagnostics"
+            "CPU inference is disabled in production macOS builds; use Metal by removing \
+             --device cpu or --no-gpu and unsetting GREPPY_DEVICE=cpu or GREPPY_NO_GPU"
                 .into(),
         ));
     }
