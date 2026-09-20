@@ -1981,7 +1981,9 @@ class Page {
       frame: () => this.mainFrame(),
       response: async () => {
         const result = await engineCall("page.responses", { page: this._id });
-        const hit = (result.responses || []).find((row) => row.url === rec.url);
+        const hit = (result.responses || []).find(
+          (row) => String(row.requestId || "") === String(rec.requestId || ""),
+        );
         if (!hit) return null;
         return this._responseFromRecord(hit);
       },
