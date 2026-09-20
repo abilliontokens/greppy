@@ -987,8 +987,8 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 {
                     println!(
                         "`web wait` takes one QUERY or --url/--title; `text WORD` is two arguments. \
-                         No wait was run. Use `greppy web wait 'text={stray}'` for exact text, \
-                         `greppy web wait 'text~/{stray}/i'` for partial text, or \
+                         No wait was run. Use `greppy web wait 'text=WORD'` for exact text, \
+                         `greppy web wait 'text~/WORD/i'` for partial text, or \
                          `greppy web wait --url '~/PATTERN/'` for a URL."
                     );
                 } else if sub == "path" && stray == "--code" {

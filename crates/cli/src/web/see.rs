@@ -625,7 +625,6 @@ mod tests {
         for query in [
             "url_not=http://localhost:8023/users/sign_in",
             "url!~sign_in",
-            "url~catalogsearch",
             "url=http://localhost:7770/catalogsearch/",
             "URL_NOT=http://example.test/",
         ] {
@@ -642,6 +641,8 @@ mod tests {
         for css_sibling in [
             "div~span",
             "div ~ span",
+            "title~meta",
+            "url~meta",
             "input[class~=quantity]",
             "css=div~span",
         ] {
@@ -651,9 +652,7 @@ mod tests {
                 "{css_sibling}"
             );
         }
-        assert!(validate_condition_query("url~catalogsearch")
-            .expect_err("condition")
-            .contains("--url"));
+        assert!(validate_condition_query("title~meta").is_ok());
     }
 
     #[test]
@@ -718,14 +717,16 @@ pub(super) fn validate_condition_query(query: &str) -> std::result::Result<(), S
 
 fn wait_condition_used_as_node_query(query: &str) -> Option<String> {
     let lower = query.trim().to_ascii_lowercase();
+    // `name~selector` is also valid bare CSS general-sibling syntax (including
+    // `title~meta`), so the ambiguous tilde-only forms must remain node
+    // queries. The explicit equals/negative forms cannot be CSS selectors and
+    // are safe to diagnose as mistaken --url/--title conditions.
     let url_like = lower.starts_with("url=")
-        || lower.starts_with("url~")
         || lower.starts_with("url!~")
         || lower.starts_with("url!=")
         || lower.starts_with("url_not=")
         || lower.starts_with("url_not~");
-    let title_like =
-        lower.starts_with("title=") || lower.starts_with("title~") || lower.starts_with("title!~");
+    let title_like = lower.starts_with("title=") || lower.starts_with("title!~");
     if url_like {
         Some(
             "URL conditions use --url EXACT or --url '~/REGEX/flags', optionally with --absent; they are not node queries and must not be sent to the page"

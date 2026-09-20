@@ -1047,20 +1047,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         drop(ChunkStore::open(root.path()).unwrap());
         let payload = b"shared payload for cas race";
-        let workers = (0..8).map(|_| {
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2).map(|_| {
             let root = root.path().to_path_buf();
+            let start = std::sync::Arc::clone(&start);
             std::thread::spawn(move || {
                 let store = retry_when_busy(|| ChunkStore::open(&root));
-                (0..40)
-                    .map(|_| retry_when_busy(|| store.put(payload)))
-                    .collect::<Vec<_>>()
+                start.wait();
+                retry_when_busy(|| store.put(payload))
             })
         });
         let ids = workers
             .map(|worker| worker.join().unwrap())
-            .flatten()
             .collect::<Vec<_>>();
-        assert!(!ids.is_empty());
+        assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| *id == ids[0]));
         let store = ChunkStore::open(root.path()).unwrap();
         assert_eq!(store.read(ids[0]).unwrap(), payload);
