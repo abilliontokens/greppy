@@ -277,6 +277,7 @@ mod tests {
 
     #[test]
     fn css_named_container_queries_are_valid_without_weakening_syntax_errors() {
+        let css = greppy_parser::language_for_path(std::path::Path::new("editor.css"));
         let valid = br#"@container mail-content-editor (max-width: 460px) {
   .editor { color: red; }
 }
@@ -285,34 +286,34 @@ mod tests {
 }
 "#;
         assert_eq!(
-            syntax_counts(Language::Css, valid),
+            syntax_counts(css, valid),
             Some(SyntaxCounts {
                 errors: 0,
                 missing: 0
             })
         );
-        assert_eq!(first_syntax_diagnostic(Language::Css, valid), None);
+        assert_eq!(first_syntax_diagnostic(css, valid), None);
 
         let malformed_query = br#"@container mail-content-editor (max-width 460px) {
   .editor { color: red; }
 }
 "#;
-        let query_counts = syntax_counts(Language::Css, malformed_query).unwrap();
+        let query_counts = syntax_counts(css, malformed_query).unwrap();
         assert!(
             query_counts.errors + query_counts.missing > 0,
             "malformed container query must remain an atomic edit failure"
         );
-        assert!(first_syntax_diagnostic(Language::Css, malformed_query).is_some());
+        assert!(first_syntax_diagnostic(css, malformed_query).is_some());
 
         let malformed_body = br#"@container mail-content-editor (max-width: 460px) {
   .editor { color: red; }
 "#;
-        let body_counts = syntax_counts(Language::Css, malformed_body).unwrap();
+        let body_counts = syntax_counts(css, malformed_body).unwrap();
         assert!(
             body_counts.errors + body_counts.missing > 0,
             "malformed container body must remain an atomic edit failure"
         );
-        assert!(first_syntax_diagnostic(Language::Css, malformed_body).is_some());
+        assert!(first_syntax_diagnostic(css, malformed_body).is_some());
     }
 
     #[test]
