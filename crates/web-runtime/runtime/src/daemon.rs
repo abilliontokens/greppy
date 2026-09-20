@@ -2930,7 +2930,7 @@ impl Daemon {
                         }
                     };
                     requests = enrich_network_records(requests, &responses);
-                    if request.params.get("filter").and_then(Value::as_str) == Some("failed") {
+                    if request.payload.get("filter").and_then(Value::as_str) == Some("failed") {
                         requests = Value::Array(
                             requests
                                 .as_array()
@@ -2941,7 +2941,7 @@ impl Daemon {
                                 .collect(),
                         );
                     }
-                    if let Some(query) = request.params.get("query").and_then(Value::as_str) {
+                    if let Some(query) = request.payload.get("query").and_then(Value::as_str) {
                         let predicates = match greppy_web_client::record_query::parse(query) {
                             Ok(predicates) => predicates,
                             Err(message) => {
