@@ -25,7 +25,9 @@ const SHIM_JS: &str = r#"(function () {
   // Servo's HeadParsed signal only says that the head has been parsed. Keep
   // the DOMContentLoaded milestone separate so navigation waits do not return
   // while the parser or a deferred script is still running.
-  var domContentLoaded = document.readyState === 'complete';
+  var lifecycleWindow = globalThis;
+  var lifecycleDocument = document;
+  var domContentLoaded = lifecycleDocument.readyState === 'complete';
   Object.defineProperty(globalThis, '__greppyDOMContentLoaded', {
     get: function () { return domContentLoaded; },
     configurable: false,
@@ -35,9 +37,9 @@ const SHIM_JS: &str = r#"(function () {
     var recordDOMContentLoaded = function recordDOMContentLoaded(event) {
       if (!event.isTrusted) return;
       domContentLoaded = true;
-      document.removeEventListener('DOMContentLoaded', recordDOMContentLoaded);
+      lifecycleWindow.removeEventListener('DOMContentLoaded', recordDOMContentLoaded, true);
     };
-    document.addEventListener('DOMContentLoaded', recordDOMContentLoaded);
+    lifecycleWindow.addEventListener('DOMContentLoaded', recordDOMContentLoaded, true);
   }
 
   // requestIdleCallback: Servo has no implementation at all. Deferred work is
