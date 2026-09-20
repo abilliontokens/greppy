@@ -224,13 +224,7 @@ fn recover_completed_index_snapshot(
 
     let mut rejected = Vec::new();
     for (candidate, owner_pid) in candidates {
-        match validate_index_recovery_candidate(
-            &candidate,
-            target,
-            effective_root,
-            project,
-            options,
-        ) {
+        match validate_index_recovery_candidate(&candidate, target, project, options) {
             Ok(()) => {
                 cleanup_sqlite_sidecars(&candidate)?;
                 sync_file(&candidate)?;
@@ -269,7 +263,6 @@ fn recover_completed_index_snapshot(
 fn validate_index_recovery_candidate(
     candidate: &std::path::Path,
     target: &std::path::Path,
-    effective_root: &std::path::Path,
     project: &str,
     options: &greppy_indexer::IndexOptions,
 ) -> Result<()> {
