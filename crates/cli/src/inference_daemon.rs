@@ -28,16 +28,17 @@ pub(super) enum RequestOutcome<T> {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SpawnOutcome {
     Spawned,
     SpawnFailed,
     Contended,
     Cooldown,
+    CoordinationFailed(String),
 }
 
 impl SpawnOutcome {
-    pub(super) fn attempted(self) -> bool {
+    pub(super) fn attempted(&self) -> bool {
         matches!(self, Self::Spawned | Self::SpawnFailed)
     }
 }
@@ -521,14 +522,18 @@ pub(super) fn spawn_once(endpoint: &Endpoint, spawn: impl FnOnce() -> Option<()>
     if cooldown_active(endpoint) {
         return SpawnOutcome::Cooldown;
     }
-    let Some(lock) = greppy_core::cache::acquire_named_lock(
+    let lock = match greppy_core::cache::acquire_named_lock(
         &endpoint.spawn_lock_name(),
         greppy_core::cache::LockMode::Exclusive,
         true,
-    )
-    .ok()
-    .flatten() else {
-        return SpawnOutcome::Contended;
+    ) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return SpawnOutcome::Contended,
+        Err(error) => {
+            return SpawnOutcome::CoordinationFailed(format!(
+                "cannot acquire daemon spawn lock: {error}"
+            ))
+        }
     };
     let outcome = if spawn().is_some() {
         SpawnOutcome::Spawned
@@ -2450,6 +2455,47 @@ mod tests {
             SpawnOutcome::Contended
         );
         drop(lock);
+    }
+
+    #[test]
+    fn spawn_lock_setup_error_is_distinct_from_contention() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let invalid_store = root.path().join("not-a-directory");
+        std::fs::write(&invalid_store, b"data").unwrap();
+        let previous = std::env::var_os("GREPPY_STORE_DIR");
+        // SAFETY: serialized by the crate-wide environment lock and restored below.
+        unsafe { std::env::set_var("GREPPY_STORE_DIR", &invalid_store) };
+        let endpoint = Endpoint::for_identity(
+            "spawn-error-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let outcome = spawn_once(&endpoint, || {
+            panic!("lock setup failure must prevent spawn")
+        });
+        // SAFETY: still serialized by the crate-wide environment lock.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("GREPPY_STORE_DIR", value),
+                None => std::env::remove_var("GREPPY_STORE_DIR"),
+            }
+        }
+        match outcome {
+            SpawnOutcome::CoordinationFailed(error) => {
+                assert!(
+                    error.contains("cannot acquire daemon spawn lock"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("refusing non-directory cache namespace"),
+                    "{error}"
+                );
+            }
+            other => panic!("expected coordination failure, got {other:?}"),
+        }
     }
 
     #[test]

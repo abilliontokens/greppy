@@ -964,6 +964,9 @@ pub(super) fn ensure_supervisor(
                         .unwrap_or("spawn coordination failed")
                 )));
             }
+            crate::inference_daemon::SpawnOutcome::CoordinationFailed(error) => {
+                return Err(spawn_coordination_unavailable(error));
+            }
         }
         let started = Instant::now();
         let budget = Duration::from_secs(60);
@@ -1011,6 +1014,16 @@ pub(super) fn ensure_supervisor(
             )
         )))
     }
+}
+
+fn spawn_coordination_unavailable(error: String) -> ErrorObject {
+    ErrorObject::new(
+        "runtime_storage_unavailable",
+        error,
+        new_request_id(),
+        EXIT_WEB_UNAVAILABLE,
+        "fix the Greppy data-root path and ownership, then retry",
+    )
 }
 
 fn attach_cookie_path(socket: &Path) -> PathBuf {
@@ -1968,5 +1981,17 @@ mod scope_tests {
             assert_ne!(a, c);
             assert!(a.starts_with("run_ws_"), "{a}");
         });
+    }
+
+    #[test]
+    fn spawn_coordination_error_reports_storage_action_without_install_advice() {
+        let error = spawn_coordination_unavailable(
+            "cannot acquire daemon spawn lock: cache root is not owned".into(),
+        );
+        assert_eq!(error.code, "runtime_storage_unavailable");
+        assert_eq!(error.exit_code, EXIT_WEB_UNAVAILABLE);
+        assert!(error.message.contains("cache root is not owned"));
+        assert!(error.next_action.contains("data-root path and ownership"));
+        assert!(!error.next_action.contains("install"));
     }
 }

@@ -106,6 +106,7 @@ fn request_via_daemon(
             RequestOutcome::NoDaemon
         }
         SpawnOutcome::Contended => RequestOutcome::DaemonBusy,
+        SpawnOutcome::CoordinationFailed(_) => RequestOutcome::Failed,
     }
 }
 

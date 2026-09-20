@@ -167,7 +167,7 @@ impl ManagedKind {
     }
 }
 
-pub fn data_root() -> PathBuf {
+fn configured_data_root() -> PathBuf {
     if let Ok(p) = std::env::var("GREPPY_STORE_DIR") {
         let path = PathBuf::from(p);
         return if path.is_absolute() {
@@ -202,6 +202,68 @@ pub fn data_root() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("greppy")
+}
+
+fn resolved_data_root() -> io::Result<PathBuf> {
+    let configured = configured_data_root();
+    let metadata = match fs::symlink_metadata(&configured) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(configured),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(configured);
+    }
+    let target = fs::canonicalize(&configured).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot resolve cache root symlink {}: {error}",
+                configured.display()
+            ),
+        )
+    })?;
+    let target_metadata = fs::symlink_metadata(&target)?;
+    if !target_metadata.is_dir() || target_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cache root symlink {} does not resolve to a directory",
+                configured.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current_uid = unsafe { libc::geteuid() };
+        validate_data_root_owner(&configured, &target, target_metadata.uid(), current_uid)?;
+    }
+    Ok(target)
+}
+
+#[cfg(unix)]
+fn validate_data_root_owner(
+    configured: &Path,
+    target: &Path,
+    owner_uid: u32,
+    current_uid: u32,
+) -> io::Result<()> {
+    if owner_uid == current_uid {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "cache root symlink {} resolves to {}, which is not owned by the current user",
+            configured.display(),
+            target.display()
+        ),
+    ))
+}
+
+pub fn data_root() -> PathBuf {
+    resolved_data_root().unwrap_or_else(|_| configured_data_root())
 }
 
 pub fn workspaces_root() -> PathBuf {
@@ -1468,7 +1530,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn ensure_owned_namespace(dir: &Path) -> io::Result<()> {
-    let data = data_root();
+    let data = resolved_data_root()?;
     if dir.starts_with(&data) {
         ensure_one_directory(&data)?;
         let mut current = data;
@@ -1776,6 +1838,27 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 mod tests {
     use super::*;
 
+    struct StoreDirRestore(Option<std::ffi::OsString>);
+
+    impl StoreDirRestore {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("GREPPY_STORE_DIR");
+            unsafe { std::env::set_var("GREPPY_STORE_DIR", path) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for StoreDirRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var("GREPPY_STORE_DIR", previous),
+                    None => std::env::remove_var("GREPPY_STORE_DIR"),
+                }
+            }
+        }
+    }
+
     fn tempdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "greppy-cache-{tag}-{}-{}",
@@ -1785,6 +1868,75 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn absent_data_root_is_created_for_named_locks() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("absent-data-root");
+        let root = base.join("new-data-root");
+        let _restore = StoreDirRestore::set(&root);
+
+        let lock = acquire_named_lock("startup", LockMode::Exclusive, true)
+            .unwrap()
+            .unwrap();
+        assert!(root.join("locks").is_dir());
+        assert_eq!(lock.path(), root.join("locks/startup"));
+        drop(lock);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_data_root_symlink_is_resolved_but_descendant_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("data-root-symlink");
+        let target = base.join("nvme-store");
+        fs::create_dir(&target).unwrap();
+        let root = base.join("greppy-store");
+        symlink(&target, &root).unwrap();
+        let _restore = StoreDirRestore::set(&root);
+
+        let lock = acquire_named_lock("startup", LockMode::Exclusive, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lock.path(), target.join("locks/startup"));
+        drop(lock);
+
+        fs::remove_dir_all(target.join("locks")).unwrap();
+        let external = base.join("external-locks");
+        fs::create_dir(&external).unwrap();
+        symlink(&external, target.join("locks")).unwrap();
+        let error = acquire_named_lock("blocked", LockMode::Exclusive, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refusing non-directory cache namespace"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_root_symlink_rejects_non_directory_and_unowned_targets() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let base = tempdir("invalid-data-root-symlink");
+        let file = base.join("not-a-directory");
+        fs::write(&file, b"data").unwrap();
+        let root = base.join("greppy-store");
+        symlink(&file, &root).unwrap();
+        let _restore = StoreDirRestore::set(&root);
+        let error = acquire_named_lock("blocked", LockMode::Exclusive, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not resolve to a directory"));
+
+        let error = validate_data_root_owner(&root, &file, 1000, 1001).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("not owned by the current user"));
+        let _ = fs::remove_dir_all(base);
     }
 
     #[cfg(windows)]
