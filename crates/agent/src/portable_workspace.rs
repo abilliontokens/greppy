@@ -2431,17 +2431,76 @@ fn restore_apply_journal(
     let _ = fs::remove_file(&index);
     let observed = capture_repository(&repository, core.chunks())?;
     let observed_hash = observed.baseline_hash.clone();
+    let mismatch_detail = baseline_mismatch_detail(&proposal.baseline, &observed);
     release_snapshot(core.chunks(), observed);
     if observed_hash != journal.baseline_hash {
         return Err(WorkspaceError::Tampered {
             path: repository,
             detail: format!(
-                "apply rollback could not restore baseline {}; observed {observed_hash}",
-                journal.baseline_hash
+                "apply rollback could not restore baseline {}; observed {observed_hash}; {mismatch_detail}",
+                journal.baseline_hash,
             ),
         });
     }
     remove_apply_journal(journal_path)
+}
+
+fn baseline_mismatch_detail(expected: &BaselineSnapshot, observed: &BaselineSnapshot) -> String {
+    if expected.base_commit != observed.base_commit {
+        return format!(
+            "base commit differs: expected {}, observed {}",
+            expected.base_commit, observed.base_commit
+        );
+    }
+    if expected.index_hash != observed.index_hash {
+        return format!(
+            "index hash differs: expected {}, observed {}",
+            expected.index_hash, observed.index_hash
+        );
+    }
+    if expected.hardlink_groups != observed.hardlink_groups {
+        return format!(
+            "hardlink groups differ: expected {:?}, observed {:?}",
+            expected.hardlink_groups, observed.hardlink_groups
+        );
+    }
+    for expected_entry in &expected.entries {
+        let Some(observed_entry) = observed
+            .entries
+            .iter()
+            .find(|entry| entry.path == expected_entry.path)
+        else {
+            return format!(
+                "baseline path is missing from observation: {}",
+                expected_entry.path
+            );
+        };
+        if expected_entry != observed_entry {
+            return format!(
+                "baseline path differs: {}; expected kind={:?} mode={:o} size={} mtime={} hash={}; observed kind={:?} mode={:o} size={} mtime={} hash={}",
+                expected_entry.path,
+                expected_entry.kind,
+                expected_entry.mode,
+                expected_entry.size,
+                expected_entry.modified_unix_ns,
+                expected_entry.content_hash,
+                observed_entry.kind,
+                observed_entry.mode,
+                observed_entry.size,
+                observed_entry.modified_unix_ns,
+                observed_entry.content_hash,
+            );
+        }
+    }
+    if let Some(extra) = observed.entries.iter().find(|entry| {
+        !expected
+            .entries
+            .iter()
+            .any(|candidate| candidate.path == entry.path)
+    }) {
+        return format!("unexpected observed baseline path: {}", extra.path);
+    }
+    "baseline serialization differs despite matching visible fields".into()
 }
 
 fn restore_pinned_baseline_entry(
