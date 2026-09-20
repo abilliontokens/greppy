@@ -1417,6 +1417,7 @@ fn apply_from_core(
         &proposal.hardlink_groups,
         &journal.path_states,
         ref_name,
+        |expected| &expected.final_state,
     ) {
         restore_apply_journal(core, &journal_path, &journal)?;
         return Err(error);
@@ -2319,6 +2320,23 @@ fn restore_apply_journal(
     // recovery.
     for entry in &proposal.baseline.entries {
         if restore_paths.contains(&entry.path) {
+            test_apply_hook("recovery-before-pinned-entry", Some(&entry.path));
+            let expectation = expectations
+                .iter()
+                .find(|expected| expected.path == entry.path)
+                .expect("restore paths were derived from expectations");
+            ensure_safe_path_ancestors(&repository, &entry.path, &journal.ref_name)?;
+            let observed = visible_path_state(&repository.join(&entry.path))?;
+            if observed != expectation.baseline && observed != expectation.final_state {
+                let _ = fs::remove_file(&index);
+                return Err(WorkspaceError::Conflict {
+                    ref_name: journal.ref_name.clone(),
+                    detail: format!(
+                        "apply recovery preserved a late external change to {}",
+                        entry.path
+                    ),
+                });
+            }
             restore_pinned_baseline_entry(core, &repository, entry)?;
         }
     }
@@ -2340,7 +2358,14 @@ fn restore_apply_journal(
             });
         }
     }
-    materialize_hardlink_groups(&repository, &baseline_hardlinks)?;
+    test_apply_hook("recovery-before-hardlinks", None);
+    materialize_hardlink_groups_checked(
+        &repository,
+        &baseline_hardlinks,
+        &expectations,
+        &journal.ref_name,
+        |expected| &expected.baseline,
+    )?;
     for (path, modified_unix_ns) in &journal.modified_times {
         validate_apply_path(path)?;
         let target = repository.join(path);
@@ -2540,9 +2565,12 @@ fn replace_visible_path(temporary: &Path, target: &Path) -> io::Result<()> {
     fs::rename(temporary, target)
 }
 
-fn materialize_hardlink_groups(
+fn materialize_hardlink_groups_checked<'a>(
     repository: &Path,
     groups: &[Vec<String>],
+    expectations: &'a [ApplyPathExpectation],
+    ref_name: &str,
+    expected_state: impl Fn(&'a ApplyPathExpectation) -> &'a ApplyPathState,
 ) -> Result<(), WorkspaceError> {
     let mut seen = BTreeSet::new();
     for group in groups {
@@ -2552,60 +2580,14 @@ fn materialize_hardlink_groups(
                 detail: "proposal hardlink group contains fewer than two paths".into(),
             });
         }
-        let source_relative = &group[0];
-        validate_apply_path(source_relative)?;
-        let source = repository.join(source_relative);
-        let source_metadata = fs::symlink_metadata(&source)?;
-        if !source_metadata.file_type().is_file() {
-            return Err(WorkspaceError::Tampered {
-                path: source,
-                detail: "proposal hardlink source is not a regular file".into(),
-            });
-        }
         for relative in group {
-            validate_apply_path(relative)?;
+            ensure_safe_path_ancestors(repository, relative, ref_name)?;
             if !seen.insert(relative) {
                 return Err(WorkspaceError::Tampered {
                     path: repository.join(relative),
                     detail: "proposal path belongs to more than one hardlink group".into(),
                 });
             }
-        }
-        for relative in &group[1..] {
-            let target = repository.join(relative);
-            let target_metadata = fs::symlink_metadata(&target)?;
-            if !target_metadata.file_type().is_file() {
-                return Err(WorkspaceError::Tampered {
-                    path: target,
-                    detail: "proposal hardlink target is not a regular file".into(),
-                });
-            }
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let temporary = temporary_apply_path(&target);
-            fs::hard_link(&source, &temporary)?;
-            if let Err(error) = replace_visible_path(&temporary, &target) {
-                let _ = fs::remove_file(&temporary);
-                return Err(error.into());
-            }
-            if let Some(parent) = target.parent() {
-                sync_directory(parent)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn materialize_hardlink_groups_checked(
-    repository: &Path,
-    groups: &[Vec<String>],
-    expectations: &[ApplyPathExpectation],
-    ref_name: &str,
-) -> Result<(), WorkspaceError> {
-    for group in groups {
-        for relative in group {
-            ensure_safe_path_ancestors(repository, relative, ref_name)?;
             let expected = expectations
                 .iter()
                 .find(|expected| expected.path == *relative)
@@ -2613,7 +2595,7 @@ fn materialize_hardlink_groups_checked(
                     path: repository.join(relative),
                     detail: "proposal hardlink path has no apply expectation".into(),
                 })?;
-            if visible_path_state(&repository.join(relative))? != expected.final_state {
+            if visible_path_state(&repository.join(relative))? != *expected_state(expected) {
                 return Err(WorkspaceError::Conflict {
                     ref_name: ref_name.into(),
                     detail: format!("proposal hardlink path changed before relinking: {relative}"),
@@ -2637,8 +2619,8 @@ fn materialize_hardlink_groups_checked(
                 .iter()
                 .find(|expected| expected.path == **relative)
                 .expect("group expectations were validated above");
-            if visible_path_state(&source)? != source_expected.final_state
-                || visible_path_state(&target)? != target_expected.final_state
+            if visible_path_state(&source)? != *expected_state(source_expected)
+                || visible_path_state(&target)? != *expected_state(target_expected)
             {
                 return Err(WorkspaceError::Conflict {
                     ref_name: ref_name.into(),
@@ -2649,8 +2631,8 @@ fn materialize_hardlink_groups_checked(
             fs::hard_link(&source, &temporary)?;
             ensure_safe_path_ancestors(repository, source_relative, ref_name)?;
             ensure_safe_path_ancestors(repository, relative, ref_name)?;
-            if visible_path_state(&source)? != source_expected.final_state
-                || visible_path_state(&target)? != target_expected.final_state
+            if visible_path_state(&source)? != *expected_state(source_expected)
+                || visible_path_state(&target)? != *expected_state(target_expected)
             {
                 let _ = fs::remove_file(&temporary);
                 return Err(WorkspaceError::Conflict {
@@ -4669,6 +4651,51 @@ mod tests {
         )
         .unwrap();
         materialize_git_tree_entry(&repo, &proposal.final_tree, "tracked.txt").unwrap();
+        let hook_repo = repo.clone();
+        *APPLY_TEST_HOOK.lock().unwrap() = Some(Box::new(move |point, path| {
+            if point == "recovery-before-pinned-entry" && path == Some("tracked.txt") {
+                fs::write(hook_repo.join("tracked.txt"), b"external during recovery\n").unwrap();
+            }
+        }));
+        assert!(matches!(
+            recover_apply_journals(&recovery_core),
+            Err(WorkspaceError::Conflict { .. })
+        ));
+        *APPLY_TEST_HOOK.lock().unwrap() = None;
+        assert!(journal_path.exists());
+        assert_eq!(
+            fs::read(repo.join("tracked.txt")).unwrap(),
+            b"external during recovery\n"
+        );
+        materialize_git_tree_entry(&repo, &proposal.final_tree, "tracked.txt").unwrap();
+        materialize_git_tree_entry(&repo, &proposal.final_tree, "baseline-linked-a.txt").unwrap();
+        materialize_git_tree_entry(&repo, &proposal.final_tree, "baseline-linked-b.txt").unwrap();
+        let hook_repo = repo.clone();
+        *APPLY_TEST_HOOK.lock().unwrap() = Some(Box::new(move |point, _| {
+            if point == "recovery-before-hardlinks" {
+                fs::write(
+                    hook_repo.join("baseline-linked-b.txt"),
+                    b"external before recovery relink\n",
+                )
+                .unwrap();
+            }
+        }));
+        assert!(matches!(
+            recover_apply_journals(&recovery_core),
+            Err(WorkspaceError::Conflict { .. })
+        ));
+        *APPLY_TEST_HOOK.lock().unwrap() = None;
+        assert!(journal_path.exists());
+        assert_eq!(
+            fs::read(repo.join("baseline-linked-b.txt")).unwrap(),
+            b"external before recovery relink\n"
+        );
+        fs::remove_file(repo.join("baseline-linked-b.txt")).unwrap();
+        fs::hard_link(
+            repo.join("baseline-linked-a.txt"),
+            repo.join("baseline-linked-b.txt"),
+        )
+        .unwrap();
         recover_apply_journals(&recovery_core).unwrap();
         assert!(!journal_path.exists());
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
