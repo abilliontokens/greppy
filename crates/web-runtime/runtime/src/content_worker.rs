@@ -1184,7 +1184,7 @@ impl ContentEngine {
         timeout: Duration,
         url_settled: impl FnMut() -> bool,
     ) -> io::Result<bool> {
-        self.spin_until_loaded_until(webview, timeout, WaitUntil::Load, url_settled)
+        self.spin_until_loaded_until(webview, timeout, WaitUntil::Load, || false, url_settled)
     }
 
     fn spin_until_loaded_until(
@@ -1192,6 +1192,7 @@ impl ContentEngine {
         webview: &WebView,
         timeout: Duration,
         until: WaitUntil,
+        mut terminal_failure: impl FnMut() -> bool,
         mut url_settled: impl FnMut() -> bool,
     ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
@@ -1201,12 +1202,20 @@ impl ContentEngine {
             if self.parent_dead() {
                 return Err(Self::parent_gone());
             }
+            if terminal_failure() {
+                trace.finish(webview);
+                return Ok(true);
+            }
             trace.note(webview, &mut url_settled);
             if url_settled() && self.load_committed_for(webview, &mut last_js, until) {
                 trace.finish(webview);
                 return Ok(true);
             }
             self.servo.spin_event_loop();
+            if terminal_failure() {
+                trace.finish(webview);
+                return Ok(true);
+            }
             trace.note(webview, &mut url_settled);
             if url_settled() && self.load_committed_for(webview, &mut last_js, until) {
                 trace.finish(webview);
@@ -2202,31 +2211,34 @@ impl ContentEngine {
                 let until = WaitUntil::from_params(&params)?;
                 let engine = &*self;
                 let mut last_stamp = Instant::now() - Duration::from_millis(200);
-                if !self.spin_until_loaded_until(&loading, call_timeout(&params), until, || {
-                    if denied.denied_navigation.borrow().is_some() {
-                        return true;
-                    }
-                    let url_settled = loading.url().is_some_and(|current| {
-                        urls_match(&current, &expected)
-                            || previous.as_ref().is_some_and(|old| current != *old)
-                    });
-                    if !url_settled || !stamped {
-                        return url_settled;
-                    }
-                    // Poll at the same 25ms cadence the readyState probe uses.
-                    if last_stamp.elapsed() < Duration::from_millis(25) {
-                        return false;
-                    }
-                    last_stamp = Instant::now();
-                    matches!(
-                        engine.evaluate_until(
-                            loading.clone(),
-                            "typeof window.__greppyNavStamp === 'undefined'",
-                            Duration::from_millis(150),
-                        ),
-                        Ok(JSValue::Boolean(true))
-                    )
-                })? {
+                if !self.spin_until_loaded_until(
+                    &loading,
+                    call_timeout(&params),
+                    until,
+                    || denied.denied_navigation.borrow().is_some(),
+                    || {
+                        let url_settled = loading.url().is_some_and(|current| {
+                            urls_match(&current, &expected)
+                                || previous.as_ref().is_some_and(|old| current != *old)
+                        });
+                        if !url_settled || !stamped {
+                            return url_settled;
+                        }
+                        // Poll at the same 25ms cadence the readyState probe uses.
+                        if last_stamp.elapsed() < Duration::from_millis(25) {
+                            return false;
+                        }
+                        last_stamp = Instant::now();
+                        matches!(
+                            engine.evaluate_until(
+                                loading.clone(),
+                                "typeof window.__greppyNavStamp === 'undefined'",
+                                Duration::from_millis(150),
+                            ),
+                            Ok(JSValue::Boolean(true))
+                        )
+                    },
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(
@@ -3074,7 +3086,13 @@ impl ContentEngine {
                 let (webview, _) = self.page(&page_id)?.clone();
                 let loading = webview.clone();
                 let until = WaitUntil::from_params(&params)?;
-                if !self.spin_until_loaded_until(&loading, call_timeout(&params), until, || true)? {
+                if !self.spin_until_loaded_until(
+                    &loading,
+                    call_timeout(&params),
+                    until,
+                    || false,
+                    || true,
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out waiting for load state",
