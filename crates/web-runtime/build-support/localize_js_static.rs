@@ -191,13 +191,21 @@ fn namespace_linux_engine_symbols(
             .cloned()
             .collect::<BTreeSet<_>>();
         reject_mixed_icu_versions(&overlaps)?;
-        redefine_linux_archive_symbols(archive, &overlaps, "__greppy_sm_")?;
+        let comdat_signatures = local_icu_comdat_signatures(archive, "__greppy_sm_")?;
+        reject_mixed_icu_versions(&comdat_signatures)?;
+        let symbols = overlaps
+            .union(&comdat_signatures)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        redefine_linux_archive_symbols(archive, &symbols, "__greppy_sm_")?;
         verify_symbols_absent(archive, &overlaps, "ICU")?;
+        verify_local_icu_comdat_absent(archive, "__greppy_sm_")?;
         let renamed = verify_symbols_renamed(archive, &overlaps, "__greppy_sm_", "ICU")?;
         println!(
-            "cargo:warning=engine namespace result: SpiderMonkey archive {} had {} ICU overlaps and {} renamed definitions",
+            "cargo:warning=engine namespace result: SpiderMonkey archive {} had {} ICU overlaps, {} ICU COMDAT signatures, and {} renamed definitions",
             archive.display(),
             overlaps.len(),
+            comdat_signatures.len(),
             renamed
         );
     }
@@ -237,6 +245,59 @@ fn namespace_linux_engine_symbols(
     Ok(())
 }
 
+pub(crate) fn local_icu_comdat_signatures(
+    archive: &Path,
+    renamed_prefix: &str,
+) -> Result<BTreeSet<String>, String> {
+    let output = Command::new("nm")
+        .arg(archive)
+        .output()
+        .map_err(|e| format!("nm {}: {e}", archive.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "nm {} failed: {}\n{}",
+            archive.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(parse_local_icu_comdat_signatures(
+        &String::from_utf8_lossy(&output.stdout),
+        renamed_prefix,
+    ))
+}
+
+fn parse_local_icu_comdat_signatures(output: &str, renamed_prefix: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            let (kind, name) = match parts.as_slice() {
+                [kind, name] => (*kind, *name),
+                [.., kind, name] => (*kind, *name),
+                _ => return None,
+            };
+            (kind == "n" && is_icu(name) && !name.starts_with(renamed_prefix))
+                .then(|| name.to_owned())
+        })
+        .collect()
+}
+
+pub(crate) fn verify_local_icu_comdat_absent(
+    archive: &Path,
+    renamed_prefix: &str,
+) -> Result<(), String> {
+    let remaining = local_icu_comdat_signatures(archive, renamed_prefix)?;
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "original ICU COMDAT signatures remain in {}: {:?}",
+        archive.display(),
+        remaining.iter().take(20).collect::<Vec<_>>()
+    ))
+}
+
 fn reject_mixed_icu_versions(symbols: &BTreeSet<String>) -> Result<(), String> {
     if let Some(name) = symbols
         .iter()
@@ -249,7 +310,7 @@ fn reject_mixed_icu_versions(symbols: &BTreeSet<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn redefine_linux_archive_symbols(
+pub(crate) fn redefine_linux_archive_symbols(
     archive: &Path,
     symbols: &BTreeSet<String>,
     prefix: &str,
