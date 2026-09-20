@@ -1,6 +1,6 @@
 [workspace]
-members = ["phase1-probe", "runtime"]
-default-members = ["runtime"]
+members = ["phase1-probe", "runtime", "symbol-isolation-tests"]
+default-members = ["runtime", "symbol-isolation-tests"]
 resolver = "2"
 
 # Debug sha2 of the ~400MiB web-runtime image otherwise dominates worker spawn.
