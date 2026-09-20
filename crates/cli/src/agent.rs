@@ -3857,7 +3857,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("foreign-index-job.json");
         fs::write(&path, "{}\n").expect("write job marker");
-        let mut launch = crate::BackgroundJobLaunch::Attached { path: path.clone() };
+        let mut launch = crate::BackgroundJobLaunch::Attached {
+            path: path.clone(),
+            root: dir.path().to_path_buf(),
+        };
 
         cancel_background_job(&mut launch);
 

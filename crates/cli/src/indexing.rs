@@ -1012,8 +1012,6 @@ pub(crate) fn dispatch_index(
         discover_overrides: discover_overrides_from_env()?,
         only_paths: None,
     };
-    let embedding_config = embedding_config_for_index(embedding_args)?;
-
     // Open the on-disk store under the workspace locator's path
     // never at `<root>/.greppy/graph.db` (which would
     // pollute `grep -R .`). The versioned platform data directory is used on
@@ -1060,6 +1058,11 @@ pub(crate) fn dispatch_index(
             return Err(Error::io(context, source));
         }
     };
+    // Claim the portable workspace ownership lock before resolving or
+    // materializing inference assets. Background launchers use this lock for
+    // their startup handshake and attached-query liveness; doing slow model
+    // setup first leaves a PID-only ownership gap.
+    let embedding_config = embedding_config_for_index(embedding_args)?;
     let recovery = recover_completed_index_snapshot(
         &store_path,
         &target,
