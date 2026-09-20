@@ -2322,12 +2322,25 @@ fn index_recover_skips_newest_invalid_completed_candidate() {
     )
     .unwrap();
     let valid = leave_completed_index_snapshot(&repo, &store, &db);
-    std::thread::sleep(std::time::Duration::from_millis(1100));
     let invalid = valid.with_file_name(format!(
         "{}.invalid",
         valid.file_name().unwrap().to_string_lossy()
     ));
     std::fs::write(&invalid, b"not a sqlite database").unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let new = old + std::time::Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&valid)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&invalid)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(new))
+        .unwrap();
 
     let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
     assert_eq!(
@@ -2407,6 +2420,20 @@ fn index_recover_never_publishes_around_a_live_candidate_owner() {
     let completed = leave_completed_index_snapshot(&repo, &store, &db);
     let live = db.with_file_name(format!("graph.db.next.{}.live", std::process::id()));
     std::fs::copy(&completed, &live).unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let new = old + std::time::Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&live)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&completed)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(new))
+        .unwrap();
 
     let (code, out, err) = run(&["index", "recover", ".", "--json"], &repo, &store);
     assert_eq!(
