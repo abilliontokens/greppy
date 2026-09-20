@@ -1,7 +1,3 @@
-import { chromium } from "playwright";
-
-const browser = await chromium.launch();
-const page = await browser.newPage();
 for (const origin of [fixtureUrl, httpsFixtureUrl]) {
   await page.goto(origin + "ok");
   await page.goto(origin + "missing");
@@ -9,7 +5,10 @@ for (const origin of [fixtureUrl, httpsFixtureUrl]) {
   await page.goto(origin + "repeat");
   await page.goto(origin + "jump");
   await page.goto(origin + "chunked");
-  await page.goto(origin + "empty");
+  await page.evaluate(async (url) => {
+    const response = await fetch(url);
+    await response.arrayBuffer();
+  }, origin + "empty");
 }
 try {
   await page.goto(failedFixtureUrl);
