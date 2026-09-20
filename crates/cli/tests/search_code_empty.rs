@@ -236,7 +236,7 @@ fn empty_search_pattern_emits_status_after_case_insensitive_scan_finishes() {
     let grep = tools.join("grep");
     std::fs::write(
         &grep,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GREPPY_TEST_GREP_ARGS\"\n: > \"$GREPPY_TEST_GREP_STARTED\"\nattempt=0; while [ ! -e \"$GREPPY_TEST_GREP_RELEASE\" ]; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 1000 ] || exit 2; /bin/sleep 0.01; done\nexit 1\n",
+        "#!/bin/sh\ncase \" $* \" in *\" -i \"*) ;; *) exec /usr/bin/grep \"$@\" ;; esac\nprintf '%s\\n' \"$@\" > \"$GREPPY_TEST_GREP_ARGS\"\n: > \"$GREPPY_TEST_GREP_STARTED\"\nattempt=0; while [ ! -e \"$GREPPY_TEST_GREP_RELEASE\" ]; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 1000 ] || exit 2; /bin/sleep 0.01; done\nexit 1\n",
     )
     .unwrap();
     std::fs::set_permissions(&grep, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -269,7 +269,7 @@ fn empty_search_pattern_emits_status_after_case_insensitive_scan_finishes() {
     let reader = std::thread::spawn(move || {
         let mut line = String::new();
         BufReader::new(stdout).read_line(&mut line).unwrap();
-        line_tx.send(line).unwrap();
+        let _ = line_tx.send(line);
     });
 
     let deadline = Instant::now() + Duration::from_secs(5);

@@ -421,6 +421,7 @@ fn nested_read_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
 #[test]
 fn nested_root_reads_select_the_subdir_not_cwd_or_repo_sentinels() {
     let (cwd, repo, store, nested) = nested_read_fixture("nested-root-read");
+    std::fs::create_dir(repo.join("other")).unwrap();
     let absolute = nested.to_str().unwrap();
     let trailing = format!("{absolute}/");
     let mut roots = vec![absolute.to_string(), "repo/etc".to_string(), trailing];

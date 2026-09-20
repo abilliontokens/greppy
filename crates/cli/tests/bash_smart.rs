@@ -302,7 +302,7 @@ fn linter_rule_diagnostics_count_and_preserve_child_exit_and_stream_bytes() {
         "apps/server/src/workjet/sync/WorkjetSyncIpc.ts:9:3: error t3code(no-global-process-runtime): Use the node:process import.\n",
         "C:\\project files\\source.ts:12:4: warning eslint(no-unused-vars): Unused variable.\n",
         "example.ts:12:4: error_count: 7\n",
-        "example.ts:x:4: error t3code(rule): Invalid location is not a diagnostic.\n",
+        "example.ts:x:y: error t3code(rule): Invalid location is not a diagnostic.\n",
         "example.ts:12:4: error mentioned in documentation: Not a rule identifier.\n",
     );
     for redirect in ["", " >&2"] {
