@@ -109,10 +109,10 @@ fn empty_search_pattern_names_the_path_filter_and_next_actions() {
         stdout.contains("next: retry without the path filter"),
         "{stdout}"
     );
-    assert!(stdout.contains("greppy index ."), "{stdout}");
+    assert!(!stdout.contains("greppy index ."), "{stdout}");
     assert!(
-        stdout.contains("next: search excluded or unindexed source directly: greppy rg -n absent_value ."),
-        "a graph no-match must disclose the direct source recovery for vendor/ignored files; got: {stdout}"
+        stdout.contains("next: search excluded source directly: greppy rg -n absent_value ."),
+        "a live no-match must disclose the direct source recovery for vendor/ignored files; got: {stdout}"
     );
 }
 
@@ -139,7 +139,7 @@ fn empty_repository_search_pattern_discloses_discovery_exclusions() {
     );
     assert!(
         stdout.contains(
-            "next: search excluded or unindexed source directly: greppy rg -n -F vendor_only_marker ."
+            "next: search excluded source directly: greppy rg -n -F vendor_only_marker ."
         ),
         "{stdout}"
     );

@@ -343,6 +343,28 @@ pub fn walk_with_policy_and_overrides(
     walk_scoped_with_policy_and_overrides(root, policy, overrides, None)
 }
 
+fn scoped_hidden_components_are_explicit(relative: &str, scopes: &[String]) -> bool {
+    let mut prefix = String::new();
+    for component in relative.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        if component.starts_with('.')
+            && component.len() > 1
+            && !scopes.iter().any(|scope| {
+                scope == &prefix
+                    || scope
+                        .strip_prefix(&prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Walk only the supplied root-relative files or subtrees while retaining the
 /// root's ignore files, skip policy, and symlink boundary.
 pub fn walk_scoped_with_policy_and_overrides(
@@ -360,6 +382,14 @@ pub fn walk_scoped_with_policy_and_overrides(
     // skip the vendored mirror if the workspace happens to be the
     // greppy project itself.
     builder.standard_filters(true);
+    // An explicit scope may itself live below a hidden ancestor (for example
+    // `.codex/task-evidence`). The ignore crate's hidden filter runs before
+    // `filter_entry`, so leave hidden filtering to the scope predicate for
+    // scoped walks. It admits hidden entries only when they are explicitly
+    // named scope components; ordinary hidden descendants remain excluded.
+    if scopes.is_some() {
+        builder.hidden(false);
+    }
     // Do not follow symlinks: a symlinked directory must not be descended
     // (loop / escape protection), and a symlinked file is handled by the
     // explicit per-entry check below.
@@ -384,7 +414,7 @@ pub fn walk_scoped_with_policy_and_overrides(
                 return false;
             };
             let relative = relative.to_string_lossy().replace('\\', "/");
-            relative.is_empty()
+            let in_scope = relative.is_empty()
                 || scopes.iter().any(|scope| {
                     scope.is_empty()
                         || relative == *scope
@@ -394,7 +424,8 @@ pub fn walk_scoped_with_policy_and_overrides(
                         || scope
                             .strip_prefix(&relative)
                             .is_some_and(|rest| rest.starts_with('/'))
-                })
+                });
+            in_scope && scoped_hidden_components_are_explicit(&relative, &scopes)
         });
     }
     let walker = builder.build();
