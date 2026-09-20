@@ -777,10 +777,7 @@ fn observe_first_use_index(
             .and_then(serde_json::Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok())
             .is_some_and(process_is_alive);
-        if owned_child_alive
-            || published_owner_alive
-            || (state == "launching" && job["pid"].is_null())
-        {
+        if owned_child_alive || published_owner_alive {
             return FirstUseIndexObservation::Pending;
         }
         if snapshot_ready && state == "complete" {
@@ -854,11 +851,17 @@ fn wait_for_first_use_index(root: Option<&str>, effective_root: &std::path::Path
             BackgroundJobLaunch::Attached { .. } => false,
         };
         let job = read_background_job(launch.path());
-        match observe_first_use_index(
-            job.as_ref(),
-            first_use_snapshot_ready(effective_root),
-            owned_child_alive,
-        ) {
+        // Publication removes the job record. Avoid opening SQLite on every
+        // poll while a live writer is still building the temporary snapshot;
+        // only an absent or explicitly complete record can make the active
+        // database relevant to this decision.
+        let publication_possible = job.as_ref().is_none_or(|job| {
+            job.get("state")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|state| state == "complete")
+        });
+        let snapshot_ready = publication_possible && first_use_snapshot_ready(effective_root);
+        match observe_first_use_index(job.as_ref(), snapshot_ready, owned_child_alive) {
             FirstUseIndexObservation::Pending => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -1122,11 +1125,29 @@ mod refresh_wait_tests {
             observe_first_use_index(Some(&failed), false, false),
             FirstUseIndexObservation::Failed("fixture model load failed".into())
         );
-        let dead = serde_json::json!({"state": "indexing", "pid": null});
+        let dead = serde_json::json!({"state": "indexing", "pid": u32::MAX});
         assert!(matches!(
             observe_first_use_index(Some(&dead), false, false),
             FirstUseIndexObservation::Failed(detail)
                 if detail.contains("owner exited") && detail.contains("indexing")
         ));
+        let abandoned_launch = serde_json::json!({"state": "launching", "pid": null});
+        assert!(matches!(
+            observe_first_use_index(Some(&abandoned_launch), false, false),
+            FirstUseIndexObservation::Failed(detail)
+                if detail.contains("owner exited") && detail.contains("launching")
+        ));
+    }
+
+    #[test]
+    fn second_caller_attaches_to_a_healthy_published_owner() {
+        let job = serde_json::json!({
+            "state": "loading_model",
+            "pid": std::process::id()
+        });
+        assert_eq!(
+            observe_first_use_index(Some(&job), false, false),
+            FirstUseIndexObservation::Pending
+        );
     }
 }
