@@ -1094,8 +1094,12 @@ fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
         .map(|hit| {
             format!(
                 "{}:{}",
-                hit["file_path"].as_str().unwrap(),
-                hit["start_line"].as_u64().unwrap()
+                hit["file"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing compact file: {out}")),
+                hit["start_line"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing line: {out}"))
             )
         })
         .collect::<Vec<_>>();
@@ -1129,8 +1133,12 @@ fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
         let location = if command == "search-symbol" {
             format!(
                 "{}:{}",
-                value["hits"][0]["file_path"].as_str().unwrap(),
-                value["hits"][0]["start_line"].as_u64().unwrap()
+                value["hits"][0]["file"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing compact file: {out}")),
+                value["hits"][0]["start_line"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing line: {out}"))
             )
         } else {
             value["hits"][0]["matches"][0]["location"]
