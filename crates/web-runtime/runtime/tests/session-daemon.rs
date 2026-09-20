@@ -732,15 +732,30 @@ impl NavigationLifecycleFixture {
     }
 
     fn wait_for(&self, path: &str) {
+        self.wait_for_all(&[path]);
+    }
+
+    fn wait_for_all(&self, paths: &[&str]) {
+        let mut pending = paths.iter().copied().collect::<HashSet<_>>();
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        while !pending.is_empty() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let event = self
                 .events
                 .recv_timeout(remaining)
-                .unwrap_or_else(|error| panic!("waiting for fixture request {path}: {error}"));
-            if event == path {
-                return;
+                .unwrap_or_else(|error| panic!("waiting for fixture requests {pending:?}: {error}"));
+            pending.remove(event.as_str());
+        }
+    }
+
+    fn assert_not_requested(&self, path: &str, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.events.recv_timeout(remaining) {
+                Ok(event) => assert_ne!(event, path, "unexpected fixture request {path}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
+                Err(error) => panic!("fixture event channel failed: {error}"),
             }
         }
     }
@@ -821,12 +836,22 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                     ),
                     "/defer" => (
                         "text/html; charset=utf-8",
-                        b"<!doctype html><html><head><script defer src='/defer-gate.js'></script></head><body><script>try { window.__greppyDOMContentLoaded = true; } catch (_) {} document.dispatchEvent(new Event('DOMContentLoaded'));</script><p id='parsed'>parser-finished</p></body></html>".to_vec(),
+                        b"<!doctype html><html><head><script defer src='/defer-gate.js'></script></head><body><script>window.addEventListener('DOMContentLoaded', event => event.stopImmediatePropagation(), true); try { window.__greppyDOMContentLoaded = true; } catch (_) {} document.dispatchEvent(new Event('DOMContentLoaded'));</script><p id='parsed'>parser-finished</p></body></html>".to_vec(),
                     ),
                     "/load" => (
                         "text/html; charset=utf-8",
                         b"<!doctype html><html><body><p id='parsed'>parser-finished</p><img src='/load-gate.png'></body></html>".to_vec(),
                     ),
+                    "/dcl-before-load" => (
+                        "text/html; charset=utf-8",
+                        b"<!doctype html><html><body><p id='parsed'>dom-content-loaded</p><img src='/dcl-load-gate.png'></body></html>".to_vec(),
+                    ),
+                    "/phrase" => (
+                        "text/html; charset=utf-8",
+                        b"<!DOCTYPE html><html><head><title>Quoted documentation</title></head><body><p>Documentation may say: Could not load the requested page.</p><p id=loaded>ordinary-page-loaded</p></body></html>".to_vec(),
+                    ),
+                    "/dcl-returned" => ("text/plain", b"ok".to_vec()),
+                    "/load-returned" => ("text/plain", b"ok".to_vec()),
                     path if path.ends_with(".js") => ("text/javascript", b"void 0;".to_vec()),
                     path if path.ends_with(".png") => ("image/png", Vec::new()),
                     _ => ("text/plain", b"not found".to_vec()),
@@ -941,10 +966,13 @@ fn run_playwright_source_async(
     socket: PathBuf,
     run_id: &str,
     source: String,
-) -> std::sync::mpsc::Receiver<greppy_web_client::Response> {
+) -> (
+    std::sync::mpsc::Receiver<greppy_web_client::Response>,
+    thread::JoinHandle<()>,
+) {
     let run_id = run_id.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let created = unix_request(
             &socket,
             &Request::new(
@@ -972,7 +1000,6 @@ fn run_playwright_source_async(
         run.deadline_ms = 30_000;
         let response = unix_request(&socket, &run, Duration::from_secs(35))
             .expect("run async navigation script");
-        let _ = tx.send(response);
         let _ = unix_request(
             &socket,
             &Request::new(
@@ -982,8 +1009,9 @@ fn run_playwright_source_async(
             ),
             Duration::from_secs(5),
         );
+        let _ = tx.send(response);
     });
-    rx
+    (rx, worker)
 }
 
 fn run_playwright_source_with_limits(
@@ -3392,16 +3420,15 @@ fn web_goto_navigates_a_fixture() {
 
 #[test]
 fn web_goto_does_not_treat_ordinary_page_text_as_a_servo_error() {
-    let fixture = serve_fixture(
-        "<!DOCTYPE html><html><head><title>Quoted documentation</title></head><body><p>Documentation may say: Could not load the requested page.</p><p id=loaded>ordinary-page-loaded</p></body></html>",
-    );
+    let fixture = serve_navigation_lifecycle_fixture();
+    let url = format!("{}/phrase", fixture.origin);
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-goto-error-phrase-{}.sock",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_goto_error_phrase", |command| {
-        command.arg("--fixture-url").arg(&fixture);
+        command.arg("--fixture-url").arg(&fixture.origin);
     });
     wait_for_socket(&socket, Duration::from_secs(30));
     let ran = run_playwright_source(
@@ -3412,7 +3439,7 @@ fn web_goto_does_not_treat_ordinary_page_text_as_a_servo_error() {
 import {{ chromium }} from "playwright";
 const browser = await chromium.launch();
 const page = await browser.newPage();
-const response = await page.goto({fixture:?});
+const response = await page.goto({url:?});
 const marker = await page.locator('#loaded').textContent();
 await browser.close();
 return {{ ok: response.ok(), marker }};
@@ -3460,7 +3487,7 @@ fn page_goto_observes_domcontentloaded_and_load_separately() {
         ),
         ("load", "/load", "/load-gate.png", "load", "#parsed"),
     ] {
-        let navigation = run_playwright_source_async(
+        let (navigation, worker) = run_playwright_source_async(
             socket.clone(),
             "run_navigation_lifecycle",
             format!(
@@ -3493,7 +3520,50 @@ return await page.locator({marker:?}).textContent();
             "parser-finished",
             "{completed:?}"
         );
+        worker.join().expect("join async navigation run");
     }
+
+    let (navigation, worker) = run_playwright_source_async(
+        socket.clone(),
+        "run_navigation_lifecycle",
+        format!(
+            r#"
+import {{ chromium }} from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage();
+await page.goto({:?}, {{ waitUntil: "domcontentloaded" }});
+const marker = await page.locator('#parsed').textContent();
+await page.evaluate((url) => fetch(url).then(() => true), {:?});
+await page.waitForLoadState("load");
+await page.evaluate((url) => fetch(url).then(() => true), {:?});
+return marker;
+"#,
+            format!("{}/dcl-before-load", fixture.origin),
+            format!("{}/dcl-returned", fixture.origin),
+            format!("{}/load-returned", fixture.origin),
+        ),
+    );
+    fixture.wait_for_all(&["/dcl-load-gate.png", "/dcl-returned"]);
+    fixture.assert_not_requested("/load-returned", Duration::from_millis(300));
+    assert!(
+        matches!(
+            navigation.recv_timeout(Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "waitForLoadState(load) returned while the image response was still gated"
+    );
+    fixture.release("/dcl-load-gate.png");
+    fixture.wait_for("/load-returned");
+    let completed = navigation
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|error| panic!("load-state navigation did not complete: {error}"));
+    assert_eq!(completed.status, "ok", "{completed:?}");
+    assert_eq!(
+        completed.result.as_ref().unwrap()["value"],
+        "dom-content-loaded",
+        "{completed:?}"
+    );
+    worker.join().expect("join async load-state run");
 }
 
 #[test]

@@ -1000,9 +1000,9 @@ impl ContentEngine {
 
     /// How far a navigation must get before `goto` returns.
     ///
-    /// Playwright lets the caller choose. Servo exposes the response-commit
-    /// boundary as HeadParsed and the full-load boundary as Complete; the
-    /// document-start lifecycle receipt supplies the distinct middle boundary.
+    /// Playwright lets the caller choose. Servo's HeadParsed signal is only a
+    /// parsing progress marker, while Complete is the full-load boundary; the
+    /// document-start lifecycle receipt supplies DOMContentLoaded between them.
     fn load_committed_for(
         &self,
         webview: &WebView,
