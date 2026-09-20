@@ -9,7 +9,7 @@ use crate::supervisor::WorkerProcess;
 use greppy_web_client::{
     new_session_id, read_frame, write_frame, ErrorObject, Handshake, Request, Response, SCHEMA,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -664,6 +664,47 @@ struct Daemon {
     run_control: Arc<RunControl>,
     workflow_deadline: Option<Instant>,
     workflow_defer_observation: bool,
+}
+
+fn enrich_network_records(mut requests: Value, responses: &Value) -> Value {
+    let Some(rows) = requests.as_array_mut() else {
+        return json!([]);
+    };
+    let response_rows = responses.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    for request in rows {
+        let Some(url) = request.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(response) = response_rows
+            .iter()
+            .rev()
+            .find(|response| response.get("url").and_then(Value::as_str) == Some(url))
+        else {
+            continue;
+        };
+        let response = redact_json(response.clone());
+        let Some(object) = request.as_object_mut() else {
+            continue;
+        };
+        for key in ["status", "statusText", "ok", "byteLength"] {
+            if let Some(value) = response.get(key) {
+                object.insert(key.to_owned(), value.clone());
+            }
+        }
+        if let Some(headers) = response.get("headers") {
+            object.insert("responseHeaders".into(), headers.clone());
+        }
+    }
+    requests
+}
+
+fn network_record_failed(record: &Value) -> bool {
+    record.get("failure").is_some_and(|failure| !failure.is_null())
+        || record.get("ok").and_then(Value::as_bool) == Some(false)
+        || record
+            .get("status")
+            .and_then(Value::as_u64)
+            .is_some_and(|status| status >= 400)
 }
 
 impl Daemon {
@@ -2849,6 +2890,59 @@ impl Daemon {
                             self.finish_session(&session_id);
                             return engine_error(request, error, 34);
                         }
+                    }
+                }
+                if kind == "network" {
+                    let responses = match self.engine_call("page.responses", json!({ "page": page })) {
+                        Ok(value) => value
+                            .get("responses")
+                            .cloned()
+                            .unwrap_or_else(|| value.clone()),
+                        Err(error) => {
+                            self.finish_session(&session_id);
+                            return engine_error(request, error, 34);
+                        }
+                    };
+                    requests = enrich_network_records(requests, &responses);
+                    if request.params.get("filter").and_then(Value::as_str) == Some("failed") {
+                        requests = Value::Array(
+                            requests
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|record| network_record_failed(record))
+                                .cloned()
+                                .collect(),
+                        );
+                    }
+                    if let Some(query) = request.params.get("query").and_then(Value::as_str) {
+                        let predicates = match greppy_web_client::record_query::parse(query) {
+                            Ok(predicates) => predicates,
+                            Err(message) => {
+                                self.finish_session(&session_id);
+                                return Response::error(
+                                    request,
+                                    ErrorObject::new(
+                                        "invalid_argument",
+                                        format!("web network: {message}"),
+                                        request.request_id.clone(),
+                                        30,
+                                        "use the web match predicate grammar, for example `status>=400`",
+                                    ),
+                                );
+                            }
+                        };
+                        requests = Value::Array(
+                            requests
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|record| {
+                                    greppy_web_client::record_query::matches(record, &predicates)
+                                })
+                                .cloned()
+                                .collect(),
+                        );
                     }
                 }
                 self.finish_session(&session_id);
