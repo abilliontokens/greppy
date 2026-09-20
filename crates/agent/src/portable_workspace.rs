@@ -2368,7 +2368,20 @@ fn restore_apply_journal(
     )?;
     for (path, modified_unix_ns) in &journal.modified_times {
         validate_apply_path(path)?;
+        let Some(expectation) = expectations.iter().find(|expected| expected.path == *path) else {
+            continue;
+        };
+        test_apply_hook("recovery-before-mtime", Some(path));
+        ensure_safe_path_ancestors(&repository, path, &journal.ref_name)?;
         let target = repository.join(path);
+        if visible_path_state(&target)? != expectation.baseline {
+            return Err(WorkspaceError::Conflict {
+                ref_name: journal.ref_name.clone(),
+                detail: format!(
+                    "apply recovery preserved a late external metadata change to {path}"
+                ),
+            });
+        }
         if fs::symlink_metadata(&target).is_err() {
             continue;
         }
@@ -2595,6 +2608,12 @@ fn materialize_hardlink_groups_checked<'a>(
                     path: repository.join(relative),
                     detail: "proposal hardlink path has no apply expectation".into(),
                 })?;
+            if !matches!(expected_state(expected), ApplyPathState::File { .. }) {
+                return Err(WorkspaceError::Tampered {
+                    path: repository.join(relative),
+                    detail: "proposal hardlink member is not expected to be a regular file".into(),
+                });
+            }
             if visible_path_state(&repository.join(relative))? != *expected_state(expected) {
                 return Err(WorkspaceError::Conflict {
                     ref_name: ref_name.into(),
@@ -2607,10 +2626,22 @@ fn materialize_hardlink_groups_checked<'a>(
             detail: "proposal hardlink group is empty".into(),
         })?;
         let source = repository.join(source_relative);
+        if !fs::symlink_metadata(&source)?.file_type().is_file() {
+            return Err(WorkspaceError::Tampered {
+                path: source,
+                detail: "proposal hardlink source is not a regular file".into(),
+            });
+        }
         for relative in &group[1..] {
             ensure_safe_path_ancestors(repository, source_relative, ref_name)?;
             ensure_safe_path_ancestors(repository, relative, ref_name)?;
             let target = repository.join(relative);
+            if !fs::symlink_metadata(&target)?.file_type().is_file() {
+                return Err(WorkspaceError::Tampered {
+                    path: target,
+                    detail: "proposal hardlink target is not a regular file".into(),
+                });
+            }
             let source_expected = expectations
                 .iter()
                 .find(|expected| expected.path == *source_relative)
@@ -2629,8 +2660,32 @@ fn materialize_hardlink_groups_checked<'a>(
             }
             let temporary = temporary_apply_path(&target);
             fs::hard_link(&source, &temporary)?;
-            ensure_safe_path_ancestors(repository, source_relative, ref_name)?;
-            ensure_safe_path_ancestors(repository, relative, ref_name)?;
+            if let Err(error) = ensure_safe_path_ancestors(repository, source_relative, ref_name)
+                .and_then(|_| ensure_safe_path_ancestors(repository, relative, ref_name))
+            {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+            let still_regular = (|| -> Result<bool, WorkspaceError> {
+                Ok(fs::symlink_metadata(&source)?.file_type().is_file()
+                    && fs::symlink_metadata(&target)?.file_type().is_file())
+            })();
+            let still_regular = match still_regular {
+                Ok(still_regular) => still_regular,
+                Err(error) => {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error);
+                }
+            };
+            if !still_regular {
+                let _ = fs::remove_file(&temporary);
+                return Err(WorkspaceError::Conflict {
+                    ref_name: ref_name.into(),
+                    detail: format!(
+                        "proposal hardlink group changed object type while relinking {relative}"
+                    ),
+                });
+            }
             if visible_path_state(&source)? != *expected_state(source_expected)
                 || visible_path_state(&target)? != *expected_state(target_expected)
             {
@@ -4696,6 +4751,27 @@ mod tests {
             repo.join("baseline-linked-b.txt"),
         )
         .unwrap();
+        let hook_repo = repo.clone();
+        *APPLY_TEST_HOOK.lock().unwrap() = Some(Box::new(move |point, path| {
+            if point == "recovery-before-mtime" && path == Some("tracked.txt") {
+                fs::write(
+                    hook_repo.join("tracked.txt"),
+                    b"external before metadata restore\n",
+                )
+                .unwrap();
+            }
+        }));
+        assert!(matches!(
+            recover_apply_journals(&recovery_core),
+            Err(WorkspaceError::Conflict { .. })
+        ));
+        *APPLY_TEST_HOOK.lock().unwrap() = None;
+        assert!(journal_path.exists());
+        assert_eq!(
+            fs::read(repo.join("tracked.txt")).unwrap(),
+            b"external before metadata restore\n"
+        );
+        fs::write(repo.join("tracked.txt"), b"dirty\n").unwrap();
         recover_apply_journals(&recovery_core).unwrap();
         assert!(!journal_path.exists());
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
