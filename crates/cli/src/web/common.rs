@@ -22,7 +22,6 @@ pub enum RunMode {
     Active,
 }
 
-
 pub const EXIT_WEB_INVALID: i32 = 30;
 pub const EXIT_WEB_UNAVAILABLE: i32 = 31;
 #[allow(dead_code)]
