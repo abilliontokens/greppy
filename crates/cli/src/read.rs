@@ -1230,6 +1230,16 @@ fn read_open_file(
     canonical_root: &std::path::Path,
     subject: &str,
 ) -> Option<(String, std::path::PathBuf, String)> {
+    let (shown, canonical) = read_resolve_file(root_path, canonical_root, subject)?;
+    let content = std::fs::read_to_string(&canonical).ok()?;
+    Some((shown, canonical, content))
+}
+
+fn read_resolve_file(
+    root_path: &std::path::Path,
+    canonical_root: &std::path::Path,
+    subject: &str,
+) -> Option<(String, std::path::PathBuf)> {
     let candidate = read_file_candidate(root_path, subject);
     let canonical = candidate.canonicalize().ok()?;
     if !canonical.is_file() {
@@ -1245,8 +1255,7 @@ fn read_open_file(
         }
         canonical.to_string_lossy().replace('\\', "/")
     };
-    let content = std::fs::read_to_string(&canonical).ok()?;
-    Some((shown, canonical, content))
+    Some((shown, canonical))
 }
 
 fn read_parse_file_range(raw: &str, line_count: usize) -> Result<(usize, usize)> {
@@ -1380,14 +1389,21 @@ pub(crate) fn dispatch_read_files(
     let mut printed = false;
     let mut previous_ended_with_newline = true;
     for path in paths {
-        if !path_filters.matches(path) {
+        let Some((shown, canonical)) = read_resolve_file(&file_base, &canonical_root, path) else {
+            read_begin_group(&mut printed, &mut previous_ended_with_newline);
+            println!("no such file: {path}");
+            previous_ended_with_newline = true;
+            failed = true;
+            continue;
+        };
+        if !path_filters.matches(&shown) {
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!("outside path filter: {path}");
             previous_ended_with_newline = true;
             failed = true;
             continue;
         }
-        let Some((shown, _, content)) = read_open_file(&file_base, &canonical_root, path) else {
+        let Ok(content) = std::fs::read_to_string(&canonical) else {
             read_begin_group(&mut printed, &mut previous_ended_with_newline);
             println!("no such file: {path}");
             previous_ended_with_newline = true;

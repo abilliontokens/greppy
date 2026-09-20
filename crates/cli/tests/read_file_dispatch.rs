@@ -433,6 +433,14 @@ fn nested_root_reads_select_the_subdir_not_cwd_or_repo_sentinels() {
     for root in &roots {
         for args in [
             vec!["--root", root.as_str(), "read-file", "probe.conf", "--all"],
+            vec![
+                "--root",
+                root.as_str(),
+                "read-file",
+                "probe.conf",
+                "--path",
+                "etc",
+            ],
             vec!["--root", root.as_str(), "read", "probe.conf"],
         ] {
             let (code, stdout, stderr) = run_from(&cwd, &store, &args);
@@ -442,6 +450,21 @@ fn nested_root_reads_select_the_subdir_not_cwd_or_repo_sentinels() {
             assert!(!stdout.contains("CWD_SENTINEL"), "{args:?}: {stdout}");
             assert!(!stdout.contains("REPO_SENTINEL"), "{args:?}: {stdout}");
         }
+        let (code, stdout, stderr) = run_from(
+            &cwd,
+            &store,
+            &[
+                "--root",
+                root.as_str(),
+                "read-file",
+                "probe.conf",
+                "--path",
+                "other",
+            ],
+        );
+        assert_ne!(code, 0, "{stdout}\n{stderr}");
+        assert!(stdout.contains("outside path filter"), "{stdout}\n{stderr}");
+        assert!(!stdout.contains("SUBDIR_SENTINEL"), "{stdout}");
     }
 
     let (code, stdout, stderr) = run(&repo, &store, &["read-file", "probe.conf", "--all"]);
