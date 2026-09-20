@@ -6999,7 +6999,6 @@ struct SearchCodeMatchLine {
 
 #[derive(Debug)]
 struct SearchCodeDefinitionEntry {
-    node_id: i64,
     qualified_name: String,
     file: String,
     start_line: i64,
@@ -7007,12 +7006,6 @@ struct SearchCodeDefinitionEntry {
     source: String,
     handle: String,
     matches: Vec<SearchCodeMatchLine>,
-}
-
-#[derive(Debug)]
-enum SearchCodeEntry {
-    Definition(SearchCodeDefinitionEntry),
-    Unenclosed(SearchCodeMatchLine),
 }
 
 fn parse_search_code_match(hit: &greppy_search::CodeHit) -> Option<SearchCodeMatchLine> {

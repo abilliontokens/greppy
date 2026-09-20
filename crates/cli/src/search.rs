@@ -752,7 +752,6 @@ pub(crate) fn search_code_definition_entry(
     handle.grammar_id = Some(format!("{language:?}"));
     handle.grammar_version = Some(env!("CARGO_PKG_VERSION").to_string());
     Ok(Some(SearchCodeDefinitionEntry {
-        node_id: row.id,
         qualified_name: row.qualified_name.clone(),
         file: row.file_path.clone(),
         start_line: row.start_line,
@@ -763,79 +762,24 @@ pub(crate) fn search_code_definition_entry(
     }))
 }
 
-pub(crate) fn search_code_entries(
-    store: &greppy_store::Store,
-    project: &str,
-    root_path: &std::path::Path,
-    hits: &[greppy_search::CodeHit],
-    resolve_definitions: bool,
-) -> Result<Vec<SearchCodeEntry>> {
-    let mut entries = Vec::new();
-    let mut definition_entries = std::collections::HashMap::<i64, usize>::new();
-    for hit in hits {
-        let Some(match_line) = parse_search_code_match(hit) else {
-            continue;
-        };
-        let row = if resolve_definitions {
-            greppy_search::definition_at(store, Some(project), &match_line.file, match_line.line)?
-        } else {
-            None
-        };
-        let Some(row) = row else {
-            entries.push(SearchCodeEntry::Unenclosed(match_line));
-            continue;
-        };
-        if let Some(index) = definition_entries.get(&row.id).copied() {
-            if let SearchCodeEntry::Definition(definition) = &mut entries[index] {
-                definition.matches.push(match_line);
-            }
-            continue;
-        }
-        let Some(mut definition) = search_code_definition_entry(root_path, &row)? else {
-            entries.push(SearchCodeEntry::Unenclosed(match_line));
-            continue;
-        };
-        definition.matches.push(match_line);
-        let index = entries.len();
-        definition_entries.insert(definition.node_id, index);
-        entries.push(SearchCodeEntry::Definition(definition));
-    }
-    Ok(entries)
-}
-
-pub(crate) fn search_code_entry_json(entry: &SearchCodeEntry) -> serde_json::Value {
-    match entry {
-        SearchCodeEntry::Definition(definition) => serde_json::json!({
-            "qualified_name": &definition.qualified_name,
-            "file": &definition.file,
-            "span": {
-                "start_line": definition.start_line,
-                "end_line": definition.end_line,
-            },
-            "source": &definition.source,
-            "handle": &definition.handle,
-            "matches": definition.matches.iter().map(|hit| serde_json::json!({
-                "location": &hit.location,
-                "line": hit.line,
-                "text": &hit.text,
-            })).collect::<Vec<_>>(),
-        }),
-        SearchCodeEntry::Unenclosed(hit) => serde_json::json!({
-            "qualified_name": serde_json::Value::Null,
-            "file": &hit.file,
-            "span": {
-                "start_line": hit.line,
-                "end_line": hit.line,
-            },
-            "source": serde_json::Value::Null,
-            "handle": serde_json::Value::Null,
-            "matches": [{
-                "location": &hit.location,
-                "line": hit.line,
-                "text": &hit.text,
-            }],
-        }),
-    }
+pub(crate) fn search_code_definition_json(
+    definition: &SearchCodeDefinitionEntry,
+) -> serde_json::Value {
+    serde_json::json!({
+        "qualified_name": &definition.qualified_name,
+        "file": &definition.file,
+        "span": {
+            "start_line": definition.start_line,
+            "end_line": definition.end_line,
+        },
+        "source": &definition.source,
+        "handle": &definition.handle,
+        "matches": definition.matches.iter().map(|hit| serde_json::json!({
+            "location": &hit.location,
+            "line": hit.line,
+            "text": &hit.text,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 #[derive(Debug)]
@@ -1043,7 +987,7 @@ fn search_pattern_row_json(
         };
         if let Some(mut entry) = search_code_definition_entry(root_path, &graph_row)? {
             entry.matches.push(row.hit.clone());
-            let mut value = search_code_entry_json(&SearchCodeEntry::Definition(entry));
+            let mut value = search_code_definition_json(&entry);
             if let Some(object) = value.as_object_mut() {
                 object.insert("name".into(), serde_json::json!(&node.name));
                 object.insert(
