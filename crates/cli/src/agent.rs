@@ -1527,6 +1527,10 @@ fn persist_session(stderr: &mut impl Write, op: io::Result<()>) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Session entry point carries separate borrowed runtime and persistence state"
+)]
 fn run_headless_session(
     client: &mut Client,
     env: &mut GreppyEnv,

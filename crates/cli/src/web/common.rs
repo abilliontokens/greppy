@@ -13,19 +13,15 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
 pub enum RunMode {
     /// Start the script with its own browser, context, and page.
+    #[default]
     Standalone,
     /// Bind the script to the selected session's current browser, context, and page.
     Active,
 }
 
-impl Default for RunMode {
-    fn default() -> Self {
-        Self::Standalone
-    }
-}
 
 pub const EXIT_WEB_INVALID: i32 = 30;
 pub const EXIT_WEB_UNAVAILABLE: i32 = 31;
