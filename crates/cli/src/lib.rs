@@ -386,7 +386,11 @@ pub enum CacheCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove one worktree's verified store, or every verified cache object.
+    /// Remove the selected worktree store and repository-wide shared agent Bases.
+    ///
+    /// --root also selects shared agent Bases used by linked worktrees of the
+    /// same repository. --all selects every verified cache object. Locked
+    /// stores are retained and reported; --yes is required.
     Clear {
         #[arg(long)]
         all: bool,
