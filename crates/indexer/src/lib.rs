@@ -272,7 +272,7 @@ pub fn index_with_options_and_progress(
     // the inventory. Migrate every retained file in this store layer, even when
     // this invocation would ordinarily refresh only a few Delta paths.
     let incompatible_index = store
-        .list_workspace_states()?
+        .list_private_workspace_states()?
         .iter()
         .find(|state| state.root_path == abs_root.to_string_lossy())
         .map_or(!prior_state.is_empty(), |state| {
@@ -3764,6 +3764,20 @@ mod tests {
             .unwrap();
         assert!(nodes.iter().any(|node| node.name == "dirty_file"));
         assert!(nodes.iter().any(|node| node.name == "clean_base_file"));
+        // A current Base row must not hide lost compatibility metadata in an
+        // existing private layer and wrongly permit incremental reuse.
+        overlay
+            .conn()
+            .execute("DELETE FROM main.workspace_state", [])
+            .unwrap();
+        assert!(!overlay.list_workspace_states().unwrap().is_empty());
+        assert!(overlay.list_private_workspace_states().unwrap().is_empty());
+        let repaired = index_with_options(&mut overlay, &repo, "test", &options).unwrap();
+        assert_eq!(
+            repaired.files_indexed, 1,
+            "missing Delta metadata requires migration"
+        );
+        assert_eq!(overlay.list_private_file_states("test").unwrap().len(), 1);
         drop(overlay);
         let _ = fs::remove_dir_all(repo);
         let _ = fs::remove_dir_all(stores);
