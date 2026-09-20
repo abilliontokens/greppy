@@ -2252,20 +2252,6 @@ fn restore_apply_journal(
             restore_paths.extend(group.iter().cloned());
         }
     }
-    let index = journal_path.with_extension("index");
-    let index_text = path_text(&index)?.to_string();
-    let read_tree = Command::new("git")
-        .args([
-            "-C",
-            path_text(&repository)?,
-            "read-tree",
-            &journal.baseline_tree,
-        ])
-        .env("GIT_INDEX_FILE", &index)
-        .output()?;
-    if !read_tree.status.success() {
-        return Err(git_failed("git read-tree for apply recovery", &read_tree));
-    }
     for path in &restore_paths {
         let expectation = expectations
             .iter()
@@ -2277,7 +2263,6 @@ fn restore_apply_journal(
         ensure_safe_path_ancestors(&repository, path, &journal.ref_name)?;
         let observed = visible_path_state(&repository.join(path))?;
         if observed != expectation.baseline && observed != expectation.final_state {
-            let _ = fs::remove_file(&index);
             return Err(WorkspaceError::Conflict {
                 ref_name: journal.ref_name.clone(),
                 detail: format!("apply recovery preserved a late external change to {path}"),
@@ -2292,7 +2277,6 @@ fn restore_apply_journal(
         ensure_safe_path_ancestors(&repository, path, &journal.ref_name)?;
         let observed = visible_path_state(&repository.join(path))?;
         if observed != expectation.baseline && observed != expectation.final_state {
-            let _ = fs::remove_file(&index);
             return Err(WorkspaceError::Conflict {
                 ref_name: journal.ref_name.clone(),
                 detail: format!("apply recovery preserved a late external change to {path}"),
@@ -2309,49 +2293,13 @@ fn restore_apply_journal(
         {
             continue;
         }
-        if expectation.baseline == ApplyPathState::Missing {
-            remove_visible_path(&repository.join(path))?;
-            continue;
-        }
-        let present = Command::new("git")
-            .args([
-                "-C",
-                path_text(&repository)?,
-                "ls-files",
-                "--error-unmatch",
-                "--",
-                path,
-            ])
-            .env("GIT_INDEX_FILE", &index)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !present.success() {
-            continue;
-        }
-        if let Some(parent) = repository.join(path).parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let output = Command::new("git")
-            .args([
-                "-C",
-                path_text(&repository)?,
-                "checkout-index",
-                "--force",
-                "--",
-                path,
-            ])
-            .env("GIT_INDEX_FILE", &index_text)
-            .output()?;
-        if !output.status.success() {
-            return Err(git_failed("git checkout-index for apply recovery", &output));
-        }
+        // Preflight classified clean tracked paths against the raw pinned
+        // baseline-tree bytes. Restore that same representation atomically;
+        // checkout-index may apply filters or line-ending conversion and no
+        // longer match the baseline that apply actually accepted.
+        materialize_git_tree_entry(&repository, &journal.baseline_tree, path)?;
     }
-    // checkout-index is correct for paths that were clean in the original
-    // checkout, including the checkout conversion configured by Git. Dirty
-    // and untracked paths are different: their exact visible bytes are pinned
-    // in the baseline CAS and must not pass through autocrlf or a filter during
-    // recovery.
+    // Dirty, untracked, and deleted paths use their exact pinned CAS bytes.
     for entry in &proposal.baseline.entries {
         if restore_paths.contains(&entry.path) {
             test_apply_hook("recovery-before-pinned-entry", Some(&entry.path));
@@ -2362,7 +2310,6 @@ fn restore_apply_journal(
             ensure_safe_path_ancestors(&repository, &entry.path, &journal.ref_name)?;
             let observed = visible_path_state(&repository.join(&entry.path))?;
             if observed != expectation.baseline && observed != expectation.final_state {
-                let _ = fs::remove_file(&index);
                 return Err(WorkspaceError::Conflict {
                     ref_name: journal.ref_name.clone(),
                     detail: format!(
@@ -2428,7 +2375,6 @@ fn restore_apply_journal(
             filetime::set_file_times(&target, time, time)?;
         }
     }
-    let _ = fs::remove_file(&index);
     let observed = capture_repository(&repository, core.chunks())?;
     let observed_hash = observed.baseline_hash.clone();
     if observed_hash != journal.baseline_hash {
@@ -5012,6 +4958,10 @@ mod tests {
         materialize_git_tree_entry(&repo, &proposal.final_tree, "tracked.txt").unwrap();
         recover_apply_journals(&recovery_core).unwrap();
         assert_eq!(fs::read(repo.join("tracked.txt")).unwrap(), b"dirty\n");
+        assert_eq!(
+            fs::read(repo.join("nested/tracked.txt")).unwrap(),
+            b"nested base\n"
+        );
 
         let hook_repo = repo.clone();
         *APPLY_TEST_HOOK.lock().unwrap() = Some(Box::new(move |point, path| {
