@@ -286,7 +286,7 @@ fn search_pattern_no_match_status(query: &str, fixed: bool, path_filters: &Query
     }
     let mode = if fixed { "-F " } else { "" };
     println!(
-        "next: search excluded or unindexed source directly: greppy rg -n {mode}{} .",
+        "next: search excluded source directly: greppy rg -n {mode}{} .",
         shell_example_arg(query)
     );
     // `--fixed` takes the pattern literally, so a pattern written as a regular
@@ -308,7 +308,6 @@ fn search_pattern_no_match_status(query: &str, fixed: bool, path_filters: &Query
         "next: search definition names: greppy search-symbol {}",
         shell_example_arg(query)
     );
-    println!("next: refresh graph-backed definition filters after source changes: greppy index .");
 }
 
 /// Whether a pattern carries regex syntax that `--fixed` would neutralise.

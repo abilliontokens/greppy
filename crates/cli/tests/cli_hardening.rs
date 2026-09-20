@@ -2894,6 +2894,96 @@ fn cold_scoped_search_pattern_parses_matches_without_starting_an_index() {
     assert!(!workspace.join("graph.db").exists());
 }
 
+#[test]
+fn cold_scoped_search_pattern_admits_only_explicit_hidden_scope_components() {
+    let (repo, store, _scratch) = make_repo("cold-hidden-scoped-pattern", "root_marker");
+    let evidence = repo.join(".codex/task-evidence");
+    std::fs::create_dir_all(&evidence).unwrap();
+    std::fs::write(
+        evidence.join("checkpoint.json"),
+        "{\"source_key\":\"visible_explicit_hidden_scope\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        evidence.join(".private.json"),
+        "{\"source_key\":\"ordinary_hidden_descendant\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        evidence.join("ignored.json"),
+        "{\"source_key\":\"ignored_by_rule\"}\n",
+    )
+    .unwrap();
+    std::fs::write(evidence.join(".gitignore"), "ignored.json\n").unwrap();
+    std::fs::create_dir(repo.join(".unrequested")).unwrap();
+    std::fs::write(
+        repo.join(".unrequested/other.json"),
+        "{\"source_key\":\"unrequested_hidden_tree\"}\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(
+        &[
+            "search-pattern",
+            "source_key",
+            "--path",
+            ".codex/task-evidence",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "stdout={out}\nstderr={err}");
+    assert!(
+        out.contains(".codex/task-evidence/checkpoint.json:1"),
+        "{out}"
+    );
+    assert!(!out.contains("ordinary_hidden_descendant"), "{out}");
+    assert!(!out.contains("ignored_by_rule"), "{out}");
+    assert!(!out.contains("unrequested_hidden_tree"), "{out}");
+
+    let (file_code, file_out, file_err) = run(
+        &[
+            "search-pattern",
+            "ordinary_hidden_descendant",
+            "--path",
+            ".codex/task-evidence/.private.json",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(file_code, 0, "stdout={file_out}\nstderr={file_err}");
+    assert!(
+        file_out.contains(".codex/task-evidence/.private.json:1"),
+        "{file_out}"
+    );
+
+    let (ignored_code, ignored_out, ignored_err) = run(
+        &[
+            "search-pattern",
+            "ignored_by_rule",
+            "--path",
+            ".codex/task-evidence/ignored.json",
+            "--all",
+        ],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        ignored_code, 1,
+        "stdout={ignored_out}\nstderr={ignored_err}"
+    );
+    assert!(ignored_out.contains("status: no_matches"), "{ignored_out}");
+
+    let workspace = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&repo));
+    assert!(!workspace.join("index.job").exists());
+    assert!(!workspace.join("graph.db").exists());
+}
+
 #[cfg(all(unix, feature = "bash-smart"))]
 #[test]
 fn first_use_query_after_output_capture_waits_for_healthy_slow_index() {
