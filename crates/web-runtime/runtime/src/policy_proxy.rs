@@ -1,11 +1,10 @@
 //! Connect-time HTTP/HTTPS proxy that dials only policy-pinned SocketAddrs.
 
 use crate::policy::{allowed_connect_addrs, decide_host_literal, SharedProfile, UrlDecision};
-use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use url::Url;
@@ -15,7 +14,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const PER_PROXY_CONNECTION_LIMIT: usize = 32;
 const GLOBAL_CONNECTION_LIMIT: usize = 128;
 static GLOBAL_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-pub(crate) const REQUEST_ID_HEADER: &str = "x-greppy-internal-request-id";
 
 struct ConnectionPermit {
     local: Arc<AtomicUsize>,
@@ -95,7 +93,6 @@ pub struct PolicyProxy {
     _profile: SharedProfile,
     transferred: Arc<AtomicU64>,
     active_connections: Arc<AtomicUsize>,
-    responses: Arc<Mutex<Vec<Value>>>,
 }
 
 impl PolicyProxy {
@@ -112,10 +109,8 @@ impl PolicyProxy {
         let thread_profile = profile.clone();
         let transferred = Arc::new(AtomicU64::new(0));
         let active_connections = Arc::new(AtomicUsize::new(0));
-        let responses = Arc::new(Mutex::new(Vec::new()));
         let thread_transferred = Arc::clone(&transferred);
         let thread_active_connections = Arc::clone(&active_connections);
-        let thread_responses = Arc::clone(&responses);
         thread::Builder::new()
             .name("greppy-policy-proxy".into())
             .spawn(move || {
@@ -125,7 +120,6 @@ impl PolicyProxy {
                     resolve,
                     thread_transferred,
                     thread_active_connections,
-                    thread_responses,
                 )
             })?;
         Ok(Self {
@@ -133,7 +127,6 @@ impl PolicyProxy {
             _profile: profile,
             transferred,
             active_connections,
-            responses,
         })
     }
 
@@ -157,13 +150,6 @@ impl PolicyProxy {
     /// Connections currently holding a bounded proxy worker slot.
     pub fn active_connections(&self) -> usize {
         self.active_connections.load(Ordering::Acquire)
-    }
-
-    pub fn responses(&self) -> Vec<Value> {
-        self.responses
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
     }
 }
 
@@ -194,7 +180,6 @@ fn accept_loop(
     resolve: ConnectResolve,
     transferred: Arc<AtomicU64>,
     active_connections: Arc<AtomicUsize>,
-    responses: Arc<Mutex<Vec<Value>>>,
 ) {
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
@@ -210,12 +195,11 @@ fn accept_loop(
         let profile = profile.clone();
         let resolve = Arc::clone(&resolve);
         let transferred = Arc::clone(&transferred);
-        let responses = Arc::clone(&responses);
         let _ = thread::Builder::new()
             .name("greppy-policy-proxy-conn".into())
             .spawn(move || {
                 let _permit = permit;
-                let _ = handle_client(stream, profile, resolve, transferred, responses);
+                let _ = handle_client(stream, profile, resolve, transferred);
             });
     }
 }
@@ -225,7 +209,6 @@ fn handle_client(
     profile: SharedProfile,
     resolve: ConnectResolve,
     transferred: Arc<AtomicU64>,
-    responses: Arc<Mutex<Vec<Value>>>,
 ) -> io::Result<()> {
     let _ = client.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = client.set_write_timeout(Some(Duration::from_secs(30)));
@@ -245,16 +228,7 @@ fn handle_client(
             return handle_connect(client, profile, resolve, &target, &transferred);
         }
         let keep =
-            handle_forward(
-                &mut client,
-                &profile,
-                &resolve,
-                &head,
-                rest,
-                &target,
-                &transferred,
-                &responses,
-            )?;
+            handle_forward(&mut client, &profile, &resolve, &head, rest, &target, &transferred)?;
         if !keep {
             return Ok(());
         }
@@ -293,9 +267,7 @@ fn handle_forward(
     rest: Vec<u8>,
     target: &str,
     transferred: &AtomicU64,
-    responses: &Mutex<Vec<Value>>,
 ) -> io::Result<bool> {
-    let request_id = header_value(head, REQUEST_ID_HEADER).and_then(|value| value.parse().ok());
     let (host, port, path) = match parse_http_target(target, head) {
         Some(parsed) => parsed,
         None => {
@@ -351,61 +323,8 @@ fn handle_forward(
         }
     }
     let _ = server.shutdown(std::net::Shutdown::Write);
-    let (response_head, response_rest) = read_headers(&mut server)?;
-    let recorded_without_length = if let (Some(request_id), Some((status, status_text))) =
-        (request_id, response_status(&response_head))
-    {
-        let declared = remaining_body_length(&response_head);
-        let headers = response_headers(&response_head);
-        responses
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(json!({
-                "requestId": request_id,
-                "status": status,
-                "statusText": status_text,
-                "ok": status < 400,
-                "byteLength": declared,
-                "headers": headers,
-            }));
-        (declared == 0).then_some(request_id)
-    } else {
-        None
-    };
-    client.write_all(response_head.as_bytes())?;
-    client.write_all(&response_rest)?;
-    transferred.fetch_add(
-        (response_head.len() + response_rest.len()) as u64,
-        Ordering::Relaxed,
-    );
-    let remaining = copy_counted(&mut server, client, transferred)?;
-    if let Some(request_id) = recorded_without_length {
-        if let Some(response) = responses
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter_mut()
-            .find(|response| response.get("requestId").and_then(Value::as_u64) == Some(request_id))
-        {
-            response["byteLength"] = json!(response_rest.len() as u64 + remaining);
-        }
-    }
+    copy_counted(&mut server, client, transferred).map(|_| ())?;
     Ok(!connection_close(head))
-}
-
-fn response_status(head: &str) -> Option<(u16, String)> {
-    let mut parts = head.lines().next()?.splitn(3, ' ');
-    let _version = parts.next()?;
-    let status = parts.next()?.parse().ok()?;
-    let status_text = parts.next().unwrap_or("").trim().to_owned();
-    Some((status, status_text))
-}
-
-fn response_headers(head: &str) -> serde_json::Map<String, Value> {
-    head.lines()
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.trim().to_ascii_lowercase(), json!(value.trim())))
-        .collect()
 }
 
 fn connection_close(head: &str) -> bool {
@@ -416,16 +335,11 @@ fn connection_close(head: &str) -> bool {
 }
 
 fn host_header_value(head: &str) -> Option<String> {
-    header_value(head, "host")
-}
-
-fn header_value(head: &str, name: &str) -> Option<String> {
     head.lines().find_map(|line| {
-        let (header, value) = line.split_once(':')?;
-        header
-            .trim()
-            .eq_ignore_ascii_case(name)
-            .then(|| value.trim().to_owned())
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("host:")
+            .map(|value| value.trim().to_owned())
     })
 }
 
@@ -495,9 +409,7 @@ fn rewrite_request_line(head: &str, path: &str) -> String {
     let mut out = format!("{method} {path} {version}\r\n");
     for line in lines {
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("proxy-connection:")
-            || lower.starts_with(&format!("{REQUEST_ID_HEADER}:"))
-        {
+        if lower.starts_with("proxy-connection:") {
             continue;
         }
         out.push_str(line);
