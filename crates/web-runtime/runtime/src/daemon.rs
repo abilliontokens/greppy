@@ -4720,6 +4720,7 @@ fn sample_rss_bytes(pid: u32) -> u64 {
     kb.saturating_mul(1024)
 }
 
+#[cfg(test)]
 fn sample_cpu_ms(pid: u32) -> u64 {
     sample_cpu_ns(pid) / 1_000_000
 }
