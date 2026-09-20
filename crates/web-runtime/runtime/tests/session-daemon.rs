@@ -2975,6 +2975,7 @@ fn network_query_filters_enriched_response_records() {
             "script_source": "file",
             "script_file": script.display().to_string(),
             "script_text": source,
+            "bind_session_page": true,
         }),
     );
     run.deadline_ms = 60_000;
@@ -3077,6 +3078,7 @@ fn network_query_filters_real_http_and_https_responses() {
     let mut run = Request::new("run_network_http_query", "web.run", json!({
         "session_id": session_id, "script_source": "file",
         "script_file": script.display().to_string(), "script_text": source,
+        "bind_session_page": true,
     }));
     run.deadline_ms = 60_000;
     let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
