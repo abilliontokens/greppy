@@ -164,6 +164,10 @@ impl ChunkStore {
     }
 
     pub fn put(&self, bytes: &[u8]) -> Result<ChunkId> {
+        self.put_with_miss_hook(bytes, || {})
+    }
+
+    fn put_with_miss_hook(&self, bytes: &[u8], on_miss: impl FnOnce()) -> Result<ChunkId> {
         if bytes.len() > CHUNK_SIZE {
             return Err(Error::Corrupt(format!(
                 "chunk has {} bytes, maximum is {CHUNK_SIZE}",
@@ -191,6 +195,9 @@ impl ChunkStore {
             return Ok(id);
         }
 
+        // Test callers use this seam to hold two optimistic misses at the
+        // same point. Production puts take the normal no-op path.
+        on_miss();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // The SELECT above is outside the writer lock. Parallel processes that
         // share chunks.sqlite3 can both observe a miss, then the second INSERT
@@ -1048,17 +1055,21 @@ mod tests {
         drop(ChunkStore::open(root.path()).unwrap());
         let payload = b"shared payload for cas race";
         let start = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let workers = (0..2).map(|_| {
-            let root = root.path().to_path_buf();
-            let start = std::sync::Arc::clone(&start);
-            std::thread::spawn(move || {
-                let store = retry_when_busy(|| ChunkStore::open(&root));
-                start.wait();
-                retry_when_busy(|| store.put(payload))
+        let workers = (0..2)
+            .map(|_| {
+                let root = root.path().to_path_buf();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let store = retry_when_busy(|| ChunkStore::open(&root));
+                    store.put_with_miss_hook(payload, || {
+                        start.wait();
+                    })
+                })
             })
-        });
+            .collect::<Vec<_>>();
         let ids = workers
-            .map(|worker| worker.join().unwrap())
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| *id == ids[0]));
