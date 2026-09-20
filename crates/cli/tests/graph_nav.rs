@@ -1045,6 +1045,129 @@ fn trace_depth_zero_returns_only_start() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn search_formats_share_primary_results_counts_filters_and_no_match_codes() {
+    let (repo, store) = make_graph_repo("search-format-contract");
+    for index in 0..8 {
+        std::fs::write(
+            repo.join(format!("src/symbol_{index}.rs")),
+            "pub fn contract_main() {}\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        repo.join("src/kinds.rs"),
+        "pub struct ContractKind;\npub fn makeContractKind() {}\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, text, err) = run(
+        &["search-symbol", "contract_main", "--limit", "3"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{text}\n{err}");
+    let (code, out, err) = run(
+        &["search-symbol", "contract_main", "--limit", "3", "--json"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["total_exact"], 8, "{out}");
+    assert_eq!(value["shown"], 3, "{out}");
+    assert_eq!(value["omitted"], 5, "{out}");
+    let locations = value["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            format!(
+                "{}:{}",
+                hit["file_path"].as_str().unwrap(),
+                hit["start_line"].as_u64().unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    let text_locations = text
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|token| token.starts_with("src/symbol_"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_locations, locations,
+        "JSON must only change presentation"
+    );
+
+    for command in ["search-symbol", "search-pattern"] {
+        let (code, out, err) = run(
+            &[command, "ContractKind", "--kind", "struct", "--json"],
+            &repo,
+            &store,
+        );
+        assert_eq!(code, 0, "{command}: {out}\n{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["total_exact"], 1,
+            "kind filter must precede counting: {out}"
+        );
+        assert_eq!(value["shown"], 1, "{out}");
+        for query in ["QQZZABSENT987654321", "CONTRACT_MAIN"] {
+            for json in [false, true] {
+                let mut args = vec![command, query];
+                if json {
+                    args.push("--json");
+                }
+                let (code, out, err) = run(&args, &repo, &store);
+                assert_eq!(
+                    code, 1,
+                    "primary no-match must remain a miss, {args:?}: {out}\n{err}"
+                );
+                if json {
+                    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+                    assert_eq!(value["total_exact"], 0, "{out}");
+                    assert_eq!(value["hits"].as_array().unwrap().len(), 0, "{out}");
+                } else {
+                    assert!(out.contains("no_matches"), "{out}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn search_pattern_limited_summary_does_not_expand_omitted_files() {
+    let (repo, store) = make_graph_repo("pattern-limited-summary");
+    for index in 0..30 {
+        std::fs::write(
+            repo.join(format!("src/summary_{index:02}.rs")),
+            "pub fn limited_summary_marker() {}\n",
+        )
+        .unwrap();
+    }
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, out, err) = run(
+        &["search-pattern", "limited_summary_marker", "--limit", "3"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("30 matches in 30 files; showing 3"), "{out}");
+    assert!(
+        !out.contains("src/summary_29.rs"),
+        "omitted paths must not leak through the summary: {out}"
+    );
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.starts_with("src/summary_"))
+            .count(),
+        3,
+        "{out}"
+    );
+}
+
+#[test]
 fn search_symbols_prints_label_and_file_line() {
     let (repo, store) = index_fixture("symbols");
 

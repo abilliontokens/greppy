@@ -3750,7 +3750,12 @@ mod tests {
             greppy_store::VisibilityIndex::new(["src/lib.rs".to_string()], Vec::<String>::new())
                 .unwrap();
         let mut overlay = Store::open_overlay(&base_path, &delta_path, &visibility).unwrap();
-        assert_eq!(overlay.list_file_states("test").unwrap().len(), 2);
+        assert!(overlay
+            .list_file_states("test")
+            .unwrap()
+            .iter()
+            .any(|state| state.rel_path == "src/clean.rs"));
+        assert_eq!(overlay.list_private_file_states("test").unwrap().len(), 1);
         let report = index_with_options(&mut overlay, &repo, "test", &options).unwrap();
         assert_eq!(
             report.files_indexed, 1,
