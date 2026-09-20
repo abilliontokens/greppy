@@ -672,13 +672,13 @@ fn enrich_network_records(mut requests: Value, responses: &Value) -> Value {
     };
     let response_rows = responses.as_array().map(Vec::as_slice).unwrap_or(&[]);
     for request in rows {
-        let Some(request_id) = request.get("requestId").and_then(Value::as_u64) else {
+        let Some(request_id) = request.get("requestId").and_then(Value::as_str) else {
             continue;
         };
         let Some(response) = response_rows
             .iter()
             .find(|response| {
-                response.get("requestId").and_then(Value::as_u64) == Some(request_id)
+                response.get("requestId").and_then(Value::as_str) == Some(request_id)
             })
         else {
             continue;

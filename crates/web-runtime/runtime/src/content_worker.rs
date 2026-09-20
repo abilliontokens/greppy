@@ -1,5 +1,5 @@
 use crate::policy::{decide_url, NetworkProfile, SharedProfile, UrlDecision};
-use crate::policy_proxy::{PolicyProxy, REQUEST_ID_HEADER};
+use crate::policy_proxy::PolicyProxy;
 use crate::protocol::{
     read_message, timeout_ms_from_json, write_message, Message, WorkerKind, MAX_FRAME_BYTES,
 };
@@ -14,8 +14,8 @@ use servo::{
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences, RenderingContext,
     RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent,
     TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript, WebResourceLoad,
-    WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
-    WheelEvent, WheelMode,
+    WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder, WebViewDelegate,
+    WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ const KEYBOARD_RUNTIME: &str = include_str!("../js/keyboard-runtime.js");
 const WAIT_FOR_FUNCTION_RUNTIME: &str = include_str!("../js/wait-for-function-runtime.js");
 const SELECT_CHOICES_RUNTIME: &str = greppy_web_client::SELECT_CHOICES_JS;
 const SELECT_OPTION_RUNTIME: &str = include_str!("../js/select-option-runtime.js");
-static NEXT_NETWORK_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_NETWORK_RECORDS_PER_PAGE: usize = 2_000;
 
 struct SlowOp<'a> {
     method: &'a str,
@@ -402,13 +402,13 @@ impl Delegate {
         }
     }
 
-    fn mark_request_failure(&self, request_id: u64, error_text: &str) {
+    fn mark_request_failure(&self, request_id: &str, error_text: &str) {
         if let Some(row) = self
             .requests
             .borrow_mut()
             .iter_mut()
             .rev()
-            .find(|row| row.get("requestId").and_then(|value| value.as_u64()) == Some(request_id))
+            .find(|row| row.get("requestId").and_then(|value| value.as_str()) == Some(request_id))
         {
             row["failure"] = json!({ "errorText": error_text });
             self.wake.wake();
@@ -555,7 +555,7 @@ impl WebViewDelegate for Delegate {
 
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
         let url = load.request.url.to_string();
-        let request_id = NEXT_NETWORK_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let request_id = format!("{}:{}", load.request.id.fetch_id, load.request.id.redirect_count);
         let mut headers: Vec<serde_json::Value> = load
             .request
             .headers
@@ -593,7 +593,8 @@ impl WebViewDelegate for Delegate {
             UrlDecision::Allow if abort_match => Some("net::ERR_FAILED".to_owned()),
             UrlDecision::Allow => None,
         };
-        self.requests.borrow_mut().push(json!({
+        let mut requests = self.requests.borrow_mut();
+        requests.push(json!({
             "requestId": request_id,
             "url": url,
             "method": load.request.method.to_string(),
@@ -602,6 +603,11 @@ impl WebViewDelegate for Delegate {
             "headers": headers,
             "failure": failure.as_ref().map(|error_text| json!({ "errorText": error_text })),
         }));
+        if requests.len() > MAX_NETWORK_RECORDS_PER_PAGE {
+            let excess = requests.len() - MAX_NETWORK_RECORDS_PER_PAGE;
+            requests.drain(..excess);
+        }
+        drop(requests);
         self.wake.wake();
         if let UrlDecision::Deny { reason } = policy {
             if load.request.is_for_main_frame {
@@ -627,8 +633,7 @@ impl WebViewDelegate for Delegate {
                 )
             });
         let Some((action, body, status, content_type, continue_headers)) = matched else {
-            let mut extras = extra_request_headers(&self.extra_headers.borrow());
-            add_proxy_request_id(&mut extras, &url, request_id);
+            let extras = extra_request_headers(&self.extra_headers.borrow());
             if !extras.is_empty() {
                 load.continue_with_headers(extras);
             }
@@ -637,7 +642,7 @@ impl WebViewDelegate for Delegate {
         let request_url = load.request.url.clone();
         match action.as_str() {
             "abort" => {
-                self.mark_request_failure(request_id, "net::ERR_FAILED");
+                self.mark_request_failure(&request_id, "net::ERR_FAILED");
                 if load.request.is_for_main_frame {
                     *self.denied_navigation.borrow_mut() = Some("net::ERR_FAILED".to_owned());
                 }
@@ -662,7 +667,8 @@ impl WebViewDelegate for Delegate {
                 intercepted.finish();
                 let status_text = status_code.canonical_reason().unwrap_or("").to_owned();
                 let body_b64 = base64_encode(&body);
-                self.last_responses.borrow_mut().push(json!({
+                let mut responses = self.last_responses.borrow_mut();
+                responses.push(json!({
                     "requestId": request_id,
                     "url": request_url.to_string(),
                     "status": status,
@@ -674,6 +680,11 @@ impl WebViewDelegate for Delegate {
                         "content-type": content_type,
                     },
                 }));
+                if responses.len() > MAX_NETWORK_RECORDS_PER_PAGE {
+                    let excess = responses.len() - MAX_NETWORK_RECORDS_PER_PAGE;
+                    responses.drain(..excess);
+                }
+                drop(responses);
                 self.wake.wake();
                 let lower = content_type.to_ascii_lowercase();
                 let is_download = lower.contains("octet-stream") || lower.contains("attachment");
@@ -697,8 +708,7 @@ impl WebViewDelegate for Delegate {
             "continue" => {
                 let mut merged = self.extra_headers.borrow().clone();
                 merged.extend(continue_headers);
-                let mut extras = extra_request_headers(&merged);
-                add_proxy_request_id(&mut extras, &url, request_id);
+                let extras = extra_request_headers(&merged);
                 if extras.is_empty() {
                     return;
                 }
@@ -707,14 +717,44 @@ impl WebViewDelegate for Delegate {
             _ => {}
         }
     }
-}
-
-fn add_proxy_request_id(headers: &mut http::HeaderMap, url: &str, request_id: u64) {
-    if !url.starts_with("http://") {
-        return;
-    }
-    if let Ok(value) = http::HeaderValue::from_str(&request_id.to_string()) {
-        headers.insert(http::HeaderName::from_static(REQUEST_ID_HEADER), value);
+    fn web_resource_response_completed(
+        &self,
+        _webview: WebView,
+        response: WebResourceResponseCompleted,
+    ) {
+        let request_id = format!("{}:{}", response.id.fetch_id, response.id.redirect_count);
+        let headers: serde_json::Map<String, serde_json::Value> = response.headers.iter().filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| (name.as_str().to_owned(), json!(value)))
+        }).collect();
+        let mut row = json!({
+            "requestId": request_id,
+            "url": response.url.to_string(),
+            "statusText": String::from_utf8_lossy(&response.status_message),
+            "bodyBytes": response.body_bytes,
+            "byteLength": response.body_bytes,
+            "fromCache": response.from_cache,
+            "headers": headers,
+        });
+        if let Some(status) = response.status_code {
+            row["status"] = json!(status);
+            row["ok"] = json!((200..400).contains(&status));
+        }
+        if let Some(failure) = response.failure {
+            row["failure"] = json!({ "errorText": failure });
+        }
+        let mut responses = self.last_responses.borrow_mut();
+        if let Some(existing) = responses.iter_mut().find(|existing| {
+            existing.get("requestId").and_then(|id| id.as_str()) == Some(request_id.as_str())
+        }) {
+            *existing = row;
+        } else {
+            responses.push(row);
+            if responses.len() > MAX_NETWORK_RECORDS_PER_PAGE {
+                let excess = responses.len() - MAX_NETWORK_RECORDS_PER_PAGE;
+                responses.drain(..excess);
+            }
+        }
+        self.wake.wake();
     }
 }
 
@@ -3291,19 +3331,7 @@ impl ContentEngine {
             "page.responses" => {
                 let page_id = required_str(&params, "page")?;
                 let delegate = &self.page(&page_id)?.1;
-                let request_ids: Vec<u64> = delegate
-                    .requests
-                    .borrow()
-                    .iter()
-                    .filter_map(|request| request.get("requestId").and_then(|id| id.as_u64()))
-                    .collect();
-                let mut responses = delegate.last_responses.borrow().clone();
-                responses.extend(self._proxy.responses().into_iter().filter(|response| {
-                    response
-                        .get("requestId")
-                        .and_then(|id| id.as_u64())
-                        .is_some_and(|id| request_ids.contains(&id))
-                }));
+                let responses = delegate.last_responses.borrow().clone();
                 Ok(json!({ "responses": responses }))
             }
             "page.downloads" => {
