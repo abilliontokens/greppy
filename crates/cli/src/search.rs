@@ -867,7 +867,7 @@ fn search_pattern_case_insensitive_hits(
     let paths = entries
         .into_iter()
         .map(|entry| entry.rel_path)
-        .filter(|path| path_filters.matches(&path.to_string_lossy()))
+        .filter(|path| path_filters.matches(path))
         .collect::<Vec<_>>();
     if paths.is_empty() {
         return Ok(Some(Vec::new()));
