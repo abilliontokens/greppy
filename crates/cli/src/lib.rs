@@ -7376,6 +7376,11 @@ impl QueryPathFilters {
 }
 
 fn normalize_query_filter_path(root_path: &std::path::Path, raw: &str) -> Option<String> {
+    // Existing filter paths are canonicalized below. Canonicalize the root as
+    // well so platform aliases (for example macOS /var -> /private/var) and
+    // Windows path normalization do not make a valid scoped path appear to be
+    // outside the repository.
+    let normalized_root = absolutize_path(root_path);
     let supplied = std::path::Path::new(raw);
     let candidate = if supplied.is_absolute() {
         absolutize_path(supplied)
@@ -7392,7 +7397,7 @@ fn normalize_query_filter_path(root_path: &std::path::Path, raw: &str) -> Option
             root_path.join(supplied)
         }
     };
-    let relative = candidate.strip_prefix(root_path).ok()?;
+    let relative = candidate.strip_prefix(&normalized_root).ok()?;
     let mut parts = Vec::new();
     for component in relative.components() {
         match component {

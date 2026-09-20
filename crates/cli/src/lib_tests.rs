@@ -725,7 +725,7 @@ fn embedding_config_defaults_to_bundled_embeddinggemma_when_no_flags() {
     // ran on the lexical/algorithmic path with no vectors at all.
     let cfg = embedding_config_required(EmbeddingCliArgs {
         device: None,
-        no_gpu: true,
+        no_gpu: false,
     })
     .expect("no-flags embedding config must resolve to the embedded model, not error");
     assert!(
