@@ -90,10 +90,12 @@ impl JobProgress {
             return None;
         }
         let deadline = self.eta_unix_secs?;
-        Some((
-            Prognosis::Remaining(Duration::from_secs(deadline.saturating_sub(now_unix_secs))),
-            Duration::from_secs(deadline),
-        ))
+        let prognosis = if deadline <= now_unix_secs {
+            Prognosis::EstimateExceeded
+        } else {
+            Prognosis::Remaining(Duration::from_secs(deadline - now_unix_secs))
+        };
+        Some((prognosis, Duration::from_secs(deadline)))
     }
 }
 
@@ -101,6 +103,7 @@ impl JobProgress {
 enum Prognosis {
     Remaining(Duration),
     Complete,
+    EstimateExceeded,
 }
 
 impl Prognosis {
@@ -126,6 +129,7 @@ impl Prognosis {
                 format!("about {}m", remaining.as_secs().div_ceil(60))
             }
             Self::Complete => "complete".into(),
+            Self::EstimateExceeded => "estimate exceeded".into(),
         }
     }
 }
@@ -216,7 +220,7 @@ impl ProgressReporter {
                     .map(|prognosis| {
                         let deadline = match prognosis {
                             Prognosis::Remaining(remaining) => elapsed.saturating_add(remaining),
-                            Prognosis::Complete => elapsed,
+                            Prognosis::Complete | Prognosis::EstimateExceeded => elapsed,
                         };
                         (prognosis, deadline)
                     })
@@ -230,8 +234,8 @@ impl ProgressReporter {
             }
             if let Some((Prognosis::Remaining(remaining), deadline)) = forecast {
                 should_report |= self.forecast_changed_substantially(deadline, remaining);
-            } else if self.prognosis == Some(Prognosis::Complete) {
-                should_report = true;
+            } else if let Some((prognosis, _)) = forecast {
+                should_report |= previous_prognosis != Some(prognosis);
             } else if previous_prognosis.is_some() && self.prognosis.is_none() {
                 should_report = true;
             }
@@ -293,7 +297,7 @@ impl ProgressReporter {
         };
         let shift = deadline.abs_diff(previous_deadline);
         let threshold = MIN_FORECAST_SHIFT.max(previous_remaining / 4);
-        shift >= threshold || remaining.is_zero()
+        shift >= threshold
     }
 }
 
@@ -439,6 +443,52 @@ mod tests {
             .observe_at("search", Some(unmeasured), Duration::from_secs(2), 1_040)
             .unwrap();
         assert!(line.contains("measuring phase ETA"), "{line}");
+    }
+
+    #[test]
+    fn completed_phase_is_reported_once() {
+        let mut reporter = ProgressReporter::default();
+        let completed = job("complete", 100, 100);
+        let first = reporter
+            .observe("search", Some(completed.clone()), Duration::from_secs(2))
+            .unwrap();
+        assert!(first.contains("phase ETA complete"), "{first}");
+        assert!(reporter
+            .observe("search", Some(completed), Duration::from_secs(4))
+            .is_none());
+    }
+
+    #[test]
+    fn expired_published_eta_reports_exceeded_once_until_forecast_changes() {
+        let mut expired = job("embedding", 400, 1000);
+        expired.rate_milli_spans_per_second = 1_000;
+        expired.eta_unix_secs = Some(1_000);
+
+        let mut reporter = ProgressReporter::default();
+        let first = reporter
+            .observe_at(
+                "search",
+                Some(expired.clone()),
+                Duration::from_secs(2),
+                1_010,
+            )
+            .unwrap();
+        assert!(first.contains("phase ETA estimate exceeded"), "{first}");
+        assert!(reporter
+            .observe_at(
+                "search",
+                Some(expired.clone()),
+                Duration::from_secs(4),
+                1_012,
+            )
+            .is_none());
+
+        expired.completed = 450;
+        expired.eta_unix_secs = Some(1_100);
+        let renewed = reporter
+            .observe_at("search", Some(expired), Duration::from_secs(6), 1_020)
+            .unwrap();
+        assert!(renewed.contains("phase ETA about 80s"), "{renewed}");
     }
 
     #[test]
