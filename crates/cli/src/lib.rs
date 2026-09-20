@@ -1649,8 +1649,7 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
 /// code. Use `dispatch_to_code` to run the dispatcher and translate the
 /// result into a `u8` exit code for `ExitCode::from`.
 pub fn dispatch(cli: Cli) -> Result<i32> {
-    let progress_root = resolve_root(cli.root.as_deref()).ok();
-    let _query_progress = query_progress::for_command(cli.command.as_ref(), progress_root);
+    let _query_progress = query_progress::for_command(cli.command.as_ref(), cli.root.as_deref());
     // If a recognised subcommand matched, dispatch it. Otherwise treat
     // the trailing args as a `grep` passthrough. This makes both
     //   greppy grep -R foo .
