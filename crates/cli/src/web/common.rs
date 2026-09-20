@@ -14,7 +14,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
-pub(super) enum RunMode {
+pub enum RunMode {
     /// Start the script with its own browser, context, and page.
     Standalone,
     /// Bind the script to the selected session's current browser, context, and page.
