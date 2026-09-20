@@ -610,7 +610,10 @@ pub(crate) fn dispatch_search_symbols(
         similar.truncate(cli_result_limit_unless_all(20, all));
         println!();
         println!("similar names:");
-        search_print_symbol_rows(&root_path, &similar, code);
+        // `--code` applies to primary matches. These rows are diagnostic
+        // recovery candidates, so expanding their bodies can turn one typo
+        // into an unbounded wall of unrelated source.
+        search_print_symbol_rows(&root_path, &similar, false);
         return Ok(1);
     }
 
@@ -628,7 +631,7 @@ pub(crate) fn dispatch_search_symbols(
         println!();
         println!("closest by meaning:");
         let purposes = semantic_vector_purposes(&store, root, &meaning, true)?;
-        print_search_meaning_rows(&store, &root_path, &meaning, purposes.as_deref(), code)?;
+        print_search_meaning_rows(&store, &root_path, &meaning, purposes.as_deref(), false)?;
     }
     // Suggestions help recover from a miss; they are not matches for the
     // requested name and must not turn an empty primary result into success.
