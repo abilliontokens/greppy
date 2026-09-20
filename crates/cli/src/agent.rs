@@ -1227,7 +1227,9 @@ fn run_agent(
         }
     }
 
-    let mut exit = EXIT_OK;
+    let mut cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
+    let (mut exit, _) =
+        result_exit_and_status(cancelled, session.last_stop.as_ref(), EXIT_OK, "clean");
     let mut result_status = "clean";
     let mut proposal_ref = None;
     let mut commit_id = None;
@@ -1282,7 +1284,9 @@ fn run_agent(
                 }
             }
 
-            if args.apply && !run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref())
+            if args.apply
+                && exit == EXIT_OK
+                && !run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref())
             {
                 match workspace.apply_to(workspace.repo_root(), &commit) {
                     Ok(()) => {
@@ -1328,6 +1332,8 @@ fn run_agent(
         }
     }
 
+    cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
+    (exit, _) = result_exit_and_status(cancelled, session.last_stop.as_ref(), exit, result_status);
     if exit == EXIT_OK && !args.keep_worktree {
         let wt_path = workspace.worktree_path().to_path_buf();
         if let Err(e) = workspace.cleanup() {
@@ -1368,7 +1374,7 @@ fn run_agent(
 
     drop(stdout);
     drop(stderr);
-    let cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
+    cancelled = run_was_cancelled(session.last_stop.as_ref(), config.cancel.as_ref());
     let (exit, status) =
         result_exit_and_status(cancelled, session.last_stop.as_ref(), exit, result_status);
     if let Some(emitter) = json.as_mut() {
@@ -1508,6 +1514,8 @@ fn result_exit_and_status(
         } else {
             (exit, ok_status)
         }
+    } else if exit == EXIT_INCOMPLETE {
+        (EXIT_INCOMPLETE, "incomplete")
     } else {
         (exit, "error")
     }
@@ -3302,7 +3310,38 @@ mod tests {
             result_exit_and_status(false, Some(&LoopStop::EndTurn), EXIT_OK, "proposal"),
             (EXIT_OK, "proposal")
         );
-        let flag = Arc::new(AtomicBool::new(true));
+        for stop in [
+            LoopStop::MaxTurns,
+            LoopStop::MaxTokens,
+            LoopStop::Deadline,
+            LoopStop::Stuck,
+        ] {
+            assert_eq!(
+                result_exit_and_status(false, Some(&stop), EXIT_OK, "proposal"),
+                (EXIT_INCOMPLETE, "incomplete"),
+                "{stop:?}"
+            );
+        }
+        assert_eq!(
+            result_exit_and_status(false, Some(&LoopStop::MaxTurns), EXIT_AGENT, "proposal"),
+            (EXIT_AGENT, "error")
+        );
+        assert_eq!(
+            result_exit_and_status(
+                false,
+                Some(&LoopStop::MaxTurns),
+                EXIT_INCOMPLETE,
+                "proposal"
+            ),
+            (EXIT_INCOMPLETE, "incomplete")
+        );
+        assert_eq!(
+            result_exit_and_status(true, Some(&LoopStop::MaxTurns), EXIT_INCOMPLETE, "proposal"),
+            (EXIT_CANCELLED, "cancelled")
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!run_was_cancelled(Some(&LoopStop::EndTurn), Some(&flag)));
+        flag.store(true, Ordering::SeqCst);
         assert!(run_was_cancelled(Some(&LoopStop::EndTurn), Some(&flag)));
         assert!(run_was_cancelled(Some(&LoopStop::Cancelled), None));
         assert!(!run_was_cancelled(Some(&LoopStop::EndTurn), None));

@@ -62,7 +62,7 @@ fn init_repo(root: &std::path::Path) {
 
 /// Minimal Anthropic Messages gateway: GET /v1/models → 200; POST /v1/messages
 /// → canned SSE text-only end_turn stream.
-fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+fn spawn_gateway(sse: &'static str) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener
         .set_nonblocking(true)
@@ -72,27 +72,6 @@ fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let stop_flag = Arc::clone(&stop);
 
     let handle = thread::spawn(move || {
-        let sse = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
-            "\n",
-            "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n",
-            "\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi from stub\"}}\n",
-            "\n",
-            "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
-            "\n",
-            "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n",
-            "\n",
-            "event: message_stop\n",
-            "data: {\"type\":\"message_stop\"}\n",
-            "\n",
-        );
-
         while !stop_flag.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -146,6 +125,52 @@ fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     }
 
     (endpoint, stop, handle)
+}
+
+fn spawn_stub_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway(concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
+        "\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n",
+        "\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi from stub\"}}\n",
+        "\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+        "\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n",
+        "\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n",
+        "\n",
+    ))
+}
+
+fn spawn_edit_gateway() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    spawn_gateway(concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_edit\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
+        "\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_edit\",\"name\":\"bash\",\"input\":{}}}\n",
+        "\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"printf 'partial\\\\n' > hello.txt\\\"}\"}}\n",
+        "\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+        "\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":8}}\n",
+        "\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n",
+        "\n",
+    ))
 }
 
 #[test]
@@ -394,6 +419,105 @@ fn greppy_p_limits_report_incomplete_and_deliver_outcome() {
         drop(provider);
         let _ = std::fs::remove_dir_all(&provider_root);
     }
+}
+
+#[test]
+fn greppy_p_incomplete_proposal_is_not_applied_and_keeps_recovery_state() {
+    let repo = unique_temp("partial-proposal-repo");
+    init_repo(&repo);
+    let store = unique_temp("partial-proposal-store");
+    let provider_root = unique_temp("partial-proposal-provider");
+    let provider = spawn_fake_provider(&provider_root, &repo);
+    let (endpoint, stop, handle) = spawn_edit_gateway();
+
+    let output = Command::new(binary_path())
+        .current_dir(&repo)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_WORKSPACE_DIR", &provider.data)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_MODEL")
+        .env_remove("GREPPY_ENDPOINT")
+        .args([
+            "-p",
+            "change hello.txt",
+            "--model",
+            "test",
+            "--endpoint",
+            &endpoint,
+            "--max-turns",
+            "1",
+            "--private-store",
+            "--skip-selfcheck",
+            "--apply",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn greppy -p");
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    let result = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["type"] == "result")
+        .expect("incomplete proposal result");
+    assert_eq!(result["status"], "incomplete");
+    assert_eq!(result["stop"], "turn limit reached");
+    assert_eq!(result["turns"], 1);
+    assert_eq!(result["applied"], false);
+    let proposal = result["proposal_ref"]
+        .as_str()
+        .expect("partial proposal must remain inspectable");
+    assert!(!proposal.is_empty(), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("hello.txt")).unwrap(),
+        "hello\n",
+        "--apply must not stage an incomplete proposal"
+    );
+    let shown = Command::new("git")
+        .args(["show", "--format=", proposal, "--", "hello.txt"])
+        .current_dir(&repo)
+        .output()
+        .expect("inspect proposal ref");
+    assert!(
+        shown.status.success(),
+        "proposal={proposal} stderr={}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains("partial"),
+        "proposal={proposal} stdout={}",
+        String::from_utf8_lossy(&shown.stdout)
+    );
+    let kept = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree kept: "))
+        .map(PathBuf::from)
+        .expect("incomplete run must report its retained worktree");
+    assert!(
+        kept.exists(),
+        "retained worktree missing: {}",
+        kept.display()
+    );
+
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&kept)
+        .current_dir(&repo)
+        .status();
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&store);
+    drop(provider);
+    let _ = std::fs::remove_dir_all(&provider_root);
 }
 
 #[test]
