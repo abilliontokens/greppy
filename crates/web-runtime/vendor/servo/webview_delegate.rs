@@ -12,8 +12,7 @@ use embedder_traits::{
     FilterPattern, InputEventId, InputEventResult, InputMethodType, LoadStatus, MediaSessionEvent,
     NewWebViewDetails, Notification, PermissionFeature, PromptResponse, RgbColor, ScreenGeometry,
     SelectElementOptionOrOptgroup, SelectElementRequest, SimpleDialogRequest, TraversalId,
-    WebResourceLoadId, WebResourceRequest, WebResourceResponse, WebResourceResponseCompleted,
-    WebResourceResponseMsg,
+    WebResourceRequest, WebResourceResponse, WebResourceResponseCompleted, WebResourceResponseMsg,
 };
 use paint_api::rendering_context::RenderingContext;
 use servo_base::generic_channel::{GenericCallback, GenericSender, SendError};
@@ -1235,6 +1234,7 @@ mod test {
     #[test]
     fn test_web_resource_load() {
         use http::{HeaderMap, Method, StatusCode};
+        use embedder_traits::WebResourceLoadId;
 
         use crate::responders::ServoErrorChannel;
 

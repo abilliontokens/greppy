@@ -34,6 +34,28 @@ fn isolated_id(value: &str) -> Result<&str, String> {
     Ok(value)
 }
 
+#[cfg(test)]
+mod network_record_tests {
+    use super::*;
+
+    #[test]
+    fn completed_response_metadata_and_failure_enrich_request() {
+        let requests = json!([{ "requestId": "fetch:0", "url": "https://fixture.invalid" }]);
+        let responses = json!([{
+            "requestId": "fetch:0", "status": 200, "statusText": "OK", "ok": true,
+            "byteLength": 7, "bodyBytes": 7, "fromCache": false,
+            "failure": { "errorText": "body reset" }, "headers": { "x-test": "yes" }
+        }]);
+        let enriched = enrich_network_records(requests, &responses);
+        let record = &enriched[0];
+        assert_eq!(record["bodyBytes"], 7);
+        assert_eq!(record["fromCache"], false);
+        assert_eq!(record["failure"]["errorText"], "body reset");
+        assert_eq!(record["responseHeaders"]["x-test"], "yes");
+        assert!(network_record_failed(record));
+    }
+}
+
 fn script_stage_dir(run_id: &str, session_id: &str, request_id: &str) -> Result<PathBuf, String> {
     Ok(std::env::temp_dir()
         .join("greppy-web-runtime")
@@ -687,7 +709,7 @@ fn enrich_network_records(mut requests: Value, responses: &Value) -> Value {
         let Some(object) = request.as_object_mut() else {
             continue;
         };
-        for key in ["status", "statusText", "ok", "byteLength"] {
+        for key in ["status", "statusText", "ok", "byteLength", "bodyBytes", "fromCache", "failure"] {
             if let Some(value) = response.get(key) {
                 object.insert(key.to_owned(), value.clone());
             }
@@ -2868,6 +2890,8 @@ impl Daemon {
             Ok((session_id, page)) => {
                 let mut console = json!([]);
                 let mut requests = json!([]);
+                let mut request_retention = json!({});
+                let mut response_retention = json!({});
                 if kind != "network" {
                     match self.engine_call("page.consoleMessages", json!({ "page": page })) {
                         Ok(value) => {
@@ -2882,6 +2906,7 @@ impl Daemon {
                 if kind != "console" {
                     match self.engine_call("page.requests", json!({ "page": page })) {
                         Ok(value) => {
+                            request_retention = value.get("retention").cloned().unwrap_or(json!({}));
                             requests = value
                                 .get("requests")
                                 .cloned()
@@ -2895,10 +2920,10 @@ impl Daemon {
                 }
                 if kind == "network" {
                     let responses = match self.engine_call("page.responses", json!({ "page": page })) {
-                        Ok(value) => value
-                            .get("responses")
-                            .cloned()
-                            .unwrap_or_else(|| value.clone()),
+                        Ok(value) => {
+                            response_retention = value.get("retention").cloned().unwrap_or(json!({}));
+                            value.get("responses").cloned().unwrap_or_else(|| value.clone())
+                        }
                         Err(error) => {
                             self.finish_session(&session_id);
                             return engine_error(request, error, 34);
@@ -2962,6 +2987,15 @@ impl Daemon {
                     }
                     if kind != "console" {
                         object.insert("requests".into(), requests);
+                    }
+                    if kind == "network" {
+                        let complete = request_retention.get("complete").and_then(Value::as_bool) == Some(true)
+                            && response_retention.get("complete").and_then(Value::as_bool) == Some(true);
+                        object.insert("coverage".into(), json!({
+                            "complete": complete,
+                            "requests": request_retention,
+                            "responses": response_retention,
+                        }));
                     }
                 }
                 Response::ok(request, result)

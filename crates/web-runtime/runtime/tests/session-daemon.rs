@@ -3106,6 +3106,8 @@ fn network_query_filters_real_http_and_https_responses() {
     let failed = records.iter().find(|row| row["url"] == failed_origin).unwrap_or_else(|| panic!("missing transport failure: {all:?}"));
     assert!(failed.get("status").is_none(), "{failed:?}");
     assert!(failed["failure"]["errorText"].is_string(), "{failed:?}");
+    let failed_only = unix_request(&socket, &Request::new("run_network_http_query", "web.network", json!({ "session_id": session_id, "filter": "failed" })), Duration::from_secs(10)).expect("failed network filter");
+    assert!(failed_only.result.as_ref().unwrap()["requests"].as_array().unwrap().iter().any(|row| row["url"] == failed_origin && row["failure"]["errorText"].is_string()), "{failed_only:?}");
 }
 
 #[test]
