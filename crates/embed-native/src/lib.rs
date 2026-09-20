@@ -432,7 +432,7 @@ fn load_auto_backend(model: &GgufModel) -> Result<EmbeddingBackend> {
     }
     #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
     {
-        return load_cuda_with_cpu_fallback(model);
+        return CudaEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cuda);
     }
     #[cfg(not(any(
         all(feature = "metal", target_os = "macos"),
@@ -440,17 +440,6 @@ fn load_auto_backend(model: &GgufModel) -> Result<EmbeddingBackend> {
     )))]
     {
         CpuEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cpu)
-    }
-}
-
-#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-fn load_cuda_with_cpu_fallback(model: &GgufModel) -> Result<EmbeddingBackend> {
-    match CudaEmbeddingModel::from_gguf(model) {
-        Ok(model) => Ok(EmbeddingBackend::Cuda(model)),
-        Err(err) => {
-            eprintln!("greppy_embed_native: CUDA unavailable, falling back to CPU: {err}");
-            CpuEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cpu)
-        }
     }
 }
 

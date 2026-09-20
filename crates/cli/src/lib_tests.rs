@@ -1,6 +1,13 @@
 use super::*;
 use clap::Parser;
 
+#[cfg(not(feature = "cpu-only"))]
+#[test]
+fn product_build_contains_embedding_and_summary_gpu_backends() {
+    assert!(greppy_embed_native::HAS_GPU_BACKEND);
+    assert!(greppy_qwen35_native::HAS_GPU_BACKEND);
+}
+
 #[cfg(unix)]
 #[test]
 fn query_path_filters_normalize_alias_roots_for_existing_and_missing_paths() {
@@ -841,14 +848,14 @@ fn embedding_device_preference_obeys_cli_and_env() {
     );
     let explicit_cpu = embedding_device_preference(Some("cpu"), false);
     let no_gpu_cpu = embedding_device_preference(None, true);
-    if cfg!(all(target_os = "macos", not(feature = "cpu-only"))) {
+    if cfg!(all(any(target_os = "macos", target_os = "linux"), not(feature = "cpu-only"))) {
         assert!(matches!(
             explicit_cpu,
             Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")
         ));
         assert!(matches!(
             no_gpu_cpu,
-            Err(Error::Invalid(message)) if message.contains("use Metal")
+            Err(Error::Invalid(message)) if message.contains("platform GPU")
         ));
     } else {
         assert_eq!(
@@ -861,13 +868,13 @@ fn embedding_device_preference_obeys_cli_and_env() {
         );
     }
 
-    // Summary inference shares the production macOS contract and must reject
+    // Summary inference shares the product GPU contract and must reject
     // an explicit CPU selector independently of the no-GPU switch.
     unsafe {
         std::env::set_var(ENV_DEVICE, "cpu");
     }
     let summary_explicit_cpu = qwen_summary_device_preference();
-    if cfg!(all(target_os = "macos", not(feature = "cpu-only"))) {
+    if cfg!(all(any(target_os = "macos", target_os = "linux"), not(feature = "cpu-only"))) {
         assert!(matches!(
             summary_explicit_cpu,
             Err(Error::Invalid(message)) if message.contains("GREPPY_DEVICE=cpu")
@@ -885,7 +892,7 @@ fn embedding_device_preference_obeys_cli_and_env() {
     }
     let env_cpu = embedding_device_preference(Some("cuda"), false);
     let summary_env_cpu = qwen_summary_device_preference();
-    if cfg!(all(target_os = "macos", not(feature = "cpu-only"))) {
+    if cfg!(all(any(target_os = "macos", target_os = "linux"), not(feature = "cpu-only"))) {
         assert!(matches!(
             env_cpu,
             Err(Error::Invalid(message)) if message.contains("CPU inference is disabled")

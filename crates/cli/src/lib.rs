@@ -25,19 +25,25 @@ compile_error!("ci-test-assets is forbidden outside debug/test builds");
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A binary without a GPU backend is not buildable, the same way a binary
-/// without the embedded models is not buildable. Nothing fails at runtime when
-/// the backend is missing — the work just takes twenty times longer, measured
-/// on this repo at 7.5 s against 0.3 s for one navigation summary — so the
-/// mistake is invisible unless the compiler refuses it. Building on a platform
-/// that has no backend, or measuring against the CPU path, is
-/// `--features cpu-only`.
+#[cfg(all(feature = "cpu-only", not(greppy_debug_profile)))]
+compile_error!(
+    "the Greppy CLI cannot be built outside Cargo's debug profile with `cpu-only`; supported product targets \
+     are macOS with Metal and Linux x86_64 with CUDA/nvcc. `cpu-only` is restricted to \
+     debug and numerical-reference use"
+);
+
+#[cfg(test)]
+mod build_policy;
+
+/// Product binaries require compiled GPU implementations for both inference
+/// workloads. The CUDA constants include the build-script signal emitted only
+/// after nvcc creates the shared backend, so a requested feature is not enough.
 #[cfg(not(feature = "cpu-only"))]
 const _: () = assert!(
-    greppy_embed_native::HAS_GPU_BACKEND,
-    "no GPU backend for this target. Metal is enabled for macOS and CUDA for \
-     Linux/Windows in crates/cli/Cargo.toml; if this target genuinely has \
-     neither, build with --features cpu-only."
+    greppy_embed_native::HAS_GPU_BACKEND && greppy_qwen35_native::HAS_GPU_BACKEND,
+    "Greppy requires compiled GPU backends for both embeddings and summaries. \
+     Supported product targets are macOS with Metal and Linux x86_64 with CUDA/nvcc; \
+     `cpu-only` is restricted to debug and numerical-reference use"
 );
 
 // Route this module's stdout through one optional collector. Query commands
