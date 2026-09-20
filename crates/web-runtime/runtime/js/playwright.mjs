@@ -2056,21 +2056,23 @@ class Page {
       const rec = requests[index];
       const key = String(rec.method || "GET") + " " + String(rec.url) + " " + index;
       const request = this._requestFromRecord(rec, requests);
-      const hit = responses.find((row) => row.url === rec.url);
+      const hit = responses.find(
+        (row) => String(row.requestId || "") === String(rec.requestId || ""),
+      );
       if (!this._emittedNetwork.has(key + " req")) {
         this._emittedNetwork.add(key + " req");
         this._emit("request", request);
       }
-      if (hit) {
+      if (request.failure()) {
+        if (!this._emittedNetwork.has(key + " fail")) {
+          this._emittedNetwork.add(key + " fail");
+          this._emit("requestfailed", request);
+        }
+      } else if (hit) {
         if (!this._emittedNetwork.has(key + " fin")) {
           this._emittedNetwork.add(key + " fin");
           this._emit("response", this._responseFromRecord(hit, request));
           this._emit("requestfinished", request);
-        }
-      } else if (request.failure()) {
-        if (!this._emittedNetwork.has(key + " fail")) {
-          this._emittedNetwork.add(key + " fail");
-          this._emit("requestfailed", request);
         }
       } else if (settle) {
         if (!this._emittedNetwork.has(key + " fin")) {
