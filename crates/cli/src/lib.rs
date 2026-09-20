@@ -9305,6 +9305,7 @@ fn output_budget_spec(cli: &Cli) -> Option<OutputBudgetSpec> {
         Command::Impact { json, .. } => ("impact", *json),
         Command::Brief { json, .. } => ("brief", *json),
         Command::Expand { json, .. } => ("expand", *json),
+        Command::Read { json, .. } => ("read", *json),
         Command::WhoCalls { json, .. } => ("who-calls", *json),
         Command::Callees { json, .. } => ("callees", *json),
         Command::FanIn { json, .. } => ("fan-in", *json),
@@ -9366,6 +9367,7 @@ const BUDGET_ARRAY_FIELDS: &[&str] = &[
     "callers",
     "references",
     "callees",
+    "candidates",
 ];
 
 fn result_item_count(value: &serde_json::Value) -> usize {
@@ -9853,11 +9855,8 @@ fn text_line_is_priority(line: &str) -> bool {
         || trimmed.starts_with("unresolved textual candidates:")
 }
 
-fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> Vec<u8> {
+fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, _exit_code: u8) -> Vec<u8> {
     let text = String::from_utf8_lossy(bytes);
-    if exit_code != 0 {
-        return bytes.to_vec();
-    }
     let mut priority = Vec::new();
     let mut content = Vec::new();
     for line in text.lines() {
@@ -9887,11 +9886,25 @@ fn budget_text_output(bytes: &[u8], spec: &OutputBudgetSpec, exit_code: u8) -> V
         if spec
             .max_bytes
             .is_none_or(|max_bytes| rendered.len() <= max_bytes)
-            || selected.pop().is_none()
         {
             return rendered;
         }
+        if selected.pop().is_none() {
+            return hard_cap_text_output(rendered, spec.max_bytes.unwrap_or(usize::MAX));
+        }
     }
+}
+
+fn hard_cap_text_output(mut rendered: Vec<u8>, max_bytes: usize) -> Vec<u8> {
+    if rendered.len() <= max_bytes {
+        return rendered;
+    }
+    let mut end = max_bytes;
+    while end > 0 && std::str::from_utf8(&rendered[..end]).is_err() {
+        end -= 1;
+    }
+    rendered.truncate(end);
+    rendered
 }
 
 /// Translate a `Result<i32>` into the actual exit code we should return.
