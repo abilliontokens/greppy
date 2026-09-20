@@ -351,6 +351,30 @@ fn read_file_ignores_missing_linked_base_for_pages_handles_and_ranges() {
         "{range_out}"
     );
     assert!(range_out.contains("line 805\nhandle: geh2:"), "{range_out}");
+    let handle = range_out
+        .lines()
+        .find_map(|line| line.strip_prefix("handle: "))
+        .expect("compact read-file handle");
+    let (edit_code, edit_out, edit_err) = run(
+        &repo,
+        &store,
+        &[
+            "replace-span",
+            handle,
+            "replacement remains dry-run only\n",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(edit_code, 0, "{edit_out}\n{edit_err}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("long.txt")).unwrap(),
+        content,
+        "compact handle resolution must not publish a dry-run replacement"
+    );
+    assert!(
+        !graph_db.parent().unwrap().join("index.job").exists(),
+        "read-file metadata operations must not launch an index job"
+    );
 }
 
 #[test]
