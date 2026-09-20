@@ -2527,7 +2527,15 @@ fn baseline_mismatch_detail(expected: &BaselineSnapshot, observed: &BaselineSnap
         .iter()
         .find(|entry| !expected_entries.contains_key(entry.path.as_str()))
     {
-        return format!("unexpected observed baseline path: {}", extra.path);
+        return format!(
+            "unexpected observed baseline path: {}; kind={:?} mode={:o} size={} mtime={} hash={}",
+            extra.path,
+            extra.kind,
+            extra.mode,
+            extra.size,
+            extra.modified_unix_ns,
+            extra.content_hash,
+        );
     }
     "baseline serialization differs despite matching visible fields".into()
 }
