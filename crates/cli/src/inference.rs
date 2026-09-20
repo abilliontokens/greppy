@@ -282,13 +282,15 @@ pub(crate) fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>
 pub(crate) fn qwen_summary_device_preference() -> Result<greppy_qwen35_native::DevicePreference> {
     let cli = cli_inference_override();
     if cli.no_gpu || env_bool(ENV_NO_GPU)? {
-        return Ok(greppy_qwen35_native::DevicePreference::Cpu);
+        return enforce_macos_production_gpu(greppy_qwen35_native::DevicePreference::Cpu);
     }
     let raw = cli
         .device
         .or_else(|| env_nonempty(ENV_DEVICE))
         .unwrap_or_else(|| "auto".to_string());
-    greppy_qwen35_native::DevicePreference::parse(&raw).map_err(|e| Error::Invalid(e.to_string()))
+    let preference = greppy_qwen35_native::DevicePreference::parse(&raw)
+        .map_err(|e| Error::Invalid(e.to_string()))?;
+    enforce_macos_production_gpu(preference)
 }
 
 pub(crate) fn qwen_summary_model_key(cfg: &QwenSummaryConfig) -> String {
@@ -387,7 +389,7 @@ pub(crate) fn embedding_device_preference(
     cli_no_gpu: bool,
 ) -> Result<greppy_embed_native::DevicePreference> {
     if cli_no_gpu || env_bool(ENV_NO_GPU)? {
-        return Ok(greppy_embed_native::DevicePreference::Cpu);
+        return enforce_macos_production_gpu(greppy_embed_native::DevicePreference::Cpu);
     }
     let raw = cli_device
         .map(str::trim)
@@ -395,8 +397,24 @@ pub(crate) fn embedding_device_preference(
         .map(ToOwned::to_owned)
         .or_else(|| env_nonempty(ENV_DEVICE))
         .unwrap_or_else(|| "auto".to_string());
-    raw.parse::<greppy_embed_native::DevicePreference>()
-        .map_err(|e| Error::Invalid(e.to_string()))
+    let preference = raw
+        .parse::<greppy_embed_native::DevicePreference>()
+        .map_err(|e| Error::Invalid(e.to_string()))?;
+    enforce_macos_production_gpu(preference)
+}
+
+fn enforce_macos_production_gpu(
+    preference: greppy_embed_native::DevicePreference,
+) -> Result<greppy_embed_native::DevicePreference> {
+    #[cfg(all(target_os = "macos", not(feature = "cpu-only")))]
+    if preference == greppy_embed_native::DevicePreference::Cpu {
+        return Err(Error::Invalid(
+            "CPU inference is disabled in production macOS builds; use Metal, or rebuild with \
+             --features cpu-only for CI and diagnostics"
+                .into(),
+        ));
+    }
+    Ok(preference)
 }
 
 /// Cache key for query embeddings: logical model id + prompt/task contract +
