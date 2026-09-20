@@ -876,7 +876,18 @@ pub(crate) fn open_default_store_query_writer(root: Option<&str>) -> Result<grep
 /// graph build. Exact filesystem reads must remain available before the first
 /// index; their pagination records are not graph-query evidence.
 pub(crate) fn open_default_store_pack_writer(root: Option<&str>) -> Result<greppy_store::Store> {
-    open_default_store_writer(root, false)
+    let effective_root = resolve_root(root)?;
+    let path = workspace_locator::store_path(&effective_root);
+    if let Some(parent) = path.parent() {
+        workspace_locator::ensure_store_dir(parent)
+            .map_err(|error| Error::io("create continuation pack store", error))?;
+    }
+    let store = greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())?;
+    let _ = workspace_locator::ensure_db_mode(&path);
+    if let Some(store_dir) = path.parent() {
+        workspace_locator::touch_lastused(store_dir);
+    }
+    Ok(store)
 }
 
 fn open_default_store_writer(

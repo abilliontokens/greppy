@@ -469,7 +469,10 @@ pub(crate) fn resolve_compact_read_handle(
         .collect::<String>();
     let mut expected = [0u8; 16];
     expected.copy_from_slice(&binary[9..25]);
-    let store = open_default_store_query_writer(root)?;
+    // Compact handles are continuation metadata, not graph evidence. Resolve
+    // them from the workspace-local pack store so a stale linked-worktree Base
+    // binding cannot make a filesystem edit handle require reindexing.
+    let store = open_default_store_pack_writer(root)?;
     let Some(pack) = store.get_expand_pack(&id)? else {
         return Ok(None);
     };
