@@ -743,8 +743,12 @@ fn serve_status_fixture() -> String {
             }
             let (status, body) = match path {
                 "/missing" => ("404 Not Found", b"missing".as_slice()),
-                "/repeat" if repeated.fetch_add(1, Ordering::SeqCst) > 0 => {
-                    ("404 Not Found", b"repeated missing".as_slice())
+                "/repeat" => {
+                    if repeated.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ("200 OK", b"repeated ok".as_slice())
+                    } else {
+                        ("404 Not Found", b"repeated missing".as_slice())
+                    }
                 }
                 "/empty" => ("204 No Content", b"".as_slice()),
                 "/landed" => ("200 OK", b"landed".as_slice()),
