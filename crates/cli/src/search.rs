@@ -903,6 +903,39 @@ fn search_pattern_case_insensitive_hits(
     Ok(Some(hits))
 }
 
+#[cfg(test)]
+mod case_insensitive_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_optional_scan_is_skipped_but_scoped_scan_remains_available() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        for n in 0..1_025 {
+            std::fs::write(
+                root.path().join(format!("file_{n}.rs")),
+                "pub fn Present() {}\n",
+            )
+            .unwrap();
+        }
+        // An invalid regex would make grep fail if the oversized scan ran.
+        let skipped = search_pattern_case_insensitive_hits(
+            "[",
+            root.path(),
+            false,
+            &QueryPathFilters::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_none());
+        let filters = QueryPathFilters::from_args(root.path(), &["file_0.rs".to_owned()]);
+        let scoped = search_pattern_case_insensitive_hits("present", root.path(), true, &filters)
+            .unwrap()
+            .expect("one scoped file stays eligible");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].location, "file_0.rs:1");
+    }
+}
+
 fn search_pattern_rows(
     store: &greppy_store::Store,
     project: &str,

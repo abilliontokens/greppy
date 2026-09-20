@@ -11,10 +11,8 @@
 //!   concrete broader-search and refresh actions.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -210,6 +208,9 @@ fn empty_search_pattern_reports_the_case_insensitive_fact() {
 fn empty_search_pattern_emits_status_after_case_insensitive_scan_finishes() {
     use std::io::{BufRead, BufReader};
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     struct ChildGuard {
         child: std::process::Child,
@@ -235,7 +236,7 @@ fn empty_search_pattern_emits_status_after_case_insensitive_scan_finishes() {
     let grep = tools.join("grep");
     std::fs::write(
         &grep,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GREPPY_TEST_GREP_ARGS\"\n: > \"$GREPPY_TEST_GREP_STARTED\"\nwhile [ ! -e \"$GREPPY_TEST_GREP_RELEASE\" ]; do /bin/sleep 0.01; done\nexit 1\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GREPPY_TEST_GREP_ARGS\"\n: > \"$GREPPY_TEST_GREP_STARTED\"\nattempt=0; while [ ! -e \"$GREPPY_TEST_GREP_RELEASE\" ]; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 1000 ] || exit 2; /bin/sleep 0.01; done\nexit 1\n",
     )
     .unwrap();
     std::fs::set_permissions(&grep, std::fs::Permissions::from_mode(0o755)).unwrap();
