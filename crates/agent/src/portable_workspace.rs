@@ -12,7 +12,7 @@ use greppy_workspace_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -2431,9 +2431,9 @@ fn restore_apply_journal(
     let _ = fs::remove_file(&index);
     let observed = capture_repository(&repository, core.chunks())?;
     let observed_hash = observed.baseline_hash.clone();
-    let mismatch_detail = baseline_mismatch_detail(&proposal.baseline, &observed);
-    release_snapshot(core.chunks(), observed);
     if observed_hash != journal.baseline_hash {
+        let mismatch_detail = baseline_mismatch_detail(&proposal.baseline, &observed);
+        release_snapshot(core.chunks(), observed);
         return Err(WorkspaceError::Tampered {
             path: repository,
             detail: format!(
@@ -2442,6 +2442,7 @@ fn restore_apply_journal(
             ),
         });
     }
+    release_snapshot(core.chunks(), observed);
     remove_apply_journal(journal_path)
 }
 
@@ -2459,22 +2460,51 @@ fn baseline_mismatch_detail(expected: &BaselineSnapshot, observed: &BaselineSnap
         );
     }
     if expected.hardlink_groups != observed.hardlink_groups {
+        let first_difference = (0..expected
+            .hardlink_groups
+            .len()
+            .max(observed.hardlink_groups.len()))
+            .find(|index| {
+                expected.hardlink_groups.get(*index) != observed.hardlink_groups.get(*index)
+            })
+            .unwrap_or(0);
+        let summarize = |group: Option<&Vec<String>>| match group {
+            Some(group) => {
+                let paths = group.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+                if group.len() > 4 {
+                    format!("[{paths}, …] ({} paths)", group.len())
+                } else {
+                    format!("[{paths}]")
+                }
+            }
+            None => "<missing>".into(),
+        };
         return format!(
-            "hardlink groups differ: expected {:?}, observed {:?}",
-            expected.hardlink_groups, observed.hardlink_groups
+            "hardlink groups differ: expected {} groups, observed {} groups; first difference at {first_difference}: expected {}, observed {}",
+            expected.hardlink_groups.len(),
+            observed.hardlink_groups.len(),
+            summarize(expected.hardlink_groups.get(first_difference)),
+            summarize(observed.hardlink_groups.get(first_difference)),
         );
     }
+    let expected_entries = expected
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let observed_entries = observed
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
     for expected_entry in &expected.entries {
-        let Some(observed_entry) = observed
-            .entries
-            .iter()
-            .find(|entry| entry.path == expected_entry.path)
-        else {
+        let Some(observed_entry) = observed_entries.get(expected_entry.path.as_str()) else {
             return format!(
                 "baseline path is missing from observation: {}",
                 expected_entry.path
             );
         };
+        let observed_entry = *observed_entry;
         if expected_entry != observed_entry {
             return format!(
                 "baseline path differs: {}; expected kind={:?} mode={:o} size={} mtime={} hash={}; observed kind={:?} mode={:o} size={} mtime={} hash={}",
@@ -2492,12 +2522,11 @@ fn baseline_mismatch_detail(expected: &BaselineSnapshot, observed: &BaselineSnap
             );
         }
     }
-    if let Some(extra) = observed.entries.iter().find(|entry| {
-        !expected
-            .entries
-            .iter()
-            .any(|candidate| candidate.path == entry.path)
-    }) {
+    if let Some(extra) = observed
+        .entries
+        .iter()
+        .find(|entry| !expected_entries.contains_key(entry.path.as_str()))
+    {
         return format!("unexpected observed baseline path: {}", extra.path);
     }
     "baseline serialization differs despite matching visible fields".into()
