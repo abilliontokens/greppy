@@ -2801,19 +2801,19 @@ fn status_reports_active_writer_before_first_snapshot_is_published() {
 
 #[cfg(unix)]
 #[test]
-fn first_use_index_is_bounded_and_reports_retryable_progress() {
-    check_first_use_index_is_bounded(false);
+fn first_use_query_waits_for_healthy_slow_index() {
+    check_first_use_query_waits_for_healthy_slow_index(false);
 }
 
 #[cfg(all(unix, feature = "bash-smart"))]
 #[test]
-fn first_use_index_after_output_capture_is_bounded_and_reports_retryable_progress() {
-    check_first_use_index_is_bounded(true);
+fn first_use_query_after_output_capture_waits_for_healthy_slow_index() {
+    check_first_use_query_waits_for_healthy_slow_index(true);
 }
 
 #[cfg(unix)]
-fn check_first_use_index_is_bounded(seed_pack: bool) {
-    let (repo, store, scratch) = make_repo("first-use-bounded", "first_use_marker");
+fn check_first_use_query_waits_for_healthy_slow_index(seed_pack: bool) {
+    let (repo, store, scratch) = make_repo("first-use-completion", "first_use_marker");
     if seed_pack {
         let (code, out, err) = run(
             &["bash-smart", "--", "sh", "-c", "printf evidence"],
@@ -2846,67 +2846,30 @@ fn check_first_use_index_is_bounded(seed_pack: bool) {
     let envs = [
         ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
         ("GREPPY_TEST_INDEX_FAILPOINT_READY", ready_string.as_str()),
-        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
+        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "500"),
     ];
 
     let started = std::time::Instant::now();
     let (code, out, err) =
         run_with_env(&["search-symbol", "first_use_marker"], &repo, &store, &envs);
     let elapsed = started.elapsed();
-    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !ready.exists() && std::time::Instant::now() < ready_deadline {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
     assert!(
         ready.exists(),
         "background index never reached its test hold point"
     );
-
-    fn find_index_job(dir: &Path) -> Option<PathBuf> {
-        for entry in std::fs::read_dir(dir).ok()?.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = find_index_job(&path) {
-                    return Some(found);
-                }
-            } else if path.file_name().and_then(|name| name.to_str()) == Some("index.job") {
-                return Some(path);
-            }
-        }
-        None
-    }
-    let job_path = find_index_job(&store).expect("first-use background job record");
-    let job: serde_json::Value = serde_json::from_slice(&std::fs::read(job_path).unwrap()).unwrap();
-    let pid_value = job["pid"].as_u64().expect("background job pid");
-    let pid = pid_value.to_string();
-    let pid_i32 = i32::try_from(pid_value).expect("background job pid fits pid_t");
     assert_eq!(
-        unsafe { libc::getpgid(pid_i32) },
-        pid_i32,
-        "first-use index must own a process group independent of its short-lived caller"
-    );
-    let killed = Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .expect("terminate held background index");
-    assert!(
-        killed.success(),
-        "failed to terminate background index {pid}"
-    );
-    assert_eq!(
-        code, 75,
-        "first use must be retryable; stdout={out} stderr={err}"
+        code, 0,
+        "the initiating query must complete after publication; stdout={out} stderr={err}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "a navigation command must never wait for the full first index; elapsed={elapsed:?}"
+        elapsed >= std::time::Duration::from_millis(400),
+        "query returned before the deliberately slow publication; elapsed={elapsed:?}"
     );
     assert!(
-        err.contains("first-use index started")
-            && err.contains("greppy index status --json")
-            && err.contains("healthy=true"),
-        "the refusal must provide state and exact recovery; stderr={err:?}"
+        out.contains("first_use_marker"),
+        "stdout={out} stderr={err}"
     );
+    assert!(!err.contains("retry after"), "stderr={err:?}");
 }
 
 #[cfg(unix)]
