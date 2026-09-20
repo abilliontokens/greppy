@@ -2900,6 +2900,74 @@ fn route_fulfill_overrides_http_body() {
 }
 
 #[test]
+fn network_query_filters_enriched_response_records() {
+    let origin = serve_fixture("unused");
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-network-query-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/network-query.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_network_query", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_network_query",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": script.display().to_string(),
+            "script_text": source,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+
+    let filtered = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status>=400" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network");
+    assert_eq!(filtered.status, "ok", "{filtered:?}");
+    let requests = filtered.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("network requests");
+    assert_eq!(requests.len(), 1, "{filtered:?}");
+    assert!(
+        requests[0]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/missing")),
+        "{filtered:?}"
+    );
+    assert_eq!(requests[0]["status"], 404);
+    assert_eq!(requests[0]["ok"], false);
+    assert_eq!(requests[0]["byteLength"], 7);
+}
+
+#[test]
 fn oracle_skip_receipt_when_chromium_pin_missing() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
