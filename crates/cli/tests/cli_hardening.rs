@@ -1318,7 +1318,8 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["status"], "skipped_stale_index");
     assert_eq!(v["fresh"], false);
-    assert_eq!(v["freshness"]["state"], "drift");
+    // This fixture holds a real index writer: the stale snapshot is refreshing.
+    assert_eq!(v["freshness"]["state"], "refreshing");
     assert_eq!(v["total_exact"], 2);
     assert_eq!(v["shown"], 0);
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
@@ -1358,7 +1359,8 @@ fn semantic_stale_index_refuses_vector_hits() {
     assert_eq!(v["mode"], "vector");
     assert_eq!(v["status"], "skipped_stale_index");
     assert_eq!(v["fresh"], false);
-    assert_eq!(v["freshness"]["state"], "drift");
+    // This fixture holds a real index writer: the stale snapshot is refreshing.
+    assert_eq!(v["freshness"]["state"], "refreshing");
     assert_eq!(v["freshness"]["stale_file_count"], 1);
     assert!(v["hits"].as_array().unwrap().is_empty());
 }
@@ -1398,7 +1400,7 @@ fn search_symbol_refuses_stale_partial_definition_hits() {
     assert!(
         value["warning"]
             .as_str()
-            .is_some_and(|warning| warning.contains("index drift")),
+            .is_some_and(|warning| warning.contains("index refreshing")),
         "{value}"
     );
     assert!(value["hits"].as_array().is_some_and(Vec::is_empty));
