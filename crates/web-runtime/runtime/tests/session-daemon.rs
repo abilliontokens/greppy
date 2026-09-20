@@ -715,6 +715,42 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
+fn serve_status_fixture() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind status fixture");
+    let address = listener.local_addr().expect("status fixture addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0_u8; 2048];
+            let count = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..count]);
+            let leaked_internal_id = request
+                .to_ascii_lowercase()
+                .contains("x-greppy-internal-request-id");
+            let missing = request
+                .lines()
+                .next()
+                .is_some_and(|line| line.split_whitespace().nth(1) == Some("/missing"));
+            let (status, body) = if leaked_internal_id {
+                ("418 I'm a teapot", b"internal header leaked".as_slice())
+            } else if missing {
+                ("404 Not Found", b"missing".as_slice())
+            } else {
+                ("200 OK", b"ok".as_slice())
+            };
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    format!("http://{address}/")
+}
+
 struct NavigationLifecycleFixture {
     origin: String,
     events: std::sync::mpsc::Receiver<String>,
@@ -3009,6 +3045,75 @@ fn network_query_filters_enriched_response_records() {
         .expect("failed transport record");
     assert!(transport.get("status").is_none(), "{transport:?}");
     assert!(transport["failure"]["errorText"].is_string(), "{transport:?}");
+}
+
+#[test]
+fn network_query_filters_ordinary_http_responses() {
+    let origin = serve_status_fixture();
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-network-http-query-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/network-http-status.mjs");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let _guard = Supervisor::spawn(&socket, "run_network_http_query", |command| {
+        command.arg("--fixture-url").arg(&origin);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.session.create",
+            json!({ "profile": "project" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("create");
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run = Request::new(
+        "run_network_http_query",
+        "web.run",
+        json!({
+            "session_id": session_id,
+            "script_source": "file",
+            "script_file": script.display().to_string(),
+            "script_text": source,
+        }),
+    );
+    run.deadline_ms = 60_000;
+    let ran = unix_request(&socket, &run, Duration::from_secs(60)).expect("web.run");
+    assert_eq!(ran.status, "ok", "{ran:?}");
+
+    let filtered = unix_request(
+        &socket,
+        &Request::new(
+            "run_network_http_query",
+            "web.network",
+            json!({ "session_id": session_id, "query": "status>=400" }),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("web.network ordinary HTTP");
+    assert_eq!(filtered.status, "ok", "{filtered:?}");
+    let requests = filtered.result.as_ref().unwrap()["requests"]
+        .as_array()
+        .expect("ordinary HTTP network requests");
+    assert_eq!(requests.len(), 1, "{filtered:?}");
+    assert!(
+        requests[0]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/missing")),
+        "{filtered:?}"
+    );
+    assert_eq!(requests[0]["status"], 404);
+    assert_eq!(requests[0]["statusText"], "Not Found");
+    assert_eq!(requests[0]["byteLength"], 7);
 }
 
 #[test]
