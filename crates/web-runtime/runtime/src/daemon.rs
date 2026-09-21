@@ -2066,9 +2066,11 @@ impl Daemon {
         // typed engine error instead of reporting the error page as success.
         let observation = (!self.workflow_defer_observation)
             .then(|| self.observe_page(session_id, page));
-        if let Some(Err(error)) = observation.as_ref()
-            && error.starts_with("navigation failed: ")
-        {
+        let navigation_error = match observation.as_ref() {
+            Some(Err(error)) if error.starts_with("navigation failed: ") => Some(error.clone()),
+            _ => None,
+        };
+        if let Some(error) = navigation_error {
             self.finish_session(session_id);
             return engine_error(request, error, 34);
         }
