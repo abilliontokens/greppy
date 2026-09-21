@@ -2056,19 +2056,61 @@ impl Daemon {
         page: &str,
         mut result: serde_json::Value,
     ) -> Response {
-        // Observe exactly once, before the original operation becomes idle.
-        // Ordinary observation failure cannot replay or erase a completed
-        // side effect. Servo's transport-error document is the result of a
-        // navigation action, so surface that specific failure as the action's
-        // typed engine error instead of reporting the error page as success.
-        let observation = (!self.workflow_defer_observation)
+        // Consume only a terminal failure produced by this action's native
+        // navigation. This check must run even when a workflow defers the
+        // full page observation until a later step.
+        let terminal_failure = result
+            .get("navigation_epoch")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|navigation_epoch| {
+                match self.engine_call(
+                    "page.take_navigation_failure",
+                    json!({ "page": page, "navigation_epoch": navigation_epoch }),
+                ) {
+                    Ok(value) => value
+                        .get("failure")
+                        .cloned()
+                        .filter(|value| !value.is_null())
+                        .map(|failure| {
+                            let request_id = failure
+                                .get("requestId")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown");
+                            let url = failure
+                                .get("url")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown");
+                            let error = failure
+                                .get("errorText")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("transport failure");
+                            let kind = failure
+                                .get("kind")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("transport");
+                            let detail = format!(
+                                "navigation failed: {error} (kind={kind}, request_id={request_id}, url={url})"
+                            );
+                            if kind == "policy_denied" {
+                                format!("policy_denied: {detail}")
+                            } else {
+                                detail
+                            }
+                        }),
+                    Err(error) => Some(format!("navigation failure check failed: {error}")),
+                }
+            });
+        if let Some(object) = result.as_object_mut() {
+            object.remove("navigation_epoch");
+        }
+        let observation = (!self.workflow_defer_observation && terminal_failure.is_none())
             .then(|| self.observe_page(session_id, page));
-        let navigation_error = match observation.as_ref() {
+        let navigation_error = terminal_failure.or_else(|| match observation.as_ref() {
             Some(Err(error))
                 if error.starts_with("navigation failed: ")
                     || error.starts_with("policy_denied: navigation failed: ") => Some(error.clone()),
             _ => None,
-        };
+        });
         if let Some(error) = navigation_error {
             self.finish_session(session_id);
             let mut response = engine_error(request, error, 34);

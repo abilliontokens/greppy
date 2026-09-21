@@ -3279,8 +3279,9 @@ fn network_query_filters_real_http_and_https_responses() {
 
 #[test]
 fn native_transport_failure_is_typed_without_classifying_page_words() {
-    let failed = spawn_reset_server();
-    let failed_url = failed.url.clone();
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("closed port");
+    let failed_url = format!("http://{}/transport-failure", closed_listener.local_addr().unwrap());
+    drop(closed_listener);
     let legitimate_html = Box::leak(format!(
         "<!doctype html><title>Error loading page</title><body><p>Could not load the requested page: documentation example</p><a id='broken' href='{failed_url}'>Broken transport</a></body>"
     ).into_boxed_str());
@@ -3314,7 +3315,7 @@ fn native_transport_failure_is_typed_without_classifying_page_words() {
         "selector": { "type": "css", "value": "#broken" },
     }));
     assert_eq!(clicked.status, "error", "failed link navigation must be typed: {clicked:?}");
-    assert_eq!(clicked.error.as_ref().unwrap().code, "engine_error");
+    assert_eq!(clicked.error.as_ref().unwrap().code, "engine_error", "{clicked:?}");
     let receipt = clicked.result.as_ref().expect("partial click receipt");
     assert_eq!(receipt["partial"], true);
     assert_eq!(receipt["ok"], false);
@@ -3331,7 +3332,7 @@ fn native_transport_failure_is_typed_without_classifying_page_words() {
 }
 
 #[test]
-fn click_navigation_wait_handles_redirect_reload_and_delayed_javascript() {
+fn click_navigation_wait_handles_redirect_reload_and_bounds_delayed_javascript() {
     let destination = serve_status_fixture();
     let redirect_page = serve_fixture(Box::leak(format!(
         "<!doctype html><a id='go' href='{destination}jump'>Redirect</a>"
@@ -3380,7 +3381,12 @@ fn click_navigation_wait_handles_redirect_reload_and_delayed_javascript() {
     assert_eq!(reloaded.status, "ok", "same URL navigation: {reloaded:?}");
 
     let delayed = click_from(&delayed_page, "#later");
-    assert_eq!(delayed.status, "ok", "delayed JavaScript navigation: {delayed:?}");
+    // The timer starts after the click returns, so this only verifies that a
+    // future script navigation does not make the originating action hang.
+    assert_eq!(
+        delayed.status, "ok",
+        "delayed JavaScript navigation: {delayed:?}"
+    );
 }
 
 #[test]
@@ -3459,6 +3465,103 @@ fn click_abort_and_policy_denial_finish_with_partial_receipts() {
         assert!(receipt.get("dispatch").is_some(), "{clicked:?}");
         assert_eq!(receipt["session_id"], session);
         assert!(receipt["tab_id"].is_string());
+    }
+}
+
+#[test]
+fn workflow_click_terminal_failures_stop_before_expectations_or_later_steps() {
+    let fixture = serve_fixture(
+        "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='policy' href='http://169.254.169.254/latest/meta-data/'>Policy</a><button id='later'>Later</button>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-workflow-terminal-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_workflow_terminal", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_workflow_terminal", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("terminal workflow request")
+    };
+    let open_session = || {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "open workflow fixture: {opened:?}");
+        session
+    };
+
+    let aborted_session = open_session();
+    let routed = call(
+        "web.run",
+        json!({
+            "session_id": aborted_session.clone(),
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": "await page.route('**/aborted', route => route.abort());",
+        }),
+    );
+    assert_eq!(routed.status, "ok", "install workflow route: {routed:?}");
+    for (session, selector, kind, code, trailing) in [
+        (
+            aborted_session,
+            "#abort",
+            "route_aborted",
+            "engine_error",
+            json!({"action":{"operation":"click","selector":{"type":"css","value":"#later"}}}),
+        ),
+        (
+            open_session(),
+            "#policy",
+            "policy_denied",
+            "policy_denied",
+            json!({"expect":{"condition":{"query":"css=#later"},"timeout_ms":1000}}),
+        ),
+    ] {
+        let response = call(
+            "web.workflow",
+            json!({
+                "version": 1,
+                "session_id": session,
+                "steps": [
+                    {"action":{"operation":"click","selector":{"type":"css","value":selector}}},
+                    trailing,
+                ],
+            }),
+        );
+        assert_eq!(response.status, "error", "{kind}: {response:?}");
+        assert_eq!(response.error.as_ref().unwrap().code, code, "{response:?}");
+        assert!(
+            response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains(&format!("kind={kind}")),
+            "{response:?}"
+        );
+        let detail = response.result.as_ref().unwrap();
+        assert_eq!(detail["failed_step"], 1, "{response:?}");
+        assert_eq!(detail["actions_attempted"], 1, "{response:?}");
+        assert_eq!(detail["steps"].as_array().unwrap().len(), 1, "{response:?}");
+        assert_eq!(detail["steps"][0]["action"]["receipt"]["partial"], true);
+        assert_eq!(detail["steps"][0]["action"]["receipt"]["ok"], false);
+        assert!(
+            detail["steps"][0]["action"]["receipt"]
+                .get("dispatch")
+                .is_some(),
+            "{response:?}"
+        );
     }
 }
 

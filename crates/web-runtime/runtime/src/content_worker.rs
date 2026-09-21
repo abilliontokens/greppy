@@ -11,11 +11,11 @@ use serde_json::json;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences, RenderingContext,
-    RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent,
-    TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript, WebResourceLoad,
-    WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder, WebViewDelegate,
-    WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences,
+    RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript,
+    WebResourceLoad, WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -353,6 +353,7 @@ struct Delegate {
     last_responses: RefCell<Vec<serde_json::Value>>,
     dropped_responses: Cell<u64>,
     current_main_frame_request: RefCell<Option<String>>,
+    main_frame_navigation_epoch: Cell<u64>,
     navigation_failure: RefCell<Option<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
@@ -399,6 +400,7 @@ impl Delegate {
             last_responses: RefCell::new(Vec::new()),
             dropped_responses: Cell::new(0),
             current_main_frame_request: RefCell::new(None),
+            main_frame_navigation_epoch: Cell::new(0),
             navigation_failure: RefCell::new(None),
             opener_id: RefCell::new(None),
             rendering_context,
@@ -442,6 +444,7 @@ impl Delegate {
                 "url": url,
                 "errorText": error_text,
                 "kind": kind,
+                "navigationEpoch": self.main_frame_navigation_epoch.get(),
             })));
             self.wake.wake();
         }
@@ -467,6 +470,28 @@ impl Delegate {
 }
 
 impl WebViewDelegate for Delegate {
+    fn request_navigation(&self, _webview: WebView, navigation: NavigationRequest) {
+        if let UrlDecision::Deny { reason } =
+            decide_url(self.profile.get(), navigation.url.as_str())
+        {
+            let epoch = self.main_frame_navigation_epoch.get().wrapping_add(1);
+            self.main_frame_navigation_epoch.set(epoch);
+            let request_id = format!("navigation:{epoch}");
+            self.current_main_frame_request
+                .replace(Some(request_id.clone()));
+            self.navigation_failure.replace(None);
+            self.record_main_frame_failure(
+                &request_id,
+                navigation.url.as_str(),
+                reason,
+                "policy_denied",
+            );
+            navigation.deny();
+            return;
+        }
+        navigation.allow();
+    }
+
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
         if status == LoadStatus::HeadParsed {
             self.document_generation
@@ -630,6 +655,10 @@ impl WebViewDelegate for Delegate {
         };
         let mut requests = self.requests.borrow_mut();
         if load.request.is_for_main_frame {
+            if !load.request.is_redirect {
+                self.main_frame_navigation_epoch
+                    .set(self.main_frame_navigation_epoch.get().wrapping_add(1));
+            }
             self.current_main_frame_request
                 .replace(Some(request_id.clone()));
             self.navigation_failure.replace(None);
@@ -2431,8 +2460,9 @@ impl ContentEngine {
             }
             "locator.click" => {
                 let resolved = self.resolve_actionable(&params)?;
-                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
-                Ok(json!({ "dispatch": dispatch }))
+                let (dispatch, navigation_epoch) =
+                    self.dispatch_locator_click(&params, &resolved)?;
+                Ok(json!({ "dispatch": dispatch, "navigation_epoch": navigation_epoch }))
             }
             "locator.tap" => {
                 let resolved = self.resolve_actionable(&params)?;
@@ -2714,6 +2744,24 @@ impl ContentEngine {
                     other => Err(io::Error::other(format!("content returned {other:?}"))),
                 }
             }
+            "page.take_navigation_failure" => {
+                let page_id = required_str(&params, "page")?;
+                let expected_epoch = params
+                    .get("navigation_epoch")
+                    .and_then(serde_json::Value::as_u64);
+                let (_, delegate) = self.page(&page_id)?.clone();
+                let matches_action = delegate
+                    .navigation_failure
+                    .borrow()
+                    .as_ref()
+                    .and_then(|failure| failure.get("navigationEpoch"))
+                    .and_then(serde_json::Value::as_u64)
+                    == expected_epoch;
+                let failure = matches_action
+                    .then(|| delegate.navigation_failure.borrow_mut().take())
+                    .flatten();
+                Ok(json!({ "failure": failure }))
+            }
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
                 let snapshot = params.get("snapshot").and_then(|value| value.as_str());
@@ -2883,14 +2931,15 @@ impl ContentEngine {
                 // assignment. Reuse the same acknowledged native click path
                 // as `locator.click` so click/input/change and framework
                 // handlers all observe one real transition (Fund 033).
-                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
+                let (dispatch, navigation_epoch) =
+                    self.dispatch_locator_click(&params, &resolved)?;
                 let actual = self.locator_checked_state(&params)?;
                 if actual != checked {
                     return Err(io::Error::other(format!(
                         "checkbox activation did not produce the requested state: expected checked={checked}, observed checked={actual}"
                     )));
                 }
-                Ok(json!({ "dispatch": dispatch }))
+                Ok(json!({ "dispatch": dispatch, "navigation_epoch": navigation_epoch }))
             }
             "locator.selectOption" => {
                 let _ = self.resolve_actionable(&params)?;
@@ -3947,11 +3996,11 @@ impl ContentEngine {
         &mut self,
         params: &serde_json::Value,
         resolved: &ResolvedNode,
-    ) -> io::Result<String> {
+    ) -> io::Result<(String, Option<u64>)> {
         let page_id = required_str(params, "page")?;
         let (webview, delegate) = self.page(&page_id)?.clone();
         let action_started = Instant::now();
-        let main_frame_request_before = delegate.current_main_frame_request.borrow().clone();
+        let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
         let document_generation_before = delegate.document_generation.get();
         let probe = format!(
             "{}-{}",
@@ -3989,11 +4038,10 @@ impl ContentEngine {
             Err(_) => "document-changed".to_owned(),
             Ok(_) => "unknown".to_owned(),
         };
-        let main_frame_request_after = delegate.current_main_frame_request.borrow().clone();
-        if let Some(expected_chain) = started_request_chain(
-            main_frame_request_before.as_deref(),
-            main_frame_request_after.as_deref(),
-        ).map(str::to_owned) {
+        let navigation_epoch_after = delegate.main_frame_navigation_epoch.get();
+        let navigation_epoch =
+            (navigation_epoch_after != navigation_epoch_before).then_some(navigation_epoch_after);
+        if let Some(expected_epoch) = navigation_epoch {
             let remaining = call_timeout(params).saturating_sub(action_started.elapsed());
             if !self.spin_until_loaded_until(
                 &webview,
@@ -4001,12 +4049,11 @@ impl ContentEngine {
                 WaitUntil::Load,
                 || {
                     let failure = delegate.navigation_failure.borrow();
-                    navigation_failure_belongs_to_chain(failure.as_ref(), Some(&expected_chain))
+                    navigation_failure_belongs_to_epoch(failure.as_ref(), expected_epoch)
                 },
                 || {
                     delegate.document_generation.get() != document_generation_before
-                        && delegate.current_main_frame_request.borrow().as_deref()
-                            .is_some_and(|request_id| request_belongs_to_chain(request_id, Some(&expected_chain)))
+                        && delegate.main_frame_navigation_epoch.get() == expected_epoch
                 },
             )? {
                 return Err(io::Error::new(
@@ -4022,7 +4069,7 @@ impl ContentEngine {
         {
             let _ = self.assign_pending_files(&page_id, selector);
         }
-        Ok(dispatch)
+        Ok((dispatch, navigation_epoch))
     }
 
     fn locator_checked_state(&self, params: &serde_json::Value) -> io::Result<bool> {
@@ -4637,29 +4684,14 @@ fn urls_match(current: &Url, expected: &Url) -> bool {
         && current.path().trim_end_matches('/') == expected.path().trim_end_matches('/')
 }
 
-fn request_chain_id(request_id: &str) -> Option<&str> {
-    request_id.split_once(':').map(|(fetch_id, _)| fetch_id)
-}
-
-fn request_belongs_to_chain(request_id: &str, expected_chain: Option<&str>) -> bool {
-    expected_chain.is_some_and(|expected| request_chain_id(request_id) == Some(expected))
-}
-
-fn started_request_chain<'a>(before: Option<&str>, after: Option<&'a str>) -> Option<&'a str> {
-    if after == before {
-        return None;
-    }
-    after.and_then(request_chain_id)
-}
-
-fn navigation_failure_belongs_to_chain(
+fn navigation_failure_belongs_to_epoch(
     failure: Option<&serde_json::Value>,
-    expected_chain: Option<&str>,
+    expected_epoch: u64,
 ) -> bool {
     failure
-        .and_then(|value| value.get("requestId"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|request_id| request_belongs_to_chain(request_id, expected_chain))
+        .and_then(|value| value.get("navigationEpoch"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(expected_epoch)
 }
 
 fn response_for_request<'a>(
@@ -4806,41 +4838,18 @@ mod serialize_tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
-    fn click_navigation_identity_follows_redirects_without_crossing_fetches() {
-        assert_eq!(request_chain_id("fetch-a:0"), Some("fetch-a"));
-        assert!(request_belongs_to_chain("fetch-a:1", Some("fetch-a")));
-        assert!(request_belongs_to_chain("fetch-a:7", Some("fetch-a")));
-        assert!(!request_belongs_to_chain("fetch-b:0", Some("fetch-a")));
-        assert!(!request_belongs_to_chain("malformed", Some("fetch-a")));
-        assert!(!request_belongs_to_chain("fetch-a:1", None));
-
-        // Same-URL reloads are still a new navigation because request
-        // identity, rather than URL text, changes.
-        assert_eq!(
-            started_request_chain(Some("fetch-old:0"), Some("fetch-reload:0")),
-            Some("fetch-reload")
-        );
-        // A JavaScript-delayed navigation that has not started when the click
-        // returns does not consume the click's finite deadline speculatively;
-        // its later native request/failure remains available to observation.
-        assert_eq!(
-            started_request_chain(Some("fetch-old:0"), Some("fetch-old:0")),
-            None
-        );
-
+    fn click_navigation_epoch_survives_redirect_request_id_changes() {
         let aborted = json!({
-            "requestId": "fetch-a:2",
+            "requestId": "different-fetch-uuid:2",
+            "navigationEpoch": 7,
             "url": "http://example.test/end",
             "errorText": "net::ERR_FAILED",
         });
         assert!(
-            navigation_failure_belongs_to_chain(Some(&aborted), Some("fetch-a")),
+            navigation_failure_belongs_to_epoch(Some(&aborted), 7),
             "terminal failure must settle an aborted navigation without a document commit"
         );
-        assert!(!navigation_failure_belongs_to_chain(
-            Some(&aborted),
-            Some("fetch-b")
-        ));
+        assert!(!navigation_failure_belongs_to_epoch(Some(&aborted), 6));
     }
 
     #[test]
