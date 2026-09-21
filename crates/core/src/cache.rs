@@ -2232,60 +2232,64 @@ mod tests {
             }
         }
         let base = tempdir("reaper-child");
-        let staging = base.join("greppy-base-build-child");
-        fs::create_dir_all(staging.join("data")).unwrap();
-        let parent = create_base_build_staging_lease(&staging).unwrap();
-        let ready = staging.join("data/ready");
-        let mut child = ChildGuard(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "cache::tests::staging_lease_subprocess_holder",
-                    "--ignored",
-                    "--test-threads=1",
-                ])
-                .env(
-                    ENV_BASE_BUILD_STAGING_LEASES,
-                    std::env::join_paths([&staging]).unwrap(),
-                )
-                .env("GREPPY_TEST_STAGING_LEASE_READY", &ready)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let until = std::time::Instant::now() + Duration::from_secs(10);
-        while !ready.exists() {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "lease child exited before ready"
+        for prefix in BASE_BUILD_STAGING_PREFIXES {
+            let staging = base.join(format!("{prefix}child"));
+            fs::create_dir_all(staging.join("data")).unwrap();
+            let parent = create_base_build_staging_lease(&staging).unwrap();
+            let ready = staging.join("data/ready");
+            let mut child = ChildGuard(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cache::tests::staging_lease_subprocess_holder",
+                        "--ignored",
+                        "--test-threads=1",
+                    ])
+                    .env(
+                        ENV_BASE_BUILD_STAGING_LEASES,
+                        std::env::join_paths([&staging]).unwrap(),
+                    )
+                    .env("GREPPY_TEST_STAGING_LEASE_READY", &ready)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "lease child exited before ready for {prefix}"
+                );
+                assert!(
+                    std::time::Instant::now() < until,
+                    "lease child readiness timed out for {prefix}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(parent);
+            set_directory_modified(
+                &staging,
+                SystemTime::now() - Duration::from_secs(7 * 60 * 60),
+            );
+            assert_eq!(
+                reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap(),
+                0,
+                "child lease must protect {prefix} staging"
             );
             assert!(
-                std::time::Instant::now() < until,
-                "lease child readiness timed out"
+                staging.is_dir(),
+                "child lifetime is independent of the parent lease for {prefix}"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            drop(child.0.stdin.take());
+            assert!(child.0.wait().unwrap().success());
+            assert_eq!(
+                reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap(),
+                1,
+                "reaper must reclaim released {prefix} staging"
+            );
+            assert!(!staging.exists());
         }
-        drop(parent);
-        set_directory_modified(
-            &staging,
-            SystemTime::now() - Duration::from_secs(7 * 60 * 60),
-        );
-        assert_eq!(
-            reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap(),
-            0
-        );
-        assert!(
-            staging.is_dir(),
-            "child lifetime is independent of the parent lease"
-        );
-        drop(child.0.stdin.take());
-        assert!(child.0.wait().unwrap().success());
-        assert_eq!(
-            reap_stale_base_build_dirs(&base, BASE_BUILD_STAGING_TTL).unwrap(),
-            1
-        );
-        assert!(!staging.exists());
         let _ = fs::remove_dir_all(base);
     }
 

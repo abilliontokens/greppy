@@ -1946,9 +1946,9 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let scratch_parent = tempfile::tempdir().unwrap();
         let missing = scratch_parent.path().join("missing-scratch");
-        let _restore = TmpdirRestore::set(&missing);
         let repo = fixture();
         let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let _restore = TmpdirRestore::set(&missing);
 
         let error = match TemporaryBaseWorktree::create(repo.path(), &commit) {
             Ok(_) => panic!("missing TMPDIR unexpectedly accepted"),
