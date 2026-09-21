@@ -53,6 +53,9 @@ mod trace_tests {
         assert!(captured.push(&[0], "c.zip".into()).is_err());
         assert_eq!(captured.encoded_bytes, MAX_CAPTURED_TRACE_BYTES);
         assert_eq!(captured.entries.len(), 2);
+        captured.reset();
+        assert_eq!(captured.encoded_bytes, 0);
+        assert!(captured.entries.is_empty());
     }
 }
 
@@ -68,6 +71,10 @@ struct CapturedTraceArchive { encoded: String, requested_path: String }
 const MAX_CAPTURED_TRACE_BYTES: usize = 8 * 1024 * 1024;
 
 impl CapturedTraceArchives {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     fn push(&mut self, archive: &[u8], requested_path: String) -> Result<(), JsErrorBox> {
         let encoded_len = archive.len().saturating_add(2) / 3 * 4;
         if self.encoded_bytes.saturating_add(encoded_len) > MAX_CAPTURED_TRACE_BYTES {
@@ -510,12 +517,12 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     .script_stdout
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .clone_from(&CapturedTraceArchives::default());
+                    .clear();
                 bridge
                     .trace_archives
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .clear();
+                    .reset();
                 let result = run_script(
                     &tokio_runtime,
                     &mut runtime,
@@ -539,7 +546,16 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                         .trace_archives
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()),
-                ).entries.into_iter().map(|entry| serde_json::json!({"encoded":entry.encoded,"requested_path":entry.requested_path})).collect::<Vec<_>>();
+                )
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "encoded": entry.encoded,
+                        "requested_path": entry.requested_path,
+                    })
+                })
+                .collect::<Vec<_>>();
                 let payload = serde_json::json!({ "stdout": captured, "trace_archives": trace_archives });
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
                 match result {
