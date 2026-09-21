@@ -41,7 +41,7 @@ pub enum DiagnoseCommand {
     },
     /// Record a Playwright trace.
     ///
-    /// The resulting action archive uses Playwright trace schema v10.
+    /// The resulting action archive uses Playwright trace schema v8.
     /// Snapshot and screenshot capture are not yet supported.
     Trace {
         #[command(subcommand)]

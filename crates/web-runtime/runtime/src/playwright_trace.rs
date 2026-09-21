@@ -1,13 +1,14 @@
 //! Minimal Playwright trace archive writer.
 //!
-//! The wire format follows Playwright trace schema version 10 as emitted by
-//! Playwright `07f1a6154795f055f341b8972086533e8e48b36f`,
-//! `packages/playwright-core/src/server/trace/recorder/tracing.ts`.
+//! The wire format follows the action subset of Playwright trace schema version
+//! 8 as read and emitted by `playwright-core@1.56.1` in
+//! `src/server/trace/recorder/{tracing.ts,traceModel.ts}`.
 
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-pub const TRACE_SCHEMA_VERSION: u32 = 10;
+pub const TRACE_SCHEMA_VERSION: u32 = 8;
 const MAX_RECORDING_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -33,7 +34,7 @@ impl TraceRecorder {
             "options": {},
             "platform": std::env::consts::OS,
             "wallTime": wall_time_ms(),
-            "monotonicTime": 0,
+            "monotonicTime": trace_time_ms(),
             "sdkLanguage": "javascript"
         }))?;
         Ok(recorder)
@@ -84,7 +85,8 @@ fn wall_time_ms() -> u64 {
         .as_millis() as u64
 }
 pub fn trace_time_ms() -> u64 {
-    wall_time_ms()
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -150,12 +152,13 @@ pub fn archive_jsonl(trace: &[u8], network: &[u8]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     #[test]
-    fn archive_has_v10_entries_without_sensitive_action_data() {
+    fn archive_has_v8_entries_without_sensitive_action_data() {
         let mut r = TraceRecorder::new().unwrap();
         r.record("page.goto", trace_time_ms(), false).unwrap();
         let z = r.finish();
         assert!(z.windows(11).any(|w| w == b"trace.trace"));
         assert!(z.windows(13).any(|w| w == b"trace.network"));
+        assert!(z.windows(11).any(|w| w == b"\"version\":8"));
         assert!(!z.windows(13).any(|w| w == b"authorization"));
     }
 
