@@ -53,24 +53,6 @@ fn run_with_env(
     )
 }
 
-#[cfg(feature = "ci-test-assets")]
-fn run_with_real_inference(
-    repo: &Path,
-    store: &Path,
-    args: &[&str],
-    extra_env: &[(&str, &str)],
-) -> (i32, String, String) {
-    let output = configured_command(repo, store, args, None, extra_env)
-        .env_remove("GREPPY_TEST_SKIP_INFERENCE")
-        .output()
-        .expect("spawn greppy with CI inference assets");
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
-}
-
 fn configured_command(
     repo: &Path,
     store: &Path,
@@ -591,7 +573,9 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         .expect("third workspace state")
         .graph_generation;
     drop(third_graph);
-    #[cfg(not(feature = "ci-test-assets"))]
+    // This fixture verifies Base lifecycle, composite visibility, and graph
+    // generation preservation. Real vector creation is covered by the native
+    // inference acceptance suite; test assets intentionally skip inference.
     let (embed_code, embed_out, embed_err) = run_with_env(
         &third,
         &store,
@@ -602,13 +586,6 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
             ("GREPPY_TEST_FORCE_EMBED_COMPLETION", "1"),
             ("GREPPY_TEST_FORBID_TEMP_BASE_CHECKOUT", "1"),
         ],
-    );
-    #[cfg(feature = "ci-test-assets")]
-    let (embed_code, embed_out, embed_err) = run_with_real_inference(
-        &third,
-        &store,
-        &["index", "."],
-        &[("GREPPY_BACKGROUND_KIND", "embedding")],
     );
     assert_eq!(embed_code, 0, "stdout={embed_out}\nstderr={embed_err}");
     let embedded_delta = greppy_store::Store::open(&third_delta).unwrap();
@@ -635,21 +612,6 @@ fn linked_git_worktrees_share_one_primary_base_and_persist_private_deltas() {
         None,
     )
     .contains("dirty_three_symbol"));
-    #[cfg(feature = "ci-test-assets")]
-    {
-        let embedded_status = query_json_raw(&third, &store, &["index", "status"], None);
-        assert_eq!(
-            embedded_status["embedding_complete"], true,
-            "{embedded_status:#}"
-        );
-        assert!(
-            embedded_status["current_embedding_rows"]
-                .as_u64()
-                .is_some_and(|rows| rows > 0),
-            "dirty Delta must contain real vectors: {embedded_status:#}"
-        );
-    }
-
     // The first process's environment is gone. A fresh query still composes
     // its Base+Delta from the binding persisted in its private graph.
     assert!(query_text(
