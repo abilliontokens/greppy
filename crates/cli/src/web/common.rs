@@ -1811,7 +1811,9 @@ mod scope_tests {
             .prefix("screenshot-output-test-")
             .tempdir_in(&parent)
             .unwrap();
-        let dest = output.path().join("saved.png");
+        // macOS temp roots may include /var -> /private/var. This success
+        // fixture needs a canonical destination; symlink rejection is separate.
+        let dest = output.path().canonicalize().unwrap().join("saved.png");
         let request = Request::new(run_id, "web.screenshot", json!({}));
         let mut response = Response::ok(
             &request,
