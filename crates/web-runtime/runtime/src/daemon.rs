@@ -4071,10 +4071,11 @@ impl Daemon {
                 request, session_id, &bytes, "application/zip", "web.run.trace", true,
             )?;
             let digest = manifest.digest.hex;
-            if let Some(path) = archive.get("requested_path").and_then(|value| value.as_str()).filter(|path| !path.is_empty()) {
+            let requested_path = archive.get("requested_path").and_then(|value| value.as_str()).filter(|path| !path.is_empty());
+            if let Some(path) = requested_path {
                 exports.push(json!({"id":digest.clone(),"path":path}));
             }
-            artifacts.push(json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true}));
+            artifacts.push(json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true,"requested_path":requested_path}));
         }
         Ok((artifacts, exports))
     }

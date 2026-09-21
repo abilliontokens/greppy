@@ -7833,11 +7833,14 @@ await browser.close();"#;
     let failing = r#"import { chromium } from "playwright";
 const browser = await chromium.launch(); const context = await browser.newContext();
 const page = await context.newPage(); await context.tracing.start(); await page.title();
+await context.tracing.stop({ path: "failed-trace.zip" });
+await context.tracing.start(); await page.title();
 throw new Error("intentional trace fixture failure");"#;
     let failed = unix_request(&socket, &Request::new("run_trace", "web.run", json!({"session_id":session_id,"script_text":failing})), Duration::from_secs(40)).unwrap();
     assert_eq!(failed.status, "error", "{failed:?}");
     assert_eq!(failed.error.as_ref().unwrap().code, "controller_exception");
-    assert_eq!(failed.artifacts.len(), 1, "active trace must survive script failure: {failed:?}");
+    assert_eq!(failed.artifacts.len(), 2, "stopped and active traces must survive script failure: {failed:?}");
+    assert!(failed.artifacts.iter().any(|artifact| artifact["requested_path"] == "failed-trace.zip"));
 }
 
 #[test]

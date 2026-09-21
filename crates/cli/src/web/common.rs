@@ -396,11 +396,17 @@ pub(super) fn run(
     );
     match rpc_response(root, "web.run", payload, Some(session.clone())) {
         Err(error) => emit_error(json, error),
-        Ok(response) => {
-            if response.status == "ok" {
-                if let Err(error) = export_trace_artifacts(root, &session, &response) {
+        Ok(mut response) => {
+            if let Err(error) = export_trace_artifacts(root, &session, &response) {
+                if response.status == "ok" {
                     return emit_error(json, error);
                 }
+                response.artifacts.push(json!({
+                    "kind": "trace_export_error",
+                    "code": error.code,
+                    "message": error.message,
+                    "requested_exports_preserved": true,
+                }));
             }
             emit_response(json, response)
         }
@@ -412,15 +418,30 @@ fn export_trace_artifacts(
     session: &str,
     response: &Response,
 ) -> std::result::Result<(), ErrorObject> {
-    let Some(exports) = response
+    let mut exports = response
         .result
         .as_ref()
         .and_then(|value| value.get("trace_exports"))
         .and_then(|value| value.as_array())
-    else {
-        return Ok(());
-    };
-    for export in exports {
+        .cloned()
+        .unwrap_or_default();
+    for artifact in &response.artifacts {
+        if let (Some(id), Some(path)) = (
+            artifact.get("id").and_then(|value| value.as_str()),
+            artifact
+                .get("requested_path")
+                .and_then(|value| value.as_str()),
+        ) {
+            if !path.is_empty()
+                && !exports
+                    .iter()
+                    .any(|export| export.get("id").and_then(|value| value.as_str()) == Some(id))
+            {
+                exports.push(json!({"id":id,"path":path}));
+            }
+        }
+    }
+    for export in &exports {
         let id = export
             .get("id")
             .and_then(|value| value.as_str())
