@@ -128,50 +128,6 @@ pub(crate) fn search_graph_counts_json(
     Ok(())
 }
 
-pub(crate) fn semantic_embedding_indexing_json(
-    project: &str,
-    cfg: &EmbeddingModelConfig,
-    graph_generation: u64,
-    freshness: &serde_json::Value,
-    progress: &serde_json::Value,
-    fallback: SemanticFallbackContext<'_>,
-) -> Result<()> {
-    let eta_seconds = progress
-        .get("eta_seconds")
-        .and_then(serde_json::Value::as_u64);
-    let retry_after_seconds = eta_seconds.map(|eta| eta.clamp(5, 30)).unwrap_or(10);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
-            "command": "search",
-            "mode": "vector",
-            "status": "indexing",
-            "project": project,
-            "model_id": cfg.model_id,
-            "prompt_version": greppy_embed_native::PROMPT_VERSION,
-            "task_profile": greppy_embed_native::CODE_RETRIEVAL_PROFILE,
-            "graph_generation": graph_generation,
-            "fresh": freshness_json_is_fresh(freshness),
-            "freshness": freshness,
-            "retryable": true,
-            "retry_after_seconds": retry_after_seconds,
-            "exit_code": EXIT_TEMPFAIL,
-            "retry_when": "greppy index status --json reports embedding_complete=true",
-            "embedding_index": progress,
-            "query_tokens": semantic_fallback_tokens(fallback.query),
-            "next": semantic_fallback_commands(fallback.query, fallback.paths, fallback.root),
-            "total_exact": 0,
-            "shown": 0,
-            "omitted": 0,
-            "truncated": false,
-            "hits": [],
-        }))
-        .map_err(|error| Error::Invalid(format!("serialize semantic indexing JSON: {error}")))?
-    );
-    Ok(())
-}
-
 fn search_all_nodes(store: &greppy_store::Store, project: &str) -> Result<Vec<greppy_store::Node>> {
     const PAGE: usize = 4096;
     let mut nodes = Vec::new();
@@ -1413,29 +1369,10 @@ pub(crate) fn dispatch_semantic(
         }
         if !embedding_generation_complete(&store, &project, generation, &cfg.model_id) {
             let root_path = resolve_root(root)?;
-            let _ = spawn_background_embed(root, &cfg);
-            let progress = embedding_progress_value(&root_path, &cfg, generation);
-            if json {
-                semantic_embedding_indexing_json(
-                    &project,
-                    &cfg,
-                    generation,
-                    &freshness,
-                    &progress,
-                    SemanticFallbackContext {
-                        query: q,
-                        paths,
-                        root,
-                    },
-                )?;
-            } else {
-                println!(
-                    "semantic search temporarily unavailable — {}; retry this command after `greppy index status --json` reports `embedding_complete: true` (temporary failure, exit {EXIT_TEMPFAIL})",
-                    embedding_progress_text(&progress)
-                );
-            }
-            return Ok(EXIT_TEMPFAIL as i32);
+            drop(store);
+            store = wait_for_embedding_publication(root, &root_path, &project, generation, &cfg)?;
         }
+        let generation = current_graph_generation(&store, root)?;
         let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
             &project,
             &cfg.model_id,
@@ -1556,6 +1493,90 @@ pub(crate) fn dispatch_semantic(
             Err(e) => Err(e),
         }
     }
+}
+
+fn wait_for_embedding_publication(
+    root: Option<&str>,
+    effective_root: &std::path::Path,
+    project: &str,
+    requested_generation: u64,
+    cfg: &EmbeddingModelConfig,
+) -> Result<greppy_store::Store> {
+    let mut announced = false;
+    loop {
+        let mut launch = spawn_background_embed_handle(root, cfg).ok_or_else(|| {
+            let detail = background_embedding_failure(embedding_progress_value(
+                effective_root,
+                cfg,
+                requested_generation,
+            ))
+            .unwrap_or_else(|| "the embedding process could not be started".into());
+            Error::Index(format!(
+                "semantic embedding failed for {}: {detail}",
+                effective_root.display()
+            ))
+        })?;
+        let initial_job = read_background_job(launch.path());
+        let attached_to_index = initial_job.as_ref().is_some_and(|job| {
+            job.get("kind").and_then(serde_json::Value::as_str) == Some("index")
+        });
+        if !announced {
+            let progress = initial_job.unwrap_or_else(|| {
+                embedding_progress_value(effective_root, cfg, requested_generation)
+            });
+            eprintln!("semantic-search: {}", embedding_progress_text(&progress));
+            announced = true;
+        }
+        loop {
+            let owner_active = launch.owner_is_active().map_err(|error| {
+                Error::io(
+                    format!(
+                        "observe semantic embedding owner for {}",
+                        effective_root.display()
+                    ),
+                    error,
+                )
+            })?;
+            if !owner_active {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if let BackgroundJobLaunch::Owned { child, .. } = &mut launch {
+            let _ = child.wait();
+        }
+        if let Some(detail) =
+            read_background_job(launch.path()).and_then(background_embedding_failure)
+        {
+            return Err(Error::Index(format!(
+                "semantic embedding failed for {}: {detail}",
+                effective_root.display()
+            )));
+        }
+        let store = open_default_store_query_writer(root)?;
+        let published_generation = current_graph_generation(&store, root)?;
+        if embedding_generation_complete(&store, project, published_generation, &cfg.model_id) {
+            return Ok(store);
+        }
+        if attached_to_index {
+            drop(store);
+            continue;
+        }
+        return Err(Error::Index(format!(
+            "semantic embedding for {} exited without publishing generation {requested_generation} for model {}",
+            effective_root.display(),
+            cfg.model_id
+        )));
+    }
+}
+
+pub(crate) fn background_embedding_failure(job: serde_json::Value) -> Option<String> {
+    (job.get("state").and_then(serde_json::Value::as_str) == Some("failed")).then(|| {
+        job.get("last_error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("background embedding failed without a recorded cause")
+            .to_string()
+    })
 }
 
 pub(crate) fn semantic_vector_purposes(

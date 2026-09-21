@@ -4914,6 +4914,13 @@ fn spawn_background_embed(root: Option<&str>, cfg: &EmbeddingModelConfig) -> boo
     spawn_background_job(root, "embedding-first-use", "embedding", Some(cfg))
 }
 
+pub(crate) fn spawn_background_embed_handle(
+    root: Option<&str>,
+    cfg: &EmbeddingModelConfig,
+) -> Option<BackgroundJobLaunch> {
+    spawn_background_job_handle(root, "embedding-first-use", "embedding", Some(cfg))
+}
+
 fn format_embedding_eta(seconds: u64) -> String {
     let minutes = seconds / 60;
     let remainder = seconds % 60;
@@ -4924,13 +4931,6 @@ fn format_embedding_eta(seconds: u64) -> String {
     } else {
         format!("{minutes}m {remainder}s")
     }
-}
-
-#[derive(Clone, Copy)]
-struct SemanticFallbackContext<'a> {
-    query: &'a str,
-    paths: &'a [String],
-    root: Option<&'a str>,
 }
 
 /// `--code` and `--json` compose: AGENTS.md gives `--code` as "also print each

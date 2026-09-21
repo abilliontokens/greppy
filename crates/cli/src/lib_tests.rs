@@ -239,6 +239,25 @@ fn embedding_progress_message_names_backend_counts_and_eta() {
 }
 
 #[test]
+fn semantic_embedding_wait_propagates_recorded_failure() {
+    let failure = serde_json::json!({
+        "kind": "embedding",
+        "state": "failed",
+        "last_error": "GPU inference stopped",
+    });
+    assert_eq!(
+        background_embedding_failure(failure).as_deref(),
+        Some("GPU inference stopped")
+    );
+    assert!(background_embedding_failure(serde_json::json!({
+        "kind": "embedding",
+        "state": "embedding",
+        "last_error": null,
+    }))
+    .is_none());
+}
+
+#[test]
 fn semantic_fallback_commands_use_query_tokens() {
     let commands = semantic_fallback_commands("find semantic progress marker", &[], None);
     assert_eq!(commands[0], "greppy search-symbol marker");
