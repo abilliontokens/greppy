@@ -477,6 +477,12 @@ impl Delegate {
 
 impl WebViewDelegate for Delegate {
     fn request_navigation(&self, _webview: WebView, navigation: NavigationRequest) {
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=intent main_frame={} url={}",
+                navigation.is_for_main_frame, navigation.url
+            );
+        }
         if !navigation.is_for_main_frame {
             match decide_url(self.profile.get(), navigation.url.as_str()) {
                 UrlDecision::Allow => navigation.allow(),
@@ -505,6 +511,12 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=load-status status={status:?} epoch={}",
+                self.main_frame_navigation_epoch.get()
+            );
+        }
         if status == LoadStatus::HeadParsed {
             self.document_generation
                 .set(self.document_generation.get().wrapping_add(1));
@@ -678,6 +690,13 @@ impl WebViewDelegate for Delegate {
             self.current_main_frame_request
                 .replace(Some(request_id.clone()));
             self.navigation_failure.replace(None);
+            if NavTrace::enabled() {
+                eprintln!(
+                    "web-runtime: nav-event phase=request request_id={request_id} redirect={} promoted={promoted} epoch={} url={url}",
+                    load.request.is_redirect,
+                    self.main_frame_navigation_epoch.get()
+                );
+            }
         }
         requests.push(json!({
             "requestId": request_id,
@@ -817,6 +836,14 @@ impl WebViewDelegate for Delegate {
         response: WebResourceResponseCompleted,
     ) {
         let request_id = format!("{}:{}", response.id.fetch_id, response.id.redirect_count);
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=response-completed request_id={request_id} failure={:?} epoch={} url={}",
+                response.failure,
+                self.main_frame_navigation_epoch.get(),
+                response.url
+            );
+        }
         let headers: serde_json::Map<String, serde_json::Value> = response
             .headers
             .iter()
@@ -1217,6 +1244,7 @@ impl ContentEngine {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                trace.timeout(webview);
                 return Ok(false);
             }
             match poll_wake_step(
@@ -1227,6 +1255,7 @@ impl ContentEngine {
                 WakePoll::Ready => return Ok(true),
                 WakePoll::TimedOut => {
                     if Instant::now() >= deadline {
+                        trace.timeout(webview);
                         return Ok(false);
                     }
                 }
@@ -4547,6 +4576,16 @@ impl NavTrace {
             started.elapsed().as_millis(),
             webview.url().map(|u| u.to_string()),
         );
+        }
+    }
+
+    fn timeout(&self, webview: &WebView) {
+        if self.started.is_some() {
+            eprintln!(
+                "web-runtime: nav-event phase=wait-timeout load_status={:?} url={:?}",
+                webview.load_status(),
+                webview.url().map(|url| url.to_string())
+            );
         }
     }
 }
