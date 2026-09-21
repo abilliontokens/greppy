@@ -3322,7 +3322,7 @@ fn query_wait_for_active_refresh_is_bounded_and_actionable() {
 }
 
 #[test]
-fn read_queries_refuse_lifecycle_contention_without_silent_wait() {
+fn read_queries_serve_published_snapshot_during_lifecycle_contention_without_silent_wait() {
     let (repo, store, _scratch) = make_repo("query-lifecycle", "lifecycle_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "fixture index failed: {out}\n{err}");
@@ -3351,18 +3351,18 @@ fn read_queries_refuse_lifecycle_contention_without_silent_wait() {
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("{command} blocked on a lifecycle lease instead of refusing it");
+                panic!("{command} blocked on a lifecycle lease instead of serving the published snapshot");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status.code(), Some(75), "{output:?}");
-        let diagnostic = format!(
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let response = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(diagnostic.contains("retry this query"), "{diagnostic}");
+        assert!(response.contains("lifecycle_marker"), "{response}");
     }
     drop(lease);
     let (code, out, err) = run(&["search-symbol", "lifecycle_marker"], &repo, &store);
