@@ -7808,6 +7808,16 @@ fn fail_closed_clock_coverage_request_and_handles() {
 
 #[test]
 fn playwright_trace_is_context_isolated_and_daemon_stored() {
+    fn trace_entry(bytes: &[u8]) -> &str {
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
+        let u16_at = |offset| u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+        assert_eq!(u16_at(8), 0, "expected stored ZIP entry");
+        let size = u32::from_le_bytes(bytes[18..22].try_into().unwrap()) as usize;
+        let name_len = u16_at(26);
+        assert_eq!(&bytes[30..30 + name_len], b"trace.trace");
+        let start = 30 + name_len + u16_at(28);
+        std::str::from_utf8(&bytes[start..start + size]).unwrap()
+    }
     let socket = std::env::temp_dir().join(format!("greppy-web-trace-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     let _guard = Supervisor::spawn(&socket, "run_trace", |_| {});
@@ -7826,15 +7836,14 @@ await browser.close();"#;
     let id = response.artifacts[0]["id"].as_str().unwrap();
     let path = unix_request(&socket, &Request::new("run_trace", "web.artifact.path", json!({"session_id":session_id,"id":id})), Duration::from_secs(10)).unwrap();
     let bytes = std::fs::read(path.result.unwrap()["path"].as_str().unwrap()).unwrap();
-    let text = String::from_utf8_lossy(&bytes);
+    let text = trace_entry(&bytes);
     assert!(text.contains("page.title"), "{text}");
     assert!(!text.contains("page.content"), "{text}");
     assert!(text.contains("\"version\":8"), "{text}");
     assert!(!text.contains("\"version\":10"), "{text}");
     let events = text
         .lines()
-        .filter_map(|line| line.find('{').map(|start| &line[start..]))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
     let context_time = events
         .iter()
@@ -7900,14 +7909,7 @@ await context.tracing.stop({ path: "recorder-b.zip" }); await browser.close();"#
         std::fs::read(second_path.result.unwrap()["path"].as_str().unwrap()).unwrap();
     // The native writer uses uncompressed ZIP entries; inspect trace.trace,
     // allowing legitimate follow-up operations started by recorder B.
-    assert_eq!(&second_bytes[..4], b"PK\x03\x04");
-    let u16_at = |offset| u16::from_le_bytes(second_bytes[offset..offset + 2].try_into().unwrap()) as usize;
-    let size = u32::from_le_bytes(second_bytes[18..22].try_into().unwrap()) as usize;
-    assert_eq!(u16_at(8), 0, "expected stored ZIP entry");
-    let name_len = u16_at(26);
-    assert_eq!(&second_bytes[30..30 + name_len], b"trace.trace");
-    let start = 30 + name_len + u16_at(28);
-    let trace = std::str::from_utf8(&second_bytes[start..start + size]).unwrap();
+    let trace = trace_entry(&second_bytes);
     let mut pending = std::collections::HashSet::new();
     for line in trace.lines() {
         let event: serde_json::Value = serde_json::from_str(line).unwrap();
