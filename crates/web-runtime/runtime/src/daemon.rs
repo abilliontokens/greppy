@@ -4046,8 +4046,9 @@ impl Daemon {
         let bytes = trace.finish();
         match self.store_bytes(request, &session_id, &bytes, "application/zip", "web.trace.stop", true) {
             Ok(manifest) => {
-                let artifact = json!({"id":manifest.digest.hex,"digest":manifest.digest.hex,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true});
-                let mut response = Response::ok(request, json!({"session_id":session_id,"artifact":artifact,"schema_version":crate::playwright_trace::TRACE_SCHEMA_VERSION}));
+                let digest = manifest.digest.hex;
+                let artifact = json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true});
+                let mut response = Response::ok(request, json!({"session_id":session_id,"artifact":artifact.clone(),"schema_version":crate::playwright_trace::TRACE_SCHEMA_VERSION}));
                 response.artifacts.push(artifact); response
             }
             Err(response) => response,
