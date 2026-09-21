@@ -1200,18 +1200,43 @@ fn parse_nul_worktree_paths(output: &[u8]) -> Result<Vec<Vec<u8>>> {
 }
 
 fn parse_legacy_worktree_paths(output: &[u8]) -> Result<Vec<Vec<u8>>> {
-    output
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(b"worktree "))
-        .map(unquote_git_path)
-        .collect()
+    let path_and_records = output
+        .strip_prefix(b"worktree ")
+        .ok_or_else(|| Error::Invalid("legacy Git worktree list has no primary record".into()))?;
+    for (newline, _) in path_and_records
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'\n')
+    {
+        let metadata = &path_and_records[newline + 1..];
+        if metadata.starts_with(b"bare\n") || legacy_head_record(metadata) {
+            return unquote_git_path(&path_and_records[..newline]).map(|path| vec![path]);
+        }
+    }
+    Err(Error::Invalid(
+        "legacy Git worktree list has no complete primary record".into(),
+    ))
+}
+
+fn legacy_head_record(metadata: &[u8]) -> bool {
+    let Some(after_head) = metadata.strip_prefix(b"HEAD ") else {
+        return false;
+    };
+    let Some(newline) = after_head.iter().position(|byte| *byte == b'\n') else {
+        return false;
+    };
+    let object_id = &after_head[..newline];
+    let state = &after_head[newline + 1..];
+    matches!(object_id.len(), 40 | 64)
+        && object_id.iter().all(u8::is_ascii_hexdigit)
+        && (state.starts_with(b"branch ") || state.starts_with(b"detached\n"))
 }
 
 fn unquote_git_path(path: &[u8]) -> Result<Vec<u8>> {
     if !path.starts_with(b"\"") {
         return Ok(path.to_vec());
     }
-    if !path.ends_with(b"\"") {
+    if path.len() < 2 || !path.ends_with(b"\"") {
         return Err(Error::Invalid(
             "malformed quoted path in git worktree list output".into(),
         ));
@@ -2044,19 +2069,23 @@ mod tests {
             if nul_terminated {
                 Err(Error::Invalid("unknown switch `z'".into()))
             } else {
-                Ok(b"worktree /plain path  \nHEAD deadbeef\n\nworktree \"/quoted\\npath\\040with\\011tab\\\"and\\\\slash\"\nbare\n\n".to_vec())
+                Ok(b"worktree /plain path  \nwith-newline\tand-tab\nHEAD 0123456789abcdef0123456789abcdef01234567\nbranch refs/heads/main\n\nworktree /linked\nHEAD 0123456789abcdef0123456789abcdef01234567\ndetached\n\n".to_vec())
             }
         })
         .unwrap();
 
         assert_eq!(invocations, [true, false]);
-        assert_eq!(
-            paths,
-            [
-                b"/plain path  ".to_vec(),
-                b"/quoted\npath with\ttab\"and\\slash".to_vec()
-            ]
-        );
+        assert_eq!(paths, [b"/plain path  \nwith-newline\tand-tab".to_vec()]);
+    }
+
+    #[test]
+    fn legacy_worktree_path_decodes_c_quoted_variant() {
+        let paths = parse_legacy_worktree_paths(
+            b"worktree \"/quoted\\npath\\040with\\011tab\\\"and\\\\slash\"\nHEAD 0123456789abcdef0123456789abcdef01234567\ndetached\n\n",
+        )
+        .unwrap();
+
+        assert_eq!(paths, [b"/quoted\npath with\ttab\"and\\slash".to_vec()]);
     }
 
     #[test]
@@ -2073,6 +2102,22 @@ mod tests {
 
         assert!(error.contains("unknown switch `z'"), "{error}");
         assert!(error.contains("not a git repository"), "{error}");
+    }
+
+    #[test]
+    fn legacy_worktree_path_rejects_malformed_quotes_and_escapes() {
+        for malformed in [
+            b"\"".as_slice(),
+            b"\"unterminated".as_slice(),
+            b"\"invalid\\q\"".as_slice(),
+        ] {
+            let error = unquote_git_path(malformed).unwrap_err().to_string();
+            assert!(
+                error.contains("malformed quoted path")
+                    || error.contains("invalid escape in git worktree path"),
+                "{malformed:?}: {error}"
+            );
+        }
     }
 
     #[test]
