@@ -30,6 +30,10 @@ const disposedBrowsers = new Set();
 let activeTrace = null;
 const pageContexts = new Map();
 
+function traceTime() {
+  return performance.now();
+}
+
 function traceEvent(value) {
   if (!activeTrace) return;
   const line = JSON.stringify(value) + "\n";
@@ -43,7 +47,7 @@ function traceEvent(value) {
 
 globalThis.__greppyCaptureActiveTrace = () => {
   if (!activeTrace) return;
-  traceEvent({ type: "event", time: Date.now(), class: "Greppy", method: "scriptFailed" });
+  traceEvent({ type: "event", time: traceTime(), class: "Greppy", method: "scriptFailed" });
   const trace = activeTrace.lines.join("");
   activeTrace = null;
   ops.op_capture_trace_archive(trace, "");
@@ -78,18 +82,18 @@ function engineCall(method, params) {
   }
   const belongsToTrace = activeTrace && (payload.context === activeTrace.context || pageContexts.get(payload.page) === activeTrace.context);
   const callId = belongsToTrace ? "call@" + activeTrace.next++ : null;
-  if (callId) traceEvent({ type: "before", callId, startTime: Date.now(), apiName: method, class: "Greppy", method, params: {}, wallTime: Date.now() });
+  if (callId) traceEvent({ type: "before", callId, startTime: traceTime(), apiName: method, class: "Greppy", method, params: {} });
   let result;
   try { result = ops.op_engine_call(method, payload); }
   catch (error) {
-    if (callId) traceEvent({ type: "after", callId, endTime: Date.now(), error: { message: "action failed" } });
+    if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } });
     throw error;
   }
   if (result && typeof result.then === "function") {
     return result.then(
-      (value) => { if (callId) traceEvent({ type: "after", callId, endTime: Date.now(), result: {} }); return value; },
+      (value) => { if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), result: {} }); return value; },
       (error) => {
-        if (callId) traceEvent({ type: "after", callId, endTime: Date.now(), error: { message: "action failed" } });
+        if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } });
         const message = String(error && error.message ? error.message : error);
         if (message.includes("timed out") || message.includes("timeout")) {
           throw new TimeoutError(message);
@@ -2890,7 +2894,7 @@ class BrowserContext {
         for (const key of ["screenshots", "snapshots", "sources"]) if (options[key]) throw new Error(`Tracing.start option ${key} is unsupported`);
         if (activeTrace) throw new Error("a trace is already recording in this controller");
         activeTrace = { context: this._id, lines: [], bytes: 0, next: 1 };
-        traceEvent({ version: 10, type: "context-options", origin: "library", browserName: "greppy", playwrightVersion: "1.52", options: {}, platform: "native", wallTime: Date.now(), monotonicTime: 0, sdkLanguage: "javascript" });
+        traceEvent({ version: 8, type: "context-options", origin: "library", browserName: "greppy", options: {}, platform: "native", wallTime: Date.now(), monotonicTime: traceTime(), sdkLanguage: "javascript" });
       },
       stop: async (options = {}) => {
         for (const key of Object.keys(options)) if (key !== "path") throw new Error(`Tracing.stop option ${key} is unsupported`);

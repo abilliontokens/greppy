@@ -7829,6 +7829,24 @@ await browser.close();"#;
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("page.title"), "{text}");
     assert!(!text.contains("page.content"), "{text}");
+    assert!(text.contains("\"version\":8"), "{text}");
+    assert!(!text.contains("\"version\":10"), "{text}");
+    let events = text
+        .lines()
+        .filter_map(|line| line.find('{').map(|start| &line[start..]))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    let context_time = events
+        .iter()
+        .find(|event| event["type"] == "context-options")["monotonicTime"]
+        .as_f64()
+        .unwrap();
+    let before = events.iter().find(|event| event["type"] == "before").unwrap();
+    let after = events.iter().find(|event| event["type"] == "after").unwrap();
+    let start = before["startTime"].as_f64().unwrap();
+    let end = after["endTime"].as_f64().unwrap();
+    assert!(start >= context_time && start - context_time < 40_000.0, "{events:?}");
+    assert!(end >= start && end - start < 40_000.0, "{events:?}");
 
     let failing = r#"import { chromium } from "playwright";
 const browser = await chromium.launch(); const context = await browser.newContext();

@@ -1,8 +1,10 @@
 //! Minimal Playwright trace archive writer.
 //!
 //! The wire format follows the action subset of Playwright trace schema version
-//! 8 as read and emitted by `playwright-core@1.56.1` in
-//! `src/server/trace/recorder/{tracing.ts,traceModel.ts}`.
+//! 8 from Playwright v1.56.1:
+//! <https://github.com/microsoft/playwright/blob/v1.56.1/packages/trace/src/trace.ts>
+//! and the recorder at
+//! <https://github.com/microsoft/playwright/blob/v1.56.1/packages/playwright-core/src/server/trace/recorder/tracing.ts>.
 
 use serde_json::{json, Value};
 use std::sync::OnceLock;
