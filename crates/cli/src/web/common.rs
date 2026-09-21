@@ -394,7 +394,73 @@ pub(super) fn run(
         timeout,
         mode,
     );
-    rpc(root, json, "web.run", payload, Some(session))
+    match rpc_response(root, "web.run", payload, Some(session.clone())) {
+        Err(error) => emit_error(json, error),
+        Ok(response) => {
+            if response.status == "ok" {
+                if let Err(error) = export_trace_artifacts(root, &session, &response) {
+                    return emit_error(json, error);
+                }
+            }
+            emit_response(json, response)
+        }
+    }
+}
+
+fn export_trace_artifacts(
+    root: Option<&str>,
+    session: &str,
+    response: &Response,
+) -> std::result::Result<(), ErrorObject> {
+    let Some(exports) = response
+        .result
+        .as_ref()
+        .and_then(|value| value.get("trace_exports"))
+        .and_then(|value| value.as_array())
+    else {
+        return Ok(());
+    };
+    for export in exports {
+        let id = export
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let destination = export
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if id.is_empty() || destination.is_empty() {
+            return Err(invalid("trace export metadata was incomplete"));
+        }
+        let artifact = rpc_response(
+            root,
+            "web.artifact.path",
+            json!({"session_id":session,"id":id}),
+            Some(session.to_owned()),
+        )?;
+        if artifact.status != "ok" {
+            return Err(artifact
+                .error
+                .unwrap_or_else(|| invalid("trace artifact path failed")));
+        }
+        let source = artifact
+            .result
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let bytes = std::fs::read(source).map_err(|error| {
+            ErrorObject::new(
+                "ARTIFACT_IO",
+                format!("cannot read trace artifact: {error}"),
+                response.request_id.clone(),
+                EXIT_WEB_ARTIFACT,
+                "retry web run",
+            )
+        })?;
+        export_regular_file(Path::new(destination), &bytes)?;
+    }
+    Ok(())
 }
 
 fn build_run_payload(

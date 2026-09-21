@@ -412,6 +412,20 @@ pub(crate) fn route_until_script_complete(
     route_until_script_complete_gated(controller, content, timeout, AllowAllGate)
 }
 
+#[derive(Debug)]
+pub(crate) struct ScriptFailure {
+    pub message: String,
+    pub result: serde_json::Value,
+}
+
+impl std::fmt::Display for ScriptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ScriptFailure {}
+
 pub(crate) fn route_until_script_complete_gated(
     controller: &mut WorkerProcess,
     content: &mut WorkerProcess,
@@ -549,10 +563,13 @@ pub(crate) fn route_until_script_complete_gated(
                     ok, result, error, ..
                 }) => {
                     if !ok {
-                        return Err(io::Error::other(format!(
-                            "controller script failed: {}",
-                            error.unwrap_or_else(|| result.to_string())
-                        )));
+                        return Err(io::Error::other(ScriptFailure {
+                            message: format!(
+                                "controller script failed: {}",
+                                error.unwrap_or_else(|| result.to_string())
+                            ),
+                            result,
+                        }));
                     }
                     return Ok(result);
                 }

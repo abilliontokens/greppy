@@ -7829,6 +7829,15 @@ await browser.close();"#;
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("page.title"), "{text}");
     assert!(!text.contains("page.content"), "{text}");
+
+    let failing = r#"import { chromium } from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start(); await page.title();
+throw new Error("intentional trace fixture failure");"#;
+    let failed = unix_request(&socket, &Request::new("run_trace", "web.run", json!({"session_id":session_id,"script_text":failing})), Duration::from_secs(40)).unwrap();
+    assert_eq!(failed.status, "error", "{failed:?}");
+    assert_eq!(failed.error.as_ref().unwrap().code, "controller_exception");
+    assert_eq!(failed.artifacts.len(), 1, "active trace must survive script failure: {failed:?}");
 }
 
 #[test]

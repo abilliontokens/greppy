@@ -41,6 +41,14 @@ function traceEvent(value) {
   activeTrace.lines.push(line);
 }
 
+globalThis.__greppyCaptureActiveTrace = () => {
+  if (!activeTrace) return;
+  traceEvent({ type: "event", time: Date.now(), class: "Greppy", method: "scriptFailed" });
+  const trace = activeTrace.lines.join("");
+  activeTrace = null;
+  ops.op_capture_trace_archive(trace, "");
+};
+
 function screenshotBuffer(result) {
   if (result && result.png_path) {
     const encoded = ops.op_read_temp_png(String(result.png_path));
@@ -2885,11 +2893,10 @@ class BrowserContext {
         traceEvent({ version: 10, type: "context-options", origin: "library", browserName: "greppy", playwrightVersion: "1.52", options: {}, platform: "native", wallTime: Date.now(), monotonicTime: 0, sdkLanguage: "javascript" });
       },
       stop: async (options = {}) => {
-        if (options.path != null) throw new Error("Tracing.stop({path}) is unsupported; the archive is returned as a web.run artifact");
-        for (const key of Object.keys(options)) throw new Error(`Tracing.stop option ${key} is unsupported`);
+        for (const key of Object.keys(options)) if (key !== "path") throw new Error(`Tracing.stop option ${key} is unsupported`);
         if (!activeTrace || activeTrace.context !== this._id) throw new Error("no trace is recording for this BrowserContext");
         const trace = activeTrace.lines.join(""); activeTrace = null;
-        ops.op_capture_trace_archive(trace);
+        ops.op_capture_trace_archive(trace, options.path == null ? "" : String(options.path));
       },
     }, "Tracing");
     this.clock = withUnsupported(

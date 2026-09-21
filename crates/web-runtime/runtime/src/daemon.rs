@@ -1790,33 +1790,17 @@ impl Daemon {
                     .get("stdout")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                let mut trace_artifacts = Vec::new();
-                if let Some(archives) = result
-                    .get("trace_archives")
-                    .and_then(|value| value.as_array())
-                {
-                    for encoded in archives {
-                        let Some(encoded) = encoded.as_str() else { continue };
-                        let bytes = match decode_base64(encoded) {
-                            Ok(bytes) => bytes,
-                            Err(error) => return engine_error(request, error, 39),
-                        };
-                        let manifest = match self.store_bytes(
-                            request, &session_id, &bytes, "application/zip", "web.run.trace", true,
-                        ) {
-                            Ok(manifest) => manifest,
-                            Err(response) => return response,
-                        };
-                        let digest = manifest.digest.hex;
-                        trace_artifacts.push(json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true}));
-                    }
-                }
+                let (trace_artifacts, trace_exports) = match self.store_trace_archives(request, &session_id, &result) {
+                    Ok(stored) => stored,
+                    Err(response) => return response,
+                };
                 let mut response = Response::ok(
                     request,
                     serde_json::json!({
                         "session_id": session_id,
                         "completed": true,
                         "stdout": stdout,
+                        "trace_exports": trace_exports,
                     }),
                 );
                 response.artifacts = trace_artifacts;
@@ -1830,6 +1814,16 @@ impl Daemon {
                 response
             }
             Err(error) => {
+                let failure_trace_artifacts = error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<crate::supervisor::ScriptFailure>())
+                    .map(|failure| self.store_trace_archives(request, &session_id, &failure.result))
+                    .transpose();
+                let failure_trace_artifacts = match failure_trace_artifacts {
+                    Ok(Some((artifacts, _))) => artifacts,
+                    Ok(None) => Vec::new(),
+                    Err(response) => return response,
+                };
                 let message = error.to_string();
                 if message.contains("cancelled") {
                     let pair = (session_id.clone(), operation_id.clone());
@@ -1989,6 +1983,7 @@ impl Daemon {
                 // came to look like a broken counter rather than a missing
                 // assignment.
                 let mut response = Response::error(request, object);
+                response.artifacts = failure_trace_artifacts;
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
@@ -4056,6 +4051,32 @@ impl Daemon {
                 sensitive,
             )
             .map_err(|error| engine_error(request, error.to_string(), 39))
+    }
+
+    fn store_trace_archives(
+        &mut self,
+        request: &Request,
+        session_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), Response> {
+        let mut artifacts = Vec::new();
+        let mut exports = Vec::new();
+        let Some(archives) = result.get("trace_archives").and_then(|value| value.as_array()) else {
+            return Ok((artifacts, exports));
+        };
+        for archive in archives {
+            let Some(encoded) = archive.get("encoded").and_then(|value| value.as_str()) else { continue };
+            let bytes = decode_base64(encoded).map_err(|error| engine_error(request, error, 39))?;
+            let manifest = self.store_bytes(
+                request, session_id, &bytes, "application/zip", "web.run.trace", true,
+            )?;
+            let digest = manifest.digest.hex;
+            if let Some(path) = archive.get("requested_path").and_then(|value| value.as_str()).filter(|path| !path.is_empty()) {
+                exports.push(json!({"id":digest.clone(),"path":path}));
+            }
+            artifacts.push(json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true}));
+        }
+        Ok((artifacts, exports))
     }
 
     fn web_trace_start(&mut self, request: &Request) -> Response {

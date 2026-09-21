@@ -11900,7 +11900,7 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "Daemon artifact export is under validation. stop({path}) remains unsupported."
+        "Daemon artifact export is under validation. stop({path}) is materialized safely by the CLI after web.run completes and is not readable from inside the still-running script."
       ]
     },
     {
@@ -15608,7 +15608,7 @@
       "behavior": "unverified",
       "tests": [],
       "known_differences": [
-        "Action-only recording returns a sensitive web.run artifact; stop({path}), snapshots, screenshots, sources, chunks and groups remain unsupported."
+        "Action-only recording returns a sensitive web.run artifact; stop({path}) exports after web.run completes. snapshots, screenshots, sources, chunks and groups remain unsupported."
       ]
     },
     {
