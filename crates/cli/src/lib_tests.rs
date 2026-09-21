@@ -1,6 +1,36 @@
 use super::*;
 use clap::Parser;
 
+struct InterruptedOnce {
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::io::Read for InterruptedOnce {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if read == 0 {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        } else {
+            let _ = buffer;
+            Ok(0)
+        }
+    }
+}
+
+#[test]
+fn base_build_owner_watchdog_retries_interrupted_reads() {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut cancelled = false;
+    watch_base_build_owner(
+        InterruptedOnce {
+            reads: reads.clone(),
+        },
+        || cancelled = true,
+    );
+    assert!(cancelled);
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
 #[cfg(not(feature = "cpu-only"))]
 #[test]
 fn product_build_contains_embedding_and_summary_gpu_backends() {
