@@ -1244,7 +1244,6 @@ impl ContentEngine {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                trace.timeout(webview);
                 return Ok(false);
             }
             match poll_wake_step(
@@ -1255,7 +1254,6 @@ impl ContentEngine {
                 WakePoll::Ready => return Ok(true),
                 WakePoll::TimedOut => {
                     if Instant::now() >= deadline {
-                        trace.timeout(webview);
                         return Ok(false);
                     }
                 }
@@ -1345,6 +1343,7 @@ impl ContentEngine {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                trace.timeout(webview);
                 return Ok(false);
             }
             match poll_wake_step(
@@ -1354,6 +1353,7 @@ impl ContentEngine {
             ) {
                 WakePoll::Ready | WakePoll::TimedOut => {
                     if Instant::now() >= deadline {
+                        trace.timeout(webview);
                         return Ok(false);
                     }
                 }
