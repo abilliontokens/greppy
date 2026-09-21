@@ -733,21 +733,49 @@ impl Drop for ResetServer {
 fn spawn_reset_server() -> ResetServer {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
     listener.set_nonblocking(true).expect("nonblocking failure port");
-    let url = format!("http://{}/transport-failure", listener.local_addr().unwrap());
+    let url = format!(
+        "http://{}/transport-failure",
+        listener.local_addr().unwrap()
+    );
     let (stop, stopped) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || loop {
         if stopped.try_recv().is_ok() {
             break;
         }
         match listener.accept() {
-            Ok((stream, _)) => drop(stream),
+            Ok((stream, _)) => {
+                // An abortive close makes the accepted-then-closed failure a
+                // deterministic TCP reset on Linux and macOS. A plain close
+                // can be interpreted as an empty orderly response by the
+                // networking stack and would not test the same failure path.
+                use std::os::fd::AsRawFd;
+                let linger = libc::linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                let result = unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        std::ptr::addr_of!(linger).cast(),
+                        std::mem::size_of_val(&linger) as libc::socklen_t,
+                    )
+                };
+                assert_eq!(result, 0, "set abortive TCP close");
+                drop(stream);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
             Err(_) => break,
         }
     });
-    ResetServer { url, stop, worker: Some(worker) }
+    ResetServer {
+        url,
+        stop,
+        worker: Some(worker),
+    }
 }
 
 fn serve_status_fixture() -> String {
@@ -3279,11 +3307,16 @@ fn network_query_filters_real_http_and_https_responses() {
 
 #[test]
 fn native_transport_failure_is_typed_without_classifying_page_words() {
+    let reset = spawn_reset_server();
     let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("closed port");
-    let failed_url = format!("http://{}/transport-failure", closed_listener.local_addr().unwrap());
+    let refused_url = format!(
+        "http://{}/transport-failure",
+        closed_listener.local_addr().unwrap()
+    );
     drop(closed_listener);
     let legitimate_html = Box::leak(format!(
-        "<!doctype html><title>Error loading page</title><body><p>Could not load the requested page: documentation example</p><a id='broken' href='{failed_url}'>Broken transport</a></body>"
+        "<!doctype html><title>Error loading page</title><body><p>Could not load the requested page: documentation example</p><a id='refused' href='{refused_url}'>Refused transport</a><a id='reset' href='{}'>Reset transport</a></body>",
+        reset.url,
     ).into_boxed_str());
     let legitimate = serve_fixture(legitimate_html);
     let socket = std::env::temp_dir().join(format!(
@@ -3304,30 +3337,67 @@ fn native_transport_failure_is_typed_without_classifying_page_words() {
         .expect("navigation request")
     };
 
-    let ordinary = call("web.session.create", json!({ "profile": "project" }));
-    let ordinary_id = ordinary.result.as_ref().unwrap()["session_id"].as_str().unwrap();
-    let opened = call("web.goto", json!({ "session_id": ordinary_id, "url": legitimate }));
-    assert_eq!(opened.status, "ok", "ordinary page words are content: {opened:?}");
-    let observed = call("web.observe", json!({ "session_id": ordinary_id }));
-    assert_eq!(observed.status, "ok", "ordinary page words are observable: {observed:?}");
-    let clicked = call("web.click", json!({
-        "session_id": ordinary_id,
-        "selector": { "type": "css", "value": "#broken" },
-    }));
-    assert_eq!(clicked.status, "error", "failed link navigation must be typed: {clicked:?}");
-    assert_eq!(clicked.error.as_ref().unwrap().code, "engine_error", "{clicked:?}");
-    let receipt = clicked.result.as_ref().expect("partial click receipt");
-    assert_eq!(receipt["partial"], true);
-    assert_eq!(receipt["ok"], false);
-    assert!(receipt.get("dispatch").is_some(), "click dispatch provenance: {receipt}");
-    assert_eq!(receipt["session_id"], ordinary_id);
-    assert!(receipt["tab_id"].is_string());
-    assert!(clicked.error.as_ref().unwrap().message.contains("request_id="));
+    for selector in ["#refused", "#reset"] {
+        let ordinary = call("web.session.create", json!({ "profile": "project" }));
+        let ordinary_id = ordinary.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap();
+        let opened = call(
+            "web.goto",
+            json!({ "session_id": ordinary_id, "url": legitimate }),
+        );
+        assert_eq!(
+            opened.status, "ok",
+            "ordinary page words are content: {opened:?}"
+        );
+        let observed = call("web.observe", json!({ "session_id": ordinary_id }));
+        assert_eq!(
+            observed.status, "ok",
+            "ordinary page words are observable: {observed:?}"
+        );
+        let clicked = call(
+            "web.click",
+            json!({
+                "session_id": ordinary_id,
+                "selector": { "type": "css", "value": selector },
+            }),
+        );
+        assert_eq!(
+            clicked.status, "error",
+            "{selector} must be typed: {clicked:?}"
+        );
+        assert_eq!(
+            clicked.error.as_ref().unwrap().code,
+            "engine_error",
+            "{clicked:?}"
+        );
+        let receipt = clicked.result.as_ref().expect("partial click receipt");
+        assert_eq!(receipt["partial"], true);
+        assert_eq!(receipt["ok"], false);
+        assert!(
+            receipt.get("dispatch").is_some(),
+            "click dispatch provenance: {receipt}"
+        );
+        assert_eq!(receipt["session_id"], ordinary_id);
+        assert!(receipt["tab_id"].is_string());
+        assert!(clicked
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("request_id="));
+    }
 
     let failed = call("web.session.create", json!({ "profile": "project" }));
     let failed_id = failed.result.as_ref().unwrap()["session_id"].as_str().unwrap();
-    let navigation = call("web.goto", json!({ "session_id": failed_id, "url": failed_url.clone() }));
-    assert_eq!(navigation.status, "error", "transport navigation must fail: {navigation:?}");
+    let navigation = call(
+        "web.goto",
+        json!({ "session_id": failed_id, "url": refused_url }),
+    );
+    assert_eq!(
+        navigation.status, "error",
+        "transport navigation must fail: {navigation:?}"
+    );
     assert_eq!(navigation.error.as_ref().unwrap().code, "engine_error");
 }
 
