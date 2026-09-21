@@ -1017,8 +1017,8 @@ fn semantic_search_reports_embedding_lifecycle_failure_without_partial_hits() {
         "failed lifecycle must not emit result JSON: {out}"
     );
     assert!(
-        err.contains("exited without publishing generation"),
-        "missing publication must be reported as the exact lifecycle failure: {err}"
+        err.contains("the embedding process could not be started"),
+        "disabled fixture inference must report the exact start failure: {err}"
     );
     assert!(
         !err.contains("semantic_progress_marker"),

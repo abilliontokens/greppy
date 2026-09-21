@@ -1567,9 +1567,10 @@ fn wait_for_embedding_publication(
             ))
         })?;
         let initial_job = read_background_job(launch.path());
-        let attached_to_index = initial_job.as_ref().is_some_and(|job| {
-            job.get("kind").and_then(serde_json::Value::as_str) == Some("index")
-        });
+        let follow_attached_owner = matches!(launch, BackgroundJobLaunch::Attached { .. })
+            && !initial_job.as_ref().is_some_and(|job| {
+                job.get("kind").and_then(serde_json::Value::as_str) == Some("embedding")
+            });
         if !announced {
             let progress = initial_job.unwrap_or_else(|| {
                 embedding_progress_value(effective_root, cfg, requested_generation)
@@ -1592,7 +1593,7 @@ fn wait_for_embedding_publication(
                     read_background_job(launch.path()).as_ref(),
                     owner_active,
                     false,
-                    attached_to_index,
+                    follow_attached_owner,
                 ),
                 BackgroundEmbeddingObservation::Pending
             ) {
@@ -1612,7 +1613,7 @@ fn wait_for_embedding_publication(
             read_background_job(launch.path()).as_ref(),
             false,
             publication_complete,
-            attached_to_index,
+            follow_attached_owner,
         ) {
             BackgroundEmbeddingObservation::Published => return Ok(store),
             BackgroundEmbeddingObservation::FollowIndex => {
@@ -1651,7 +1652,7 @@ pub(crate) fn observe_background_embedding(
     job: Option<&serde_json::Value>,
     owner_active: bool,
     publication_complete: bool,
-    attached_to_index: bool,
+    follow_attached_owner: bool,
 ) -> BackgroundEmbeddingObservation {
     if owner_active {
         return BackgroundEmbeddingObservation::Pending;
@@ -1662,7 +1663,7 @@ pub(crate) fn observe_background_embedding(
     if let Some(detail) = job.cloned().and_then(background_embedding_failure) {
         return BackgroundEmbeddingObservation::Failed(detail);
     }
-    if attached_to_index {
+    if follow_attached_owner {
         return BackgroundEmbeddingObservation::FollowIndex;
     }
     BackgroundEmbeddingObservation::MissingPublication

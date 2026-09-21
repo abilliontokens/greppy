@@ -4703,6 +4703,8 @@ fn spawn_background_job_handle(
     let Ok(Some(_spawn_lock)) = greppy_core::cache::acquire_named_lock(
         &format!("workspace-{hash}.job-spawn"),
         greppy_core::cache::LockMode::Exclusive,
+        // `false` is the blocking mode: concurrent first queries serialize
+        // here, then the follower observes and attaches to the active writer.
         false,
     ) else {
         return None;
