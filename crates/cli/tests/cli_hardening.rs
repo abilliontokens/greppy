@@ -957,6 +957,24 @@ fn semantic_search_reports_embedding_lifecycle_failure_without_partial_hits() {
     let mut vector = Vec::new();
     vector.extend_from_slice(&1.0f32.to_le_bytes());
     vector.extend_from_slice(&0.0f32.to_le_bytes());
+    use sha2::Digest as _;
+    let mut embedded_digest = sha2::Sha256::new();
+    for (name, digest) in [
+        (
+            "embeddinggemma-300M-Q4_K.gguf",
+            env!("GREPPY_EMBEDDED_GGUF_SHA"),
+        ),
+        ("tokenizer.json", env!("GREPPY_EMBEDDED_TOK_SHA")),
+    ] {
+        embedded_digest.update(name.as_bytes());
+        embedded_digest.update([0]);
+        embedded_digest.update(digest.as_bytes());
+        embedded_digest.update([0]);
+    }
+    let configured_model_id = format!(
+        "google/embeddinggemma-300m@sha256:{:x}",
+        embedded_digest.finalize()
+    );
     graph
         .execute(
             "INSERT INTO vector_embeddings
@@ -967,7 +985,7 @@ fn semantic_search_reports_embedding_lifecycle_failure_without_partial_hits() {
                      ?7, 2, 1.0, ?8, 'test', NULL, NULL)",
             rusqlite::params![
                 "repo",
-                "google/embeddinggemma-300m",
+                configured_model_id,
                 greppy_embed_native::PROMPT_VERSION,
                 greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE,
                 "repo.partial_semantic_progress_marker",
