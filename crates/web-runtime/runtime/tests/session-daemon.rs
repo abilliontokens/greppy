@@ -3243,6 +3243,68 @@ fn network_query_filters_real_http_and_https_responses() {
 }
 
 #[test]
+fn native_transport_failure_is_typed_without_classifying_page_words() {
+    let failed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
+    let failed_url = format!("http://{}/transport-failure", failed_listener.local_addr().unwrap());
+    thread::spawn(move || {
+        for _ in 0..4 {
+            if let Ok((stream, _)) = failed_listener.accept() {
+                drop(stream);
+            }
+        }
+    });
+    let legitimate = serve_fixture(&format!(
+        "<!doctype html><title>Error loading page</title><body><p>Could not load the requested page: documentation example</p><a id='broken' href='{failed_url}'>Broken transport</a></body>"
+    ));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-navigation-failure-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_navigation_failure", |command| {
+        command.arg("--fixture-url").arg(&legitimate);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_navigation_failure", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("navigation request")
+    };
+
+    let ordinary = call("web.session.create", json!({ "profile": "project" }));
+    let ordinary_id = ordinary.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let opened = call("web.goto", json!({ "session_id": ordinary_id, "url": legitimate }));
+    assert_eq!(opened.status, "ok", "ordinary page words are content: {opened:?}");
+    let observed = call("web.observe", json!({ "session_id": ordinary_id }));
+    assert_eq!(observed.status, "ok", "ordinary page words are observable: {observed:?}");
+    let clicked = call("web.click", json!({
+        "session_id": ordinary_id,
+        "selector": { "type": "css", "value": "#broken" },
+    }));
+    assert_eq!(clicked.status, "error", "failed link navigation must be typed: {clicked:?}");
+    assert_eq!(clicked.error.as_ref().unwrap().code, "engine_error");
+    let receipt = clicked.result.as_ref().expect("partial click receipt");
+    assert_eq!(receipt["partial"], true);
+    assert_eq!(receipt["ok"], false);
+    assert!(receipt.get("dispatch").is_some(), "click dispatch provenance: {receipt}");
+    assert_eq!(receipt["session_id"], ordinary_id);
+    assert!(receipt["tab_id"].is_string());
+
+    let failed = call("web.session.create", json!({ "profile": "project" }));
+    let failed_id = failed.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+    let navigation = call("web.goto", json!({ "session_id": failed_id, "url": failed_url }));
+    assert_eq!(navigation.status, "error", "transport navigation must fail: {navigation:?}");
+    assert_eq!(navigation.error.as_ref().unwrap().code, "engine_error");
+    let observation = call("web.observe", json!({ "session_id": failed_id }));
+    assert_eq!(observation.status, "error", "failed navigation provenance must reach observe: {observation:?}");
+    assert_eq!(observation.error.as_ref().unwrap().code, "engine_error");
+    assert!(observation.error.as_ref().unwrap().message.contains("request_id="));
+}
+
+#[test]
 fn oracle_skip_receipt_when_chromium_pin_missing() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")

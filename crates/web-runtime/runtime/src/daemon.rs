@@ -2011,9 +2011,6 @@ impl Daemon {
             "query": query, "include_html": include_html,
         }), timeout, recover_worker)?;
         let object = tree.as_object_mut().ok_or("observe returned no page object")?;
-        if let Some(error) = observed_navigation_error(object) {
-            return Err(format!("navigation failed: {error}"));
-        }
         let token = object.remove("ref_snapshot")
             .and_then(|value| value.as_str().map(str::to_owned))
             .ok_or("observe returned no document scope")?;
@@ -2072,7 +2069,16 @@ impl Daemon {
         };
         if let Some(error) = navigation_error {
             self.finish_session(session_id);
-            return engine_error(request, error, 34);
+            let mut response = engine_error(request, error, 34);
+            if let Some(object) = result.as_object_mut() {
+                object.insert("session_id".into(), json!(session_id));
+                object.insert("tab_id".into(), json!(page));
+                object.insert("ok".into(), json!(false));
+                object.insert("partial".into(), json!(true));
+                object.insert("untrusted_content_boundary".into(), json!("UNTRUSTED_PAGE_CONTENT"));
+            }
+            response.result = Some(result);
+            return response;
         }
         let state = observation.map(page_state_envelope);
         if let Some(object) = result.as_object_mut() {
@@ -4599,13 +4605,6 @@ fn page_state_envelope(observation: Result<serde_json::Value, String>) -> serde_
     }
 }
 
-fn observed_navigation_error(object: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
-    let title = object.get("title").and_then(serde_json::Value::as_str)?;
-    let text = object.get("text").and_then(serde_json::Value::as_str)?;
-    (title == "Error loading page" && text.starts_with("Could not load the requested page:"))
-        .then_some(text)
-}
-
 fn locator_error(request: &Request, message: impl Into<String>) -> Response {
     let message = redact_secrets(&message.into());
     let (code, next_action) = recovery_for_locator_error(&message);
@@ -5891,34 +5890,6 @@ mod redirect_chain_tests {
         assert_eq!(payload["path"], format!("objects/sha256/{digest}"));
         assert_eq!(payload["label"], "web.read");
         assert_eq!(payload["redaction_status"], "redacted_for_model");
-    }
-
-    #[test]
-    fn servo_transport_error_document_is_not_a_successful_observation() {
-        let failed = json!({
-            "title": "Error loading page",
-            "text": "Could not load the requested page: client error (SendRequest)",
-        });
-        assert_eq!(
-            super::observed_navigation_error(failed.as_object().unwrap()),
-            Some("Could not load the requested page: client error (SendRequest)")
-        );
-
-        for ordinary in [
-            json!({
-                "title": "Troubleshooting",
-                "text": "Could not load the requested page: an example for readers",
-            }),
-            json!({
-                "title": "Error loading page",
-                "text": "The application reported a validation error",
-            }),
-        ] {
-            assert_eq!(
-                super::observed_navigation_error(ordinary.as_object().unwrap()),
-                None
-            );
-        }
     }
 
     #[test]

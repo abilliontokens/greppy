@@ -352,6 +352,8 @@ struct Delegate {
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
     last_responses: RefCell<Vec<serde_json::Value>>,
     dropped_responses: Cell<u64>,
+    current_main_frame_request: RefCell<Option<String>>,
+    navigation_failure: RefCell<Option<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
     /// Main-document lifecycle, owned by Servo rather than page script. A
@@ -396,6 +398,8 @@ impl Delegate {
             last_file_choosers: RefCell::new(Vec::new()),
             last_responses: RefCell::new(Vec::new()),
             dropped_responses: Cell::new(0),
+            current_main_frame_request: RefCell::new(None),
+            navigation_failure: RefCell::new(None),
             opener_id: RefCell::new(None),
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
@@ -599,6 +603,10 @@ impl WebViewDelegate for Delegate {
             UrlDecision::Allow => None,
         };
         let mut requests = self.requests.borrow_mut();
+        if load.request.is_for_main_frame {
+            self.current_main_frame_request.replace(Some(request_id.clone()));
+            self.navigation_failure.replace(None);
+        }
         requests.push(json!({
             "requestId": request_id,
             "url": url,
@@ -754,7 +762,14 @@ impl WebViewDelegate for Delegate {
             row["ok"] = json!((200..400).contains(&status));
         }
         if let Some(failure) = response.failure {
-            row["failure"] = json!({ "errorText": failure });
+            row["failure"] = json!({ "errorText": failure.clone() });
+            if self.current_main_frame_request.borrow().as_deref() == Some(request_id.as_str()) {
+                self.navigation_failure.replace(Some(json!({
+                    "requestId": request_id,
+                    "url": response.url.to_string(),
+                    "errorText": failure,
+                })));
+            }
         }
         let mut responses = self.last_responses.borrow_mut();
         if let Some(existing) = responses.iter_mut().find(|existing| {
@@ -2317,6 +2332,10 @@ impl ContentEngine {
                     .and_then(|row| row.get("headers"))
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                let recorded_failure = matched
+                    .and_then(|row| row.pointer("/failure/errorText"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
                 drop(recorded);
                 // A failed probe means UNKNOWN, never "empty": on a page
                 // whose script thread is still busy (a 7.6MB spec mid-parse)
@@ -2329,22 +2348,9 @@ impl ContentEngine {
                     Ok(JSValue::String(text)) => Some(text),
                     _ => None,
                 };
-                let servo_error_shell = match self.evaluate(
-                    webview.clone(),
-                    "document.title === 'Error loading page' && document.body && document.body.children.length === 1 && document.body.firstElementChild.tagName === 'P' && document.body.firstElementChild.innerText.startsWith('Could not load the requested page:')",
-                ) {
-                    Ok(JSValue::Boolean(matches)) => matches,
-                    _ => false,
-                };
-                // Servo 0.5 exposes no typed transport-failure callback for a
-                // pass-through WebResourceLoad. A missing recorded response is
-                // also normal for some CONNECT-tunnel traffic, so keep this as
-                // a deliberately narrow structural fallback matching Servo's
-                // baked-in neterror.html instead of classifying body text.
-                if recorded_status.is_none() && servo_error_shell {
+                if let Some(failure) = recorded_failure {
                     return Err(io::Error::other(format!(
-                        "navigation failed: {}",
-                        text.as_deref().unwrap_or("Servo network error")
+                        "navigation failed: {failure}"
                     )));
                 }
                 let html =
@@ -2353,8 +2359,9 @@ impl ContentEngine {
                         _ => None,
                     };
                 // CONNECT-tunneled fetches often never match last_responses, so a
-                // missing recorded status is not proof of failure. The Servo error
-                // shell is already rejected above; accept a rendered document.
+                // missing recorded status is not proof of failure. A typed
+                // terminal transport failure is rejected above; otherwise accept
+                // a rendered document.
                 //
                 // Empty innerText plus tiny HTML is not proof either: a
                 // <frameset> page has no body at all, so its innerText is
@@ -2688,7 +2695,15 @@ impl ContentEngine {
                     .get("ref_last")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                if let Some(failure) = delegate.navigation_failure.borrow_mut().take() {
+                    let request_id = failure.get("requestId").and_then(|value| value.as_str()).unwrap_or("unknown");
+                    let url = failure.get("url").and_then(|value| value.as_str()).unwrap_or("unknown");
+                    let error = failure.get("errorText").and_then(|value| value.as_str()).unwrap_or("transport failure");
+                    return Err(io::Error::other(format!(
+                        "navigation failed: {error} (request_id={request_id}, url={url})"
+                    )));
+                }
                 let query = params.get("query").and_then(|value| value.as_str());
                 let include_html = params
                     .get("include_html")
@@ -3898,6 +3913,9 @@ impl ContentEngine {
     ) -> io::Result<String> {
         let page_id = required_str(params, "page")?;
         let (webview, delegate) = self.page(&page_id)?.clone();
+        let action_started = Instant::now();
+        let main_frame_request_before = delegate.current_main_frame_request.borrow().clone();
+        let document_generation_before = delegate.document_generation.get();
         let probe = format!(
             "{}-{}",
             std::process::id(),
@@ -3934,6 +3952,20 @@ impl ContentEngine {
             Err(_) => "document-changed".to_owned(),
             Ok(_) => "unknown".to_owned(),
         };
+        let main_frame_request_after = delegate.current_main_frame_request.borrow().clone();
+        if main_frame_request_after != main_frame_request_before {
+            let expected_request = main_frame_request_after.clone();
+            let remaining = call_timeout(params).saturating_sub(action_started.elapsed());
+            if !self.spin_until_loaded(&webview, remaining, || {
+                delegate.current_main_frame_request.borrow().as_ref() == expected_request.as_ref()
+                    && delegate.document_generation.get() != document_generation_before
+            })? {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for click navigation",
+                ));
+            }
+        }
         if let Some(selector) = params
             .get("selector")
             .and_then(|value| value.get("value"))
