@@ -3417,6 +3417,12 @@ impl Daemon {
                         {
                             object.insert("dispatch".into(), dispatch);
                         }
+                        if let (Some(navigation_epoch), Some(object)) = (
+                            result.get("navigation_epoch").cloned(),
+                            response.as_object_mut(),
+                        ) {
+                            object.insert("navigation_epoch".into(), navigation_epoch);
+                        }
                         self.finish_action_with_page_state(request, &session_id, &page, response)
                     }
                     Err(error) => {

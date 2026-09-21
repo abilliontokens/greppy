@@ -31,6 +31,7 @@ use crate::{RegisterOrUnregister, Servo, WebView, WebViewBuilder};
 /// asynchronously. If not handled, the request will automatically be allowed.
 pub struct NavigationRequest {
     pub url: Url,
+    pub is_for_main_frame: bool,
     pub(crate) pipeline_id: PipelineId,
     pub(crate) constellation_proxy: ConstellationProxy,
     pub(crate) response_sent: bool,

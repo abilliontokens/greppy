@@ -3636,6 +3636,57 @@ fn workflow_click_terminal_failures_stop_before_expectations_or_later_steps() {
 }
 
 #[test]
+fn denied_iframe_navigation_does_not_poison_top_level_actions() {
+    let fixture = serve_fixture(
+        "<!doctype html><button id='top' onclick=\"window.topClicked=true;const frame=document.createElement('iframe');frame.src='http://169.254.169.254/latest/meta-data/';document.body.appendChild(frame)\">Top control</button><script>window.topClicked=false</script>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-denied-iframe-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_denied_iframe", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_denied_iframe", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("denied iframe request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+    assert_eq!(opened.status, "ok", "top page remains usable: {opened:?}");
+    let observed = call("web.observe", json!({"session_id":session}));
+    assert_eq!(observed.status, "ok", "iframe denial is not top failure: {observed:?}");
+    let clicked = call(
+        "web.click",
+        json!({
+            "session_id": session,
+            "selector": {"type":"css","value":"#top"},
+        }),
+    );
+    assert_eq!(clicked.status, "ok", "benign top click: {clicked:?}");
+    let observed_after = call("web.observe", json!({"session_id":session}));
+    assert_eq!(
+        observed_after.status, "ok",
+        "denied iframe created by click is not a top failure: {observed_after:?}"
+    );
+    let state = call(
+        "web.evaluate",
+        json!({"session_id":session,"source":"window.topClicked"}),
+    );
+    assert_eq!(state.status, "ok", "top state: {state:?}");
+    assert_eq!(state.result.as_ref().unwrap()["value"], true, "{state:?}");
+}
+
+#[test]
 fn oracle_skip_receipt_when_chromium_pin_missing() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")

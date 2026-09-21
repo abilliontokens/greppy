@@ -354,6 +354,9 @@ struct Delegate {
     dropped_responses: Cell<u64>,
     current_main_frame_request: RefCell<Option<String>>,
     main_frame_navigation_epoch: Cell<u64>,
+    navigation_intent_generation: Cell<u64>,
+    pending_navigation_intent: RefCell<Option<(u64, String, Option<String>)>>,
+    promoted_navigation_url: RefCell<Option<String>>,
     navigation_failure: RefCell<Option<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
@@ -401,6 +404,9 @@ impl Delegate {
             dropped_responses: Cell::new(0),
             current_main_frame_request: RefCell::new(None),
             main_frame_navigation_epoch: Cell::new(0),
+            navigation_intent_generation: Cell::new(0),
+            pending_navigation_intent: RefCell::new(None),
+            promoted_navigation_url: RefCell::new(None),
             navigation_failure: RefCell::new(None),
             opener_id: RefCell::new(None),
             rendering_context,
@@ -471,21 +477,27 @@ impl Delegate {
 
 impl WebViewDelegate for Delegate {
     fn request_navigation(&self, _webview: WebView, navigation: NavigationRequest) {
-        if let UrlDecision::Deny { reason } =
-            decide_url(self.profile.get(), navigation.url.as_str())
-        {
-            let epoch = self.main_frame_navigation_epoch.get().wrapping_add(1);
-            self.main_frame_navigation_epoch.set(epoch);
-            let request_id = format!("navigation:{epoch}");
-            self.current_main_frame_request
-                .replace(Some(request_id.clone()));
-            self.navigation_failure.replace(None);
-            self.record_main_frame_failure(
-                &request_id,
-                navigation.url.as_str(),
-                reason,
-                "policy_denied",
-            );
+        if !navigation.is_for_main_frame {
+            match decide_url(self.profile.get(), navigation.url.as_str()) {
+                UrlDecision::Allow => navigation.allow(),
+                UrlDecision::Deny { .. } => navigation.deny(),
+            }
+            return;
+        }
+        let generation = self.navigation_intent_generation.get().wrapping_add(1);
+        self.navigation_intent_generation.set(generation);
+        let decision = decide_url(self.profile.get(), navigation.url.as_str());
+        let denied = match &decision {
+            UrlDecision::Deny { reason } => Some(reason.to_owned()),
+            UrlDecision::Allow => None,
+        };
+        self.pending_navigation_intent.replace(Some((
+            generation,
+            navigation.url.to_string(),
+            denied,
+        )));
+        self.wake.wake();
+        if matches!(decision, UrlDecision::Deny { .. }) {
             navigation.deny();
             return;
         }
@@ -655,9 +667,13 @@ impl WebViewDelegate for Delegate {
         };
         let mut requests = self.requests.borrow_mut();
         if load.request.is_for_main_frame {
-            if !load.request.is_redirect {
+            let promoted = self.promoted_navigation_url.borrow().as_deref() == Some(url.as_str());
+            if !load.request.is_redirect && !promoted {
                 self.main_frame_navigation_epoch
                     .set(self.main_frame_navigation_epoch.get().wrapping_add(1));
+            }
+            if promoted {
+                self.promoted_navigation_url.replace(None);
             }
             self.current_main_frame_request
                 .replace(Some(request_id.clone()));
@@ -4001,6 +4017,7 @@ impl ContentEngine {
         let (webview, delegate) = self.page(&page_id)?.clone();
         let action_started = Instant::now();
         let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
+        let navigation_intent_before = delegate.navigation_intent_generation.get();
         let document_generation_before = delegate.document_generation.get();
         let probe = format!(
             "{}-{}",
@@ -4038,6 +4055,25 @@ impl ContentEngine {
             Err(_) => "document-changed".to_owned(),
             Ok(_) => "unknown".to_owned(),
         };
+        if let Some((generation, url, denied)) = delegate
+            .pending_navigation_intent
+            .borrow()
+            .clone()
+            .filter(|(generation, _, _)| *generation != navigation_intent_before)
+            .filter(|_| delegate.main_frame_navigation_epoch.get() == navigation_epoch_before)
+        {
+            let epoch = delegate.main_frame_navigation_epoch.get().wrapping_add(1);
+            delegate.main_frame_navigation_epoch.set(epoch);
+            let request_id = format!("navigation-intent:{generation}");
+            delegate
+                .current_main_frame_request
+                .replace(Some(request_id.clone()));
+            delegate.promoted_navigation_url.replace(Some(url.clone()));
+            delegate.navigation_failure.replace(None);
+            if let Some(reason) = denied {
+                delegate.record_main_frame_failure(&request_id, &url, &reason, "policy_denied");
+            }
+        }
         let navigation_epoch_after = delegate.main_frame_navigation_epoch.get();
         let navigation_epoch =
             (navigation_epoch_after != navigation_epoch_before).then_some(navigation_epoch_after);
