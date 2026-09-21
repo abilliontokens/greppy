@@ -286,6 +286,7 @@ fn option_recovery_never_rewrites_arguments_after_double_dash() {
 
 struct HeldIndex {
     child: std::process::Child,
+    release: PathBuf,
 }
 
 impl Drop for HeldIndex {
@@ -300,12 +301,14 @@ impl Drop for HeldIndex {
 /// active fixture unchanged while the query process exercises its refusal path.
 fn hold_index_before_publish(repo: &Path, store: &Path, label: &str) -> HeldIndex {
     let ready = store.join(format!("{label}-writer-ready"));
+    let release = store.join(format!("{label}-writer-release"));
     let mut child = Command::new(bin())
         .args(["index", "."])
         .current_dir(repo)
         .env("GREPPY_STORE_DIR", store)
         .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
         .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_RELEASE", &release)
         .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_DISCOVER_INCLUDE")
@@ -326,7 +329,75 @@ fn hold_index_before_publish(repo: &Path, store: &Path, label: &str) -> HeldInde
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    HeldIndex { child }
+    HeldIndex { child, release }
+}
+
+/// Wait for a real query to join a held publication, then release the writer.
+/// Both child processes are cleaned up even if the test fails.
+fn query_after_releasing_writer(
+    args: &[&str],
+    repo: &Path,
+    store: &Path,
+    writer: &mut HeldIndex,
+) -> std::process::Output {
+    struct Query(Option<std::process::Child>);
+    impl Drop for Query {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let diagnostic = store.join("waiting-query.stderr");
+    let mut query = Query(Some(
+        Command::new(bin())
+            .args(args)
+            .current_dir(repo)
+            .env("GREPPY_STORE_DIR", store)
+            .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+            .env_remove("GREPPY_DISCOVER_INCLUDE")
+            .env_remove("GREPPY_DISCOVER_EXCLUDE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::fs::File::create(&diagnostic).unwrap())
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        assert!(
+            query.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "query returned before the fresh snapshot was published"
+        );
+        assert!(
+            writer.child.try_wait().unwrap().is_none(),
+            "fixture writer must remain held"
+        );
+        if std::fs::read_to_string(&diagnostic)
+            .unwrap()
+            .contains("syncing_snapshot")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "query never reported held publication: {}",
+            std::fs::read_to_string(&diagnostic).unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::write(&writer.release, "release").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while query.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "query did not finish after publication was released"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut output = query.0.take().unwrap().wait_with_output().unwrap();
+    output.stderr = std::fs::read(&diagnostic).unwrap();
+    output
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -3326,7 +3397,7 @@ fn foreground_index_publishes_observable_progress_while_building() {
 
 #[cfg(unix)]
 #[test]
-fn query_wait_for_active_refresh_is_bounded_and_actionable() {
+fn query_wait_for_active_refresh_returns_fresh_results_without_retry() {
     let (repo, store, _scratch) = make_repo("bounded-query-refresh", "old_refresh_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
@@ -3338,25 +3409,22 @@ fn query_wait_for_active_refresh_is_bounded_and_actionable() {
         "pub fn new_refresh_marker() -> i32 { 9 }\n",
     )
     .unwrap();
-    let _writer = hold_index_before_publish(&repo, &store, "bounded-query-refresh");
-
-    let started = std::time::Instant::now();
-    let (code, out, err) = run(&["search-symbol", "old_refresh_marker"], &repo, &store);
-    assert_eq!(
-        code, 75,
-        "refresh contention is temporary; stdout={out}\nstderr={err}"
+    let mut writer = hold_index_before_publish(&repo, &store, "bounded-query-refresh");
+    let output = query_after_releasing_writer(
+        &["search-symbol", "refresh_marker", "--json"],
+        &repo,
+        &store,
+        &mut writer,
     );
-    assert!(
-        !out.contains("old_refresh_marker"),
-        "an unpublished refresh must never serve the deleted definition: {out}\n{err}"
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "query must not wait for the held writer indefinitely"
-    );
-    assert!(err.contains("waiting up to 2s"), "stderr={err}");
-    assert!(err.contains("phase=syncing_snapshot"), "stderr={err}");
-    assert!(err.contains("greppy index status --json"), "stderr={err}");
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let names: Vec<_> = result["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["new_refresh_marker"], "{result}");
 }
 
 #[test]
@@ -3514,21 +3582,19 @@ fn graph_queries_serve_verified_contents_during_metadata_only_refresh() {
     }
     // Actual source changes still must not be represented as fresh graph data.
     std::fs::write(repo.join("src/lib.rs"), "pub fn changed_marker() {}\n").unwrap();
-    let (code, out, err) = run(
+    let output = query_after_releasing_writer(
         &["search-symbol", "clean_committed_marker", "--json"],
         &repo,
         &store,
+        &mut writer,
     );
-    assert_eq!(
-        code, 75,
-        "changed source must not silently reuse old rows: {out}\n{err}"
-    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "no_matches", "{result}");
+    assert!(result["hits"].as_array().unwrap().is_empty(), "{result}");
     drop(writer);
-    let (code, out, err) = run(&["index", "."], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "refresh must recover after prior writer stops: {out}\n{err}"
-    );
+    // The waiting query must have completed the refresh itself; do not repair
+    // the fixture with a separate index command before checking fresh results.
     let (code, out, err) = run(
         &["search-symbol", "changed_marker", "--json", "--diagnostics"],
         &repo,
