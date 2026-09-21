@@ -3322,20 +3322,21 @@ fn query_wait_for_active_refresh_is_bounded_and_actionable() {
 }
 
 #[test]
-fn read_queries_serve_published_snapshot_during_lifecycle_contention_without_silent_wait() {
+fn read_queries_handle_lifecycle_contention_without_silent_wait() {
     let (repo, store, _scratch) = make_repo("query-lifecycle", "lifecycle_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "fixture index failed: {out}\n{err}");
     let hash = greppy_core::workspace::workspace_hash(&repo);
+    let lock_root = std::fs::canonicalize(&store).unwrap_or_else(|_| store.clone());
     let lease = greppy_core::cache::acquire_named_lock_in(
-        &store,
+        &lock_root,
         &format!("workspace-{hash}.lease"),
         greppy_core::cache::LockMode::Exclusive,
         false,
     )
     .unwrap()
     .unwrap();
-    for command in ["search-symbol", "search-pattern"] {
+    for (command, expected_code) in [("search-symbol", 75), ("search-pattern", 0)] {
         let mut child = Command::new(bin())
             .args([command, "lifecycle_marker"])
             .current_dir(&repo)
@@ -3351,18 +3352,23 @@ fn read_queries_serve_published_snapshot_during_lifecycle_contention_without_sil
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("{command} blocked on a lifecycle lease instead of serving the published snapshot");
+                panic!("{command} blocked on a lifecycle lease instead of returning its command-specific result");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.status.code(), Some(expected_code), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stdout.contains("lib.rs:1") && stdout.contains("lifecycle_marker"),
-            "unexpected stdout: {stdout}\nstderr: {stderr}"
-        );
+        if command == "search-symbol" {
+            let diagnostic = format!("{stdout}{stderr}");
+            assert!(diagnostic.contains("retry this query"), "{diagnostic}");
+        } else {
+            assert!(
+                stdout.contains("lib.rs:1") && stdout.contains("lifecycle_marker"),
+                "unexpected stdout: {stdout}\nstderr: {stderr}"
+            );
+        }
     }
     drop(lease);
     let (code, out, err) = run(&["search-symbol", "lifecycle_marker"], &repo, &store);
