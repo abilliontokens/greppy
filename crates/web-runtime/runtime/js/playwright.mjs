@@ -35,18 +35,18 @@ function traceTime() {
   return ops.op_trace_time_ms();
 }
 
-function traceEvent(value) {
-  if (!activeTrace || activeTrace.truncated) return;
+function traceEvent(value, recorder = activeTrace) {
+  if (!recorder || recorder !== activeTrace || recorder.truncated) return;
   const line = JSON.stringify(value) + "\n";
-  activeTrace.bytes += line.length;
-  if (activeTrace.bytes > traceLimitBytes) {
-    activeTrace.lines = [];
-    activeTrace.bytes = 0;
-    activeTrace.truncated = true;
+  recorder.bytes += line.length;
+  if (recorder.bytes > traceLimitBytes) {
+    recorder.lines = [];
+    recorder.bytes = 0;
+    recorder.truncated = true;
     console.warn("warning: trace recording stopped after exceeding the 8 MiB in-memory limit");
     return;
   }
-  activeTrace.lines.push(line);
+  recorder.lines.push(line);
 }
 
 globalThis.__greppyCaptureActiveTrace = () => {
@@ -92,20 +92,20 @@ function engineCall(method, params) {
   if (payload.timeout == null) {
     payload.timeout = 30_000;
   }
-  const belongsToTrace = activeTrace && (payload.context === activeTrace.context || pageContexts.get(payload.page) === activeTrace.context);
-  const callId = belongsToTrace ? "call@" + activeTrace.next++ : null;
-  if (callId) traceEvent({ type: "before", callId, startTime: traceTime(), apiName: method, class: "Greppy", method, params: {} });
+  const recorder = activeTrace && (payload.context === activeTrace.context || pageContexts.get(payload.page) === activeTrace.context) ? activeTrace : null;
+  const callId = recorder ? "call@" + recorder.next++ : null;
+  if (callId) traceEvent({ type: "before", callId, startTime: traceTime(), apiName: method, class: "Greppy", method, params: {} }, recorder);
   let result;
   try { result = ops.op_engine_call(method, payload); }
   catch (error) {
-    if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } });
+    if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } }, recorder);
     throw error;
   }
   if (result && typeof result.then === "function") {
     return result.then(
-      (value) => { if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), result: {} }); return value; },
+      (value) => { if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), result: {} }, recorder); return value; },
       (error) => {
-        if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } });
+        if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } }, recorder);
         const message = String(error && error.message ? error.message : error);
         if (message.includes("timed out") || message.includes("timeout")) {
           throw new TimeoutError(message);
@@ -2913,7 +2913,7 @@ class BrowserContext {
         if (!activeTrace || activeTrace.context !== this._id) throw new Error("no trace is recording for this BrowserContext");
         if (activeTrace.truncated) {
           activeTrace = null;
-          return;
+          throw new Error("trace recording was truncated after exceeding the 8 MiB in-memory limit; no archive was exported");
         }
         const trace = activeTrace.lines.join(""); activeTrace = null;
         ops.op_capture_trace_archive(trace, options.path == null ? "" : String(options.path));

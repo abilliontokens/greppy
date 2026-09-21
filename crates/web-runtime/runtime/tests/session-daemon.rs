@@ -7860,8 +7860,52 @@ throw new Error("intentional trace fixture failure");"#;
     assert_eq!(failed.error.as_ref().unwrap().code, "controller_exception");
     assert_eq!(failed.artifacts.len(), 2, "stopped and active traces must survive script failure: {failed:?}");
     assert!(failed.artifacts.iter().any(|artifact| artifact["requested_path"] == "failed-trace.zip"));
+
+    let async_source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start();
+const pending = page.evaluate(() => new Promise(resolve => setTimeout(() => resolve(7), 25)));
+await context.tracing.stop({ path: "recorder-a.zip" });
+await context.tracing.start(); await pending;
+await context.tracing.stop({ path: "recorder-b.zip" }); await browser.close();"#;
+    let async_response = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.run",
+            json!({"session_id":session_id,"script_text":async_source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(async_response.status, "ok", "{async_response:?}");
+    let second_id = async_response
+        .artifacts
+        .iter()
+        .find(|artifact| artifact["requested_path"] == "recorder-b.zip")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let second_path = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace",
+            "web.artifact.path",
+            json!({"session_id":session_id,"id":second_id}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let second_bytes =
+        std::fs::read(second_path.result.unwrap()["path"].as_str().unwrap()).unwrap();
+    let second_text = String::from_utf8_lossy(&second_bytes);
+    assert!(
+        !second_text.contains("\"type\":\"after\""),
+        "recorder A completion leaked into recorder B: {second_text}"
+    );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn playwright_trace_overflow_preserves_completed_mutation() {
     const LIMIT_ENV: &str = "GREPPY_TEST_TRACE_LIMIT_BYTES";
@@ -7893,7 +7937,9 @@ const browser = await chromium.launch(); const context = await browser.newContex
 const page = await context.newPage(); await context.tracing.start();
 await page.evaluate(() => { globalThis.traceMutationCount = (globalThis.traceMutationCount || 0) + 1; });
 console.log("mutation-count=" + await page.evaluate(() => globalThis.traceMutationCount));
-await context.tracing.stop(); await browser.close();"#;
+try { await context.tracing.stop({ path: "truncated.zip" }); }
+catch (error) { console.log("stop-error=" + error.message); }
+await browser.close();"#;
     let response = unix_request(
         &socket,
         &Request::new(
@@ -7913,10 +7959,14 @@ await context.tracing.stop(); await browser.close();"#;
         stdout.contains("trace recording stopped after exceeding"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("stop-error=trace recording was truncated"),
+        "{stdout}"
+    );
     assert!(response.artifacts.is_empty(), "truncated trace must not be archived: {response:?}");
 }
 
-fn playwright_stopped_trace_survives_classified_failure(message: &str, code: &str) {
+fn playwright_stopped_trace_survives_synthetic_classified_failure(message: &str, code: &str) {
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-trace-failure-{}-{code}.sock",
         std::process::id()
@@ -7967,16 +8017,16 @@ throw new Error({message:?});"#
 }
 
 #[test]
-fn playwright_stopped_trace_survives_timeout_classification() {
-    playwright_stopped_trace_survives_classified_failure(
+fn playwright_stopped_trace_survives_synthetic_timeout_classification() {
+    playwright_stopped_trace_survives_synthetic_classified_failure(
         "timed out after stopped trace fixture",
         "timeout",
     );
 }
 
 #[test]
-fn playwright_stopped_trace_survives_cancel_classification() {
-    playwright_stopped_trace_survives_classified_failure(
+fn playwright_stopped_trace_survives_synthetic_cancel_classification() {
+    playwright_stopped_trace_survives_synthetic_classified_failure(
         "cancelled after stopped trace fixture",
         "cancelled",
     );

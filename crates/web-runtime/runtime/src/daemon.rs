@@ -1793,11 +1793,14 @@ impl Daemon {
                     .get("stdout")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                let (trace_artifacts, trace_exports) =
-                    match self.store_trace_archives(request, &session_id, &result) {
-                        Ok(stored) => stored,
-                        Err(response) => return response,
-                    };
+                let stored = self.store_trace_archives(request, &session_id, &result);
+                if let Some(warning) = stored.warning {
+                    let mut response = engine_error(request, warning, 39);
+                    response.artifacts = stored.artifacts;
+                    return response;
+                }
+                let trace_artifacts = stored.artifacts;
+                let trace_exports = stored.exports;
                 let mut response = Response::ok(
                     request,
                     serde_json::json!({
@@ -1818,16 +1821,13 @@ impl Daemon {
                 response
             }
             Err(error) => {
-                let failure_trace_artifacts = error
+                let failure_trace_storage = error
                     .get_ref()
                     .and_then(|source| source.downcast_ref::<crate::supervisor::ScriptFailure>())
                     .map(|failure| self.store_trace_archives(request, &session_id, &failure.result))
-                    .transpose();
-                let failure_trace_artifacts = match failure_trace_artifacts {
-                    Ok(Some((artifacts, _))) => artifacts,
-                    Ok(None) => Vec::new(),
-                    Err(response) => return response,
-                };
+                    .unwrap_or_else(StoredTraceArchives::empty);
+                let failure_trace_artifacts = failure_trace_storage.artifacts;
+                let failure_trace_warning = failure_trace_storage.warning;
                 let message = error.to_string();
                 if message.contains("cancelled") {
                     let pair = (session_id.clone(), operation_id.clone());
@@ -1878,6 +1878,7 @@ impl Daemon {
                                 object.session_id = Some(session_id.clone());
                                 let mut response = Response::error(request, object);
                                 response.artifacts = failure_trace_artifacts;
+                                append_optional_warning(&mut response, failure_trace_warning.as_deref());
                                 return response;
                             }
                         }
@@ -1894,6 +1895,7 @@ impl Daemon {
                         object.session_id = Some(session_id.clone());
                         let mut response = Response::error(request, object);
                         response.artifacts = failure_trace_artifacts;
+                        append_optional_warning(&mut response, failure_trace_warning.as_deref());
                         return response;
                     }
                     self.journal(
@@ -1922,6 +1924,7 @@ impl Daemon {
                     object.session_id = Some(session_id.clone());
                     let mut response = Response::error(request, object);
                     response.artifacts = failure_trace_artifacts;
+                    append_optional_warning(&mut response, failure_trace_warning.as_deref());
                     return response;
                 }
                 if error.kind() == io::ErrorKind::TimedOut || message.contains("timed out") {
@@ -1943,6 +1946,7 @@ impl Daemon {
                     object.session_id = Some(session_id.clone());
                     let mut response = Response::error(request, object);
                     response.artifacts = failure_trace_artifacts;
+                    append_optional_warning(&mut response, failure_trace_warning.as_deref());
                     let timeout_manifest = format!(
                         "{{\"partial\":true,\"reason\":\"timeout\",\"session_id\":\"{session_id}\"}}"
                     );
@@ -1968,6 +1972,7 @@ impl Daemon {
                 if let Some(limit) = message.strip_prefix("resource_limit: ") {
                     let mut response = limit_error(request, limit);
                     response.artifacts = failure_trace_artifacts;
+                    append_optional_warning(&mut response, failure_trace_warning.as_deref());
                     if let Some(error) = response.error.as_mut() {
                         error.session_id = Some(session_id);
                     }
@@ -1996,6 +2001,7 @@ impl Daemon {
                 // assignment.
                 let mut response = Response::error(request, object);
                 response.artifacts = failure_trace_artifacts;
+                append_optional_warning(&mut response, failure_trace_warning.as_deref());
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
@@ -4070,28 +4076,39 @@ impl Daemon {
         request: &Request,
         session_id: &str,
         result: &serde_json::Value,
-    ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), Response> {
+    ) -> StoredTraceArchives {
         let mut artifacts = Vec::new();
         let mut exports = Vec::new();
         let Some(archives) = result
             .get("trace_archives")
             .and_then(|value| value.as_array())
         else {
-            return Ok((artifacts, exports));
+            return StoredTraceArchives { artifacts, exports, warning: None };
         };
         for archive in archives {
             let Some(encoded) = archive.get("encoded").and_then(|value| value.as_str()) else {
                 continue;
             };
-            let bytes = decode_base64(encoded).map_err(|error| engine_error(request, error, 39))?;
-            let manifest = self.store_bytes(
+            let bytes = match decode_base64(encoded) {
+                Ok(bytes) => bytes,
+                Err(error) => return StoredTraceArchives::failed(artifacts, exports, error),
+            };
+            let manifest = match self.store_bytes(
                 request,
                 session_id,
                 &bytes,
                 "application/zip",
                 "web.run.trace",
                 true,
-            )?;
+            ) {
+                Ok(manifest) => manifest,
+                Err(response) => {
+                    let warning = response.error
+                        .map(|error| error.message.to_string())
+                        .unwrap_or_else(|| "trace archive storage failed".into());
+                    return StoredTraceArchives::failed(artifacts, exports, warning);
+                }
+            };
             let digest = manifest.digest.hex;
             let requested_path = archive
                 .get("requested_path")
@@ -4102,7 +4119,7 @@ impl Daemon {
             }
             artifacts.push(json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true,"requested_path":requested_path}));
         }
-        Ok((artifacts, exports))
+        StoredTraceArchives { artifacts, exports, warning: None }
     }
 
     fn web_trace_start(&mut self, request: &Request) -> Response {
@@ -4724,14 +4741,50 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 
 fn append_nonfatal_warning(response: &mut Response, message: &str) {
     let warning: String = message.chars().take(256).collect();
-    let Some(result) = response.result.as_mut().and_then(|value| value.as_object_mut()) else {
-        return;
-    };
+    let result = response
+        .result
+        .get_or_insert_with(|| json!({}))
+        .as_object_mut();
+    let Some(result) = result else { return };
     let warnings = result
         .entry("warnings")
         .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     if let Some(warnings) = warnings.as_array_mut() {
         warnings.push(json!(warning));
+    }
+}
+
+fn append_optional_warning(response: &mut Response, warning: Option<&str>) {
+    if let Some(warning) = warning {
+        append_nonfatal_warning(response, warning);
+    }
+}
+
+struct StoredTraceArchives {
+    artifacts: Vec<serde_json::Value>,
+    exports: Vec<serde_json::Value>,
+    warning: Option<String>,
+}
+
+impl StoredTraceArchives {
+    fn empty() -> Self {
+        Self {
+            artifacts: Vec::new(),
+            exports: Vec::new(),
+            warning: None,
+        }
+    }
+
+    fn failed(
+        artifacts: Vec<serde_json::Value>,
+        exports: Vec<serde_json::Value>,
+        warning: impl Into<String>,
+    ) -> Self {
+        Self {
+            artifacts,
+            exports,
+            warning: Some(warning.into().chars().take(256).collect()),
+        }
     }
 }
 
