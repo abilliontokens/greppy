@@ -715,6 +715,41 @@ fn serve_fixture(html: &'static str) -> String {
     format!("http://{address}/")
 }
 
+struct ResetServer {
+    url: String,
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ResetServer {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn spawn_reset_server() -> ResetServer {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
+    listener.set_nonblocking(true).expect("nonblocking failure port");
+    let url = format!("http://{}/transport-failure", listener.local_addr().unwrap());
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || loop {
+        if stopped.try_recv().is_ok() {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => drop(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    });
+    ResetServer { url, stop, worker: Some(worker) }
+}
+
 fn serve_status_fixture() -> String {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3244,18 +3279,12 @@ fn network_query_filters_real_http_and_https_responses() {
 
 #[test]
 fn native_transport_failure_is_typed_without_classifying_page_words() {
-    let failed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failure port");
-    let failed_url = format!("http://{}/transport-failure", failed_listener.local_addr().unwrap());
-    thread::spawn(move || {
-        for _ in 0..4 {
-            if let Ok((stream, _)) = failed_listener.accept() {
-                drop(stream);
-            }
-        }
-    });
-    let legitimate = serve_fixture(&format!(
+    let failed = spawn_reset_server();
+    let failed_url = failed.url.clone();
+    let legitimate_html = Box::leak(format!(
         "<!doctype html><title>Error loading page</title><body><p>Could not load the requested page: documentation example</p><a id='broken' href='{failed_url}'>Broken transport</a></body>"
-    ));
+    ).into_boxed_str());
+    let legitimate = serve_fixture(legitimate_html);
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-navigation-failure-{}.sock",
         std::process::id()
@@ -3299,6 +3328,59 @@ fn native_transport_failure_is_typed_without_classifying_page_words() {
     let navigation = call("web.goto", json!({ "session_id": failed_id, "url": failed_url.clone() }));
     assert_eq!(navigation.status, "error", "transport navigation must fail: {navigation:?}");
     assert_eq!(navigation.error.as_ref().unwrap().code, "engine_error");
+}
+
+#[test]
+fn click_navigation_wait_handles_redirect_reload_and_delayed_javascript() {
+    let destination = serve_status_fixture();
+    let redirect_page = serve_fixture(Box::leak(format!(
+        "<!doctype html><a id='go' href='{destination}jump'>Redirect</a>"
+    ).into_boxed_str()));
+    let same_page = serve_fixture(Box::leak(
+        "<!doctype html><a id='same' href='/'>Same URL</a>".to_owned().into_boxed_str(),
+    ));
+    let delayed_page = serve_fixture(Box::leak(format!(
+        "<!doctype html><button id='later' onclick=\"setTimeout(() => location.href='{destination}landed', 50)\">Later</button>"
+    ).into_boxed_str()));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-click-navigation-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_click_navigation", |command| {
+        command.arg("--fixture-url").arg(&redirect_page);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_click_navigation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("click navigation request")
+    };
+    let click_from = |url: &str, selector: &str| {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"].as_str().unwrap();
+        let opened = call("web.goto", json!({"session_id":session,"url":url}));
+        assert_eq!(opened.status, "ok", "open click source: {opened:?}");
+        call("web.click", json!({
+            "session_id": session,
+            "selector": {"type":"css","value":selector},
+            "timeout": 5_000,
+        }))
+    };
+
+    let redirected = click_from(&redirect_page, "#go");
+    assert_eq!(redirected.status, "ok", "redirect chain: {redirected:?}");
+    assert!(redirected.result.as_ref().unwrap()["page_state"]["snapshot"]["url"]
+        .as_str().is_some_and(|url| url.ends_with("/landed")), "{redirected:?}");
+
+    let reloaded = click_from(&same_page, "#same");
+    assert_eq!(reloaded.status, "ok", "same URL navigation: {reloaded:?}");
+
+    let delayed = click_from(&delayed_page, "#later");
+    assert_eq!(delayed.status, "ok", "delayed JavaScript navigation: {delayed:?}");
 }
 
 #[test]

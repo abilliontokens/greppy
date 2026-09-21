@@ -2313,12 +2313,9 @@ impl ContentEngine {
                     .url()
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| url.to_string());
+                let current_request = delegate.current_main_frame_request.borrow().clone();
                 let recorded = delegate.last_responses.borrow();
-                let matched = recorded.iter().rev().find(|row| {
-                    row.get("url")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|recorded_url| recorded_url == final_url)
-                });
+                let matched = response_for_request(&recorded, current_request.as_deref());
                 let http = url.scheme() == "http" || url.scheme() == "https";
                 let recorded_status = matched
                     .and_then(|row| row.get("status"))
@@ -3954,13 +3951,25 @@ impl ContentEngine {
             Ok(_) => "unknown".to_owned(),
         };
         let main_frame_request_after = delegate.current_main_frame_request.borrow().clone();
-        if main_frame_request_after != main_frame_request_before {
-            let expected_request = main_frame_request_after.clone();
+        if let Some(expected_chain) = started_request_chain(
+            main_frame_request_before.as_deref(),
+            main_frame_request_after.as_deref(),
+        ).map(str::to_owned) {
             let remaining = call_timeout(params).saturating_sub(action_started.elapsed());
-            if !self.spin_until_loaded(&webview, remaining, || {
-                delegate.current_main_frame_request.borrow().as_ref() == expected_request.as_ref()
-                    && delegate.document_generation.get() != document_generation_before
-            })? {
+            if !self.spin_until_loaded_until(
+                &webview,
+                remaining,
+                WaitUntil::Load,
+                || {
+                    let failure = delegate.navigation_failure.borrow();
+                    navigation_failure_belongs_to_chain(failure.as_ref(), Some(&expected_chain))
+                },
+                || {
+                    delegate.document_generation.get() != document_generation_before
+                        && delegate.current_main_frame_request.borrow().as_deref()
+                            .is_some_and(|request_id| request_belongs_to_chain(request_id, Some(&expected_chain)))
+                },
+            )? {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "timed out waiting for click navigation",
@@ -4589,6 +4598,41 @@ fn urls_match(current: &Url, expected: &Url) -> bool {
         && current.path().trim_end_matches('/') == expected.path().trim_end_matches('/')
 }
 
+fn request_chain_id(request_id: &str) -> Option<&str> {
+    request_id.split_once(':').map(|(fetch_id, _)| fetch_id)
+}
+
+fn request_belongs_to_chain(request_id: &str, expected_chain: Option<&str>) -> bool {
+    expected_chain.is_some_and(|expected| request_chain_id(request_id) == Some(expected))
+}
+
+fn started_request_chain<'a>(before: Option<&str>, after: Option<&'a str>) -> Option<&'a str> {
+    if after == before {
+        return None;
+    }
+    after.and_then(request_chain_id)
+}
+
+fn navigation_failure_belongs_to_chain(
+    failure: Option<&serde_json::Value>,
+    expected_chain: Option<&str>,
+) -> bool {
+    failure
+        .and_then(|value| value.get("requestId"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|request_id| request_belongs_to_chain(request_id, expected_chain))
+}
+
+fn response_for_request<'a>(
+    responses: &'a [serde_json::Value],
+    request_id: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    let request_id = request_id?;
+    responses.iter().rev().find(|row| {
+        row.get("requestId").and_then(serde_json::Value::as_str) == Some(request_id)
+    })
+}
+
 fn required_str(params: &serde_json::Value, key: &str) -> io::Result<String> {
     params
         .get(key)
@@ -4721,6 +4765,51 @@ fn serialize_jsvalue(value: JSValue) -> io::Result<serde_json::Value> {
 mod serialize_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn click_navigation_identity_follows_redirects_without_crossing_fetches() {
+        assert_eq!(request_chain_id("fetch-a:0"), Some("fetch-a"));
+        assert!(request_belongs_to_chain("fetch-a:1", Some("fetch-a")));
+        assert!(request_belongs_to_chain("fetch-a:7", Some("fetch-a")));
+        assert!(!request_belongs_to_chain("fetch-b:0", Some("fetch-a")));
+        assert!(!request_belongs_to_chain("malformed", Some("fetch-a")));
+        assert!(!request_belongs_to_chain("fetch-a:1", None));
+
+        // Same-URL reloads are still a new navigation because request
+        // identity, rather than URL text, changes.
+        assert_eq!(
+            started_request_chain(Some("fetch-old:0"), Some("fetch-reload:0")),
+            Some("fetch-reload")
+        );
+        // A JavaScript-delayed navigation that has not started when the click
+        // returns does not consume the click's finite deadline speculatively;
+        // its later native request/failure remains available to observation.
+        assert_eq!(
+            started_request_chain(Some("fetch-old:0"), Some("fetch-old:0")),
+            None
+        );
+
+        let aborted = json!({
+            "requestId": "fetch-a:2",
+            "url": "http://example.test/end",
+            "errorText": "net::ERR_FAILED",
+        });
+        assert!(navigation_failure_belongs_to_chain(Some(&aborted), Some("fetch-a")),
+            "terminal failure must settle an aborted navigation without a document commit");
+        assert!(!navigation_failure_belongs_to_chain(Some(&aborted), Some("fetch-b")));
+    }
+
+    #[test]
+    fn current_request_identity_beats_stale_same_url_response() {
+        let responses = vec![
+            json!({"requestId":"old:0","url":"http://example.test/same","failure":{"errorText":"stale"}}),
+            json!({"requestId":"current:0","url":"http://example.test/same","status":200}),
+        ];
+        let current = response_for_request(&responses, Some("current:0")).unwrap();
+        assert_eq!(current["status"], 200);
+        assert!(current.get("failure").is_none());
+        assert!(response_for_request(&responses, Some("missing:0")).is_none());
+    }
 
     #[test]
     fn terminal_response_merge_is_order_independent_and_keeps_failure_details() {
