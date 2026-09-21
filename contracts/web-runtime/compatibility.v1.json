@@ -11855,12 +11855,12 @@
       "symbol": "Tracing.start",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "implemented",
-      "behavior": "implemented",
-      "tests": ["native-trace-v10"],
+      "schema": "unverified",
+      "source": "unverified",
+      "behavior": "unverified",
+      "tests": [],
       "known_differences": [
-        "Playwright trace schema v10 action recording is supported. screenshots, snapshots and sources options fail explicitly."
+        "Action-only schema v10 recording is under validation. screenshots, snapshots and sources options fail explicitly."
       ]
     },
     {
@@ -11895,12 +11895,12 @@
       "symbol": "Tracing.stop",
       "kind": "method",
       "origin": "parser",
-      "schema": "implemented",
-      "source": "implemented",
-      "behavior": "implemented",
-      "tests": ["native-trace-v10"],
+      "schema": "unverified",
+      "source": "unverified",
+      "behavior": "unverified",
+      "tests": [],
       "known_differences": [
-        "Writes a Playwright trace schema v10 archive containing trace.trace and trace.network."
+        "Daemon artifact export is under validation. stop({path}) remains unsupported."
       ]
     },
     {
@@ -15603,12 +15603,12 @@
       "symbol": "BrowserContext.tracing",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "implemented",
-      "source": "implemented",
-      "behavior": "implemented",
-      "tests": ["native-trace-v10"],
+      "schema": "unverified",
+      "source": "unverified",
+      "behavior": "unverified",
+      "tests": [],
       "known_differences": [
-        "Action recording uses Playwright trace schema v10; snapshots, screenshots, sources, chunks and groups remain unsupported and fail explicitly."
+        "Action-only recording returns a sensitive web.run artifact; stop({path}), snapshots, screenshots, sources, chunks and groups remain unsupported."
       ]
     },
     {

@@ -7807,6 +7807,31 @@ fn fail_closed_clock_coverage_request_and_handles() {
 }
 
 #[test]
+fn playwright_trace_is_context_isolated_and_daemon_stored() {
+    let socket = std::env::temp_dir().join(format!("greppy-web-trace-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(&socket, &Request::new("run_trace", "web.session.create", json!({"profile":"project"})), Duration::from_secs(10)).unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"].as_str().unwrap().to_owned();
+    let source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch();
+const first = await browser.newContext(); const second = await browser.newContext();
+const firstPage = await first.newPage(); const secondPage = await second.newPage();
+await first.tracing.start(); await secondPage.content(); await firstPage.title(); await first.tracing.stop();
+await browser.close();"#;
+    let response = unix_request(&socket, &Request::new("run_trace", "web.run", json!({"session_id":session_id,"script_text":source})), Duration::from_secs(40)).unwrap();
+    assert_eq!(response.status, "ok", "{response:?}");
+    assert_eq!(response.artifacts.len(), 1, "{response:?}");
+    let id = response.artifacts[0]["id"].as_str().unwrap();
+    let path = unix_request(&socket, &Request::new("run_trace", "web.artifact.path", json!({"session_id":session_id,"id":id})), Duration::from_secs(10)).unwrap();
+    let bytes = std::fs::read(path.result.unwrap()["path"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("page.title"), "{text}");
+    assert!(!text.contains("page.content"), "{text}");
+}
+
+#[test]
 fn locator_strict_mode_rejects_ambiguous_click() {
     run_named_fixture("strict-mode.mjs", "run_strict");
 }

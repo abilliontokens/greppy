@@ -30,6 +30,7 @@ struct EngineBridge {
     next_id: Arc<AtomicU64>,
     stdout: Arc<Mutex<File>>,
     script_stdout: Arc<Mutex<Vec<String>>>,
+    trace_archives: Arc<Mutex<Vec<String>>>,
     pending: Arc<
         Mutex<
             HashMap<
@@ -312,20 +313,27 @@ fn op_read_temp_png(#[string] path: String) -> Result<String, JsErrorBox> {
 }
 
 #[op2]
-fn op_write_trace_archive(#[string] path: String, #[string] trace: String) -> Result<(), JsErrorBox> {
+#[string]
+fn op_capture_trace_archive(
+    state: Rc<RefCell<OpState>>,
+    #[string] trace: String,
+) -> Result<String, JsErrorBox> {
     let archive = crate::playwright_trace::archive_jsonl(trace.as_bytes(), b"")
         .map_err(|error| JsErrorBox::generic(error))?;
-    let destination = PathBuf::from(path);
-    if destination.as_os_str().is_empty() { return Err(JsErrorBox::generic("Tracing.stop requires a non-empty path")); }
-    if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) { std::fs::create_dir_all(parent).map_err(|e| JsErrorBox::generic(e.to_string()))?; }
-    let temporary = destination.with_extension("greppy-trace-tmp");
-    std::fs::write(&temporary, archive).map_err(|e| JsErrorBox::generic(e.to_string()))?;
-    std::fs::rename(&temporary, &destination).map_err(|e| { let _=std::fs::remove_file(&temporary); JsErrorBox::generic(e.to_string()) })
+    let encoded = base64_encode_png(&archive);
+    let state = state.borrow();
+    state
+        .borrow::<EngineBridge>()
+        .trace_archives
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(encoded);
+    Ok("captured".to_owned())
 }
 
 extension!(
     greppy_playwright,
-    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png, op_write_trace_archive],
+    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png, op_capture_trace_archive],
     options = { bridge: EngineBridge },
     state = |state, options| {
         state.put(options.bridge);
@@ -351,10 +359,12 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
     let stdout = Arc::new(Mutex::new(protocol_out));
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let script_stdout = Arc::new(Mutex::new(Vec::new()));
+    let trace_archives = Arc::new(Mutex::new(Vec::new()));
     let bridge = EngineBridge {
         next_id: Arc::new(AtomicU64::new(1)),
         stdout: Arc::clone(&stdout),
         script_stdout: Arc::clone(&script_stdout),
+        trace_archives: Arc::clone(&trace_archives),
         pending: Arc::clone(&pending),
     };
     let mut runtime = new_js_runtime(bridge.clone(), None);
@@ -462,6 +472,11 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .clear();
+                bridge
+                    .trace_archives
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clear();
                 let result = run_script(
                     &tokio_runtime,
                     &mut runtime,
@@ -474,7 +489,13 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .join("\n");
-                let payload = serde_json::json!({ "stdout": captured });
+                let trace_archives = std::mem::take(
+                    &mut *bridge
+                        .trace_archives
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                );
+                let payload = serde_json::json!({ "stdout": captured, "trace_archives": trace_archives });
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
                 match result {
                     Ok(()) => write_message(

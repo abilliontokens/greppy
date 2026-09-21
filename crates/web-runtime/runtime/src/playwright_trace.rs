@@ -39,20 +39,14 @@ impl TraceRecorder {
         Ok(recorder)
     }
 
-    pub fn record(
-        &mut self,
-        operation: &str,
-        params: &Value,
-        result: &Value,
-        error: Option<&str>,
-    ) -> Result<(), String> {
+    pub fn record(&mut self, operation: &str, start_time: u64, failed: bool) -> Result<(), String> {
         let call_id = format!("call@{}", self.next_call);
         self.next_call += 1;
-        let now = wall_time_ms();
-        self.append(json!({"type":"before","callId":call_id,"startTime":now,"apiName":operation,"class":"Greppy","method":operation,"params":redact(params),"wallTime":now}))?;
-        let mut after = json!({"type":"after","callId":call_id,"endTime":wall_time_ms(),"result":redact(result)});
-        if let Some(message) = error {
-            after["error"] = json!({"message": message});
+        self.append(json!({"type":"before","callId":call_id,"startTime":start_time,"apiName":operation,"class":"Greppy","method":operation,"params":{},"wallTime":start_time}))?;
+        let mut after =
+            json!({"type":"after","callId":call_id,"endTime":wall_time_ms(),"result":{}});
+        if failed {
+            after["error"] = json!({"message": "action failed"});
         }
         self.append(after)
     }
@@ -89,28 +83,8 @@ fn wall_time_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-
-fn redact(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(k, v)| {
-                    let lower = k.to_ascii_lowercase();
-                    let value = if ["authorization", "cookie", "password", "token", "secret"]
-                        .iter()
-                        .any(|s| lower.contains(s))
-                    {
-                        json!("<redacted>")
-                    } else {
-                        redact(v)
-                    };
-                    (k.clone(), value)
-                })
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(values.iter().map(redact).collect()),
-        other => other.clone(),
-    }
+pub fn trace_time_ms() -> u64 {
+    wall_time_ms()
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -176,18 +150,44 @@ pub fn archive_jsonl(trace: &[u8], network: &[u8]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     #[test]
-    fn archive_has_v10_entries_and_redacts_secrets() {
+    fn archive_has_v10_entries_without_sensitive_action_data() {
         let mut r = TraceRecorder::new().unwrap();
-        r.record(
-            "page.goto",
-            &json!({"authorization":"Bearer x"}),
-            &json!({}),
-            None,
-        )
-        .unwrap();
+        r.record("page.goto", trace_time_ms(), false).unwrap();
         let z = r.finish();
         assert!(z.windows(11).any(|w| w == b"trace.trace"));
         assert!(z.windows(13).any(|w| w == b"trace.network"));
-        assert!(!z.windows(8).any(|w| w == b"Bearer x"));
+        assert!(!z.windows(13).any(|w| w == b"authorization"));
+    }
+
+    #[test]
+    fn records_real_start_and_generic_failure_without_payload() {
+        let mut recorder = TraceRecorder::new().unwrap();
+        recorder.record("locator.fill", 1234, true).unwrap();
+        let archive = recorder.finish();
+        let text = String::from_utf8_lossy(&archive);
+        assert!(text.contains("\"startTime\":1234"));
+        assert!(text.contains("action failed"));
+        assert!(!text.contains("password"));
+    }
+
+    #[test]
+    fn recorders_are_isolated() {
+        let mut first = TraceRecorder::new().unwrap();
+        let mut second = TraceRecorder::new().unwrap();
+        first.record("page.goto", 1, false).unwrap();
+        second.record("locator.click", 2, false).unwrap();
+        let first = String::from_utf8_lossy(&first.finish()).into_owned();
+        let second = String::from_utf8_lossy(&second.finish()).into_owned();
+        assert!(first.contains("page.goto") && !first.contains("locator.click"));
+        assert!(second.contains("locator.click") && !second.contains("page.goto"));
+    }
+
+    #[test]
+    fn live_recording_limit_fails_before_growth() {
+        let mut recorder = TraceRecorder::new().unwrap();
+        let oversized = "x".repeat(MAX_RECORDING_BYTES);
+        let error = recorder.append(json!({"oversized":oversized})).unwrap_err();
+        assert!(error.contains("8 MiB"));
+        assert!(recorder.trace.len() < MAX_RECORDING_BYTES);
     }
 }

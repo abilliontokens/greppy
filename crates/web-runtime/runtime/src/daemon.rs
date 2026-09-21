@@ -903,6 +903,11 @@ impl Daemon {
             .flatten()
             .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()));
         let limit_request = request.clone();
+        let trace_started = session_id
+            .as_deref()
+            .and_then(|id| self.sessions.get(id))
+            .and_then(|session| session.trace.as_ref())
+            .map(|_| crate::playwright_trace::trace_time_ms());
         let mut response = self.dispatch_operation(request);
         if response.metrics.wall_ms == 0 {
             response.metrics.wall_ms = dispatch_started.elapsed().as_millis() as u64;
@@ -993,10 +998,11 @@ impl Daemon {
         }
         if !matches!(limit_request.operation.as_str(), "web.trace.start" | "web.trace.stop") {
             if let Some(session_id) = session_id.as_deref() {
-                let trace_error = if let Some(trace) = self.sessions.get_mut(session_id).and_then(|s| s.trace.as_mut()) {
-                    let result = response.result.as_ref().unwrap_or(&serde_json::Value::Null);
-                    let error = response.error.as_ref().map(|e| e.message.as_ref());
-                    trace.record(&limit_request.operation, &limit_request.payload, result, error).err()
+                let trace_error = if let (Some(trace), Some(started)) = (
+                    self.sessions.get_mut(session_id).and_then(|s| s.trace.as_mut()),
+                    trace_started,
+                ) {
+                    trace.record(&limit_request.operation, started, response.status != "ok").err()
                 } else { None };
                 if let Some(message) = trace_error {
                     if response.status == "ok" { response = limit_error(&limit_request, message); }
@@ -1784,6 +1790,27 @@ impl Daemon {
                     .get("stdout")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
+                let mut trace_artifacts = Vec::new();
+                if let Some(archives) = result
+                    .get("trace_archives")
+                    .and_then(|value| value.as_array())
+                {
+                    for encoded in archives {
+                        let Some(encoded) = encoded.as_str() else { continue };
+                        let bytes = match decode_base64(encoded) {
+                            Ok(bytes) => bytes,
+                            Err(error) => return engine_error(request, error, 39),
+                        };
+                        let manifest = match self.store_bytes(
+                            request, &session_id, &bytes, "application/zip", "web.run.trace", true,
+                        ) {
+                            Ok(manifest) => manifest,
+                            Err(response) => return response,
+                        };
+                        let digest = manifest.digest.hex;
+                        trace_artifacts.push(json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true}));
+                    }
+                }
                 let mut response = Response::ok(
                     request,
                     serde_json::json!({
@@ -1792,6 +1819,7 @@ impl Daemon {
                         "stdout": stdout,
                     }),
                 );
+                response.artifacts = trace_artifacts;
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
