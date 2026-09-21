@@ -407,6 +407,18 @@ pub(crate) fn split_path_qualified(query: &str) -> Option<(&str, &str)> {
     looks_like_path.then(|| (head, &query[idx + 2..]))
 }
 
+/// Definition labels that a lossless qualified spelling may address directly.
+///
+/// Variable and Field are real value definitions with readable source spans,
+/// but they intentionally remain outside is_primary_label: bare navigation
+/// aggregates callable/type definitions and must not suddenly collect every
+/// same-named value. Exact qualified names and file-qualified queries are
+/// already narrowed, so accepting these two resolver definition labels there
+/// preserves emitted forms without broadening bare or owner/member resolution.
+fn is_addressable_definition_label(label: &str) -> bool {
+    is_primary_label(label) || matches!(label, "Variable" | "Field")
+}
+
 pub(crate) fn resolve_symbol_nodes(
     store: &greppy_store::Store,
     symbol: Option<&str>,
@@ -428,7 +440,7 @@ pub(crate) fn resolve_symbol_nodes(
                 .with_limit(10_000),
         )?
         .into_iter()
-        .filter(|row| is_primary_label(&row.label))
+        .filter(|row| is_addressable_definition_label(&row.label))
         .map(|row| row.id)
         .collect::<Vec<_>>();
         exact.sort_unstable();
@@ -460,7 +472,7 @@ pub(crate) fn resolve_symbol_nodes(
             .iter()
             .filter(|r| {
                 r.name.eq_ignore_ascii_case(name)
-                    && is_primary_label(&r.label)
+                    && is_addressable_definition_label(&r.label)
                     && indexed_path_matches_query(&r.file_path, path)
             })
             .collect();

@@ -2337,6 +2337,58 @@ fn bare_name_query_is_unchanged_and_aggregates() {
     assert_eq!(split_qualified("get"), None);
 }
 
+#[test]
+fn path_qualified_value_definitions_are_addressable_without_broadening_bare_aggregation() {
+    let store = store_with_defs(&[
+        (
+            "Variable",
+            "src/core/gateway.rs",
+            "Variable",
+            "EMAIL_RUNTIME_ENV_KEYS",
+        ),
+        ("Field", "src/model.rs", "Config", "email"),
+        ("Method", "src/service.rs", "Service", "email"),
+    ]);
+    let variable = id_of(
+        &store,
+        "src/core/gateway.rs",
+        "Variable",
+        "EMAIL_RUNTIME_ENV_KEYS",
+    );
+    let field = id_of(&store, "src/model.rs", "Config", "email");
+
+    assert_eq!(
+        resolve_symbol_nodes(
+            &store,
+            Some("src/core/gateway.rs::Variable::EMAIL_RUNTIME_ENV_KEYS")
+        )
+        .unwrap(),
+        vec![variable]
+    );
+    assert_eq!(
+        resolve_symbol_nodes(&store, Some("src/core/gateway.rs::EMAIL_RUNTIME_ENV_KEYS")).unwrap(),
+        vec![variable]
+    );
+    assert_eq!(
+        resolve_symbol_nodes(&store, Some("src/model.rs::Config::email")).unwrap(),
+        vec![field]
+    );
+    assert_eq!(
+        resolve_symbol_nodes(&store, Some("src/model.rs::Field::email")).unwrap(),
+        vec![field]
+    );
+    assert!(
+        resolve_symbol_nodes(&store, Some("missing/model.rs::email"))
+            .unwrap()
+            .is_empty(),
+        "a missing path must not fall back to a same-named definition"
+    );
+
+    let bare = resolve_symbol_nodes(&store, Some("email")).unwrap();
+    assert_eq!(bare.len(), 1, "bare aggregation remains primary-only");
+    assert_ne!(bare[0], field);
+}
+
 /// Seed a provider_state row so the completeness helpers have data.
 fn seed_provider(
     store: &mut greppy_store::Store,

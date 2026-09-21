@@ -252,6 +252,45 @@ fn read_applies_path_filters_before_ambiguity_resolution() {
 }
 
 #[test]
+fn read_accepts_emitted_and_simplified_path_qualified_rust_variables() {
+    let (repo, store) = fresh_workspace("path-variable");
+    std::fs::create_dir_all(repo.join("src/core")).unwrap();
+    std::fs::write(
+        repo.join("src/core/gateway.rs"),
+        "pub const EMAIL_RUNTIME_ENV_KEYS: &[&str] = &[\n    \"CTO_EMAIL_PASSWORD\",\n    \"CTO_EMAIL_USERNAME\",\n];\n",
+    )
+    .unwrap();
+    index(&repo, &store);
+
+    for symbol in [
+        "src/core/gateway.rs::Variable::EMAIL_RUNTIME_ENV_KEYS",
+        "src/core/gateway.rs::EMAIL_RUNTIME_ENV_KEYS",
+    ] {
+        let (code, stdout, stderr) = run(&repo, &store, &["read", symbol]);
+        assert_eq!(code, 0, "symbol={symbol}\nstdout={stdout}\nstderr={stderr}");
+        assert!(
+            stdout.starts_with("src/core/gateway.rs:1-4  EMAIL_RUNTIME_ENV_KEYS\n"),
+            "symbol={symbol}\n{stdout}"
+        );
+        assert!(
+            stdout.contains("CTO_EMAIL_PASSWORD"),
+            "symbol={symbol}\n{stdout}"
+        );
+    }
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read", "missing/gateway.rs::EMAIL_RUNTIME_ENV_KEYS"],
+    );
+    assert_ne!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        !stdout.contains("pub const EMAIL_RUNTIME_ENV_KEYS"),
+        "a missing path must not fall back to the real declaration: {stdout}"
+    );
+}
+
+#[test]
 fn read_file_pages_and_expand_continues_at_the_named_line() {
     let (repo, store) = fresh_workspace("pages");
     let content = (1..=805)
