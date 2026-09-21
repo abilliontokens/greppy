@@ -1656,11 +1656,11 @@ pub(crate) fn observe_background_embedding(
     if owner_active {
         return BackgroundEmbeddingObservation::Pending;
     }
-    if let Some(detail) = job.cloned().and_then(background_embedding_failure) {
-        return BackgroundEmbeddingObservation::Failed(detail);
-    }
     if publication_complete {
         return BackgroundEmbeddingObservation::Published;
+    }
+    if let Some(detail) = job.cloned().and_then(background_embedding_failure) {
+        return BackgroundEmbeddingObservation::Failed(detail);
     }
     if attached_to_index {
         return BackgroundEmbeddingObservation::FollowIndex;

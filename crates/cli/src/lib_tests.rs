@@ -281,6 +281,11 @@ fn semantic_embedding_wait_propagates_failed_owner_after_release() {
         observe_background_embedding(Some(&failed), false, false, false),
         BackgroundEmbeddingObservation::Failed("model execution failed".into())
     );
+    assert_eq!(
+        observe_background_embedding(Some(&failed), false, true, false),
+        BackgroundEmbeddingObservation::Published,
+        "verified publication outranks a stale failed job record"
+    );
 }
 
 #[test]

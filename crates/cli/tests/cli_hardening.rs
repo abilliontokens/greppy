@@ -945,6 +945,40 @@ fn semantic_search_reports_embedding_lifecycle_failure_without_partial_hits() {
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index failed; stdout={out} stderr={err}");
 
+    let db = find_graph_db(&store).expect("active graph after structural index");
+    let graph = rusqlite::Connection::open(&db).expect("open graph for partial vector fixture");
+    let generation = graph
+        .query_row(
+            "SELECT graph_generation FROM workspace_state LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let mut vector = Vec::new();
+    vector.extend_from_slice(&1.0f32.to_le_bytes());
+    vector.extend_from_slice(&0.0f32.to_le_bytes());
+    graph
+        .execute(
+            "INSERT INTO vector_embeddings
+             (project, model_id, prompt_version, task, node_id, chunk_idx,
+              qualified_name, file_path, start_line, end_line, content_sha256,
+              graph_generation, dim, vector_norm, vector, created_at, vector_i8, i8_scale)
+             VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5, 'lib.rs', 1, 1, ?6,
+                     ?7, 2, 1.0, ?8, 'test', NULL, NULL)",
+            rusqlite::params![
+                "repo",
+                "google/embeddinggemma-300m",
+                greppy_embed_native::PROMPT_VERSION,
+                greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE,
+                "repo.partial_semantic_progress_marker",
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                generation,
+                vector,
+            ],
+        )
+        .unwrap();
+    drop(graph);
+
     let (code, out, err) = run(
         &[
             "search",
@@ -965,8 +999,8 @@ fn semantic_search_reports_embedding_lifecycle_failure_without_partial_hits() {
         "failed lifecycle must not emit result JSON: {out}"
     );
     assert!(
-        err.contains("semantic embedding failed"),
-        "genuine lifecycle failure must be reported: {err}"
+        err.contains("exited without publishing generation"),
+        "missing publication must be reported as the exact lifecycle failure: {err}"
     );
     assert!(
         !err.contains("semantic_progress_marker"),
