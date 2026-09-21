@@ -7966,6 +7966,104 @@ await browser.close();"#;
     assert!(response.artifacts.is_empty(), "truncated trace must not be archived: {response:?}");
 }
 
+fn playwright_trace_storage_quota_response(throws: bool) -> greppy_web_client::Response {
+    let socket = std::env::temp_dir().join(format!(
+        "g-w-trace-quota-{}-{}.sock",
+        std::process::id(),
+        u8::from(throws)
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace_quota", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_quota",
+            "web.session.create",
+            json!({
+                "profile":"project",
+                "limits": {"max_artifact_bytes": 1500}
+            }),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ending = if throws {
+        "throw new Error(\"intentional quota fixture failure\");"
+    } else {
+        "console.log(\"mutation-count=\" + await page.evaluate(() => globalThis.traceMutationCount));"
+    };
+    let source = format!(
+        r#"import {{ chromium }} from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage();
+await page.evaluate(() => {{ globalThis.traceMutationCount = (globalThis.traceMutationCount || 0) + 1; }});
+await context.tracing.start(); await page.title();
+await context.tracing.stop({{ path: "retained.zip" }});
+await context.tracing.start();
+for (let i = 0; i < 20; i++) await page.title();
+await context.tracing.stop({{ path: "over-quota.zip" }});
+{ending}"#
+    );
+    unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_quota",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap()
+}
+
+fn assert_partial_trace_quota_result(response: &greppy_web_client::Response) {
+    assert_eq!(response.artifacts.len(), 1, "{response:?}");
+    assert_eq!(response.artifacts[0]["requested_path"], "retained.zip");
+    let warnings = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("warnings"))
+        .and_then(|warnings| warnings.as_array())
+        .expect("bounded trace-storage warning");
+    assert_eq!(warnings.len(), 1, "{response:?}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("artifact byte limit"), "{warning}");
+    assert!(warning.chars().count() <= 256, "{warning}");
+}
+
+#[test]
+fn successful_script_remains_completed_when_trace_storage_hits_quota() {
+    let response = playwright_trace_storage_quota_response(false);
+    assert_eq!(response.status, "ok", "{response:?}");
+    assert_eq!(response.result.as_ref().unwrap()["completed"], true);
+    assert!(
+        response.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("mutation-count=1"),
+        "{response:?}"
+    );
+    assert_partial_trace_quota_result(&response);
+}
+
+#[test]
+fn script_failure_survives_partial_trace_storage_quota_failure() {
+    let response = playwright_trace_storage_quota_response(true);
+    assert_eq!(response.status, "error", "{response:?}");
+    let error = response.error.as_ref().unwrap();
+    assert_eq!(error.code, "controller_exception", "{response:?}");
+    assert!(
+        error.message.contains("intentional quota fixture failure"),
+        "{response:?}"
+    );
+    assert_partial_trace_quota_result(&response);
+}
+
 fn playwright_stopped_trace_survives_synthetic_classified_failure(message: &str, code: &str) {
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-trace-failure-{}-{code}.sock",

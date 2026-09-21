@@ -1794,13 +1794,9 @@ impl Daemon {
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
                 let stored = self.store_trace_archives(request, &session_id, &result);
-                if let Some(warning) = stored.warning {
-                    let mut response = engine_error(request, warning, 39);
-                    response.artifacts = stored.artifacts;
-                    return response;
-                }
                 let trace_artifacts = stored.artifacts;
                 let trace_exports = stored.exports;
+                let trace_warning = stored.warning;
                 let mut response = Response::ok(
                     request,
                     serde_json::json!({
@@ -1811,6 +1807,7 @@ impl Daemon {
                     }),
                 );
                 response.artifacts = trace_artifacts;
+                append_optional_warning(&mut response, trace_warning.as_deref());
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
