@@ -418,29 +418,7 @@ fn export_trace_artifacts(
     session: &str,
     response: &Response,
 ) -> std::result::Result<(), ErrorObject> {
-    let mut exports = response
-        .result
-        .as_ref()
-        .and_then(|value| value.get("trace_exports"))
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    for artifact in &response.artifacts {
-        if let (Some(id), Some(path)) = (
-            artifact.get("id").and_then(|value| value.as_str()),
-            artifact
-                .get("requested_path")
-                .and_then(|value| value.as_str()),
-        ) {
-            if !path.is_empty()
-                && !exports
-                    .iter()
-                    .any(|export| export.get("id").and_then(|value| value.as_str()) == Some(id))
-            {
-                exports.push(json!({"id":id,"path":path}));
-            }
-        }
-    }
+    let exports = trace_exports(response);
     for export in &exports {
         let id = export
             .get("id")
@@ -482,6 +460,33 @@ fn export_trace_artifacts(
         export_regular_file(Path::new(destination), &bytes)?;
     }
     Ok(())
+}
+
+fn trace_exports(response: &Response) -> Vec<serde_json::Value> {
+    let mut exports = response
+        .result
+        .as_ref()
+        .and_then(|value| value.get("trace_exports"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for artifact in &response.artifacts {
+        if let (Some(id), Some(path)) = (
+            artifact.get("id").and_then(|value| value.as_str()),
+            artifact
+                .get("requested_path")
+                .and_then(|value| value.as_str()),
+        ) {
+            let duplicate = exports.iter().any(|export| {
+                export.get("id").and_then(|value| value.as_str()) == Some(id)
+                    && export.get("path").and_then(|value| value.as_str()) == Some(path)
+            });
+            if !path.is_empty() && !duplicate {
+                exports.push(json!({"id":id,"path":path}));
+            }
+        }
+    }
+    exports
 }
 
 fn build_run_payload(
@@ -1821,6 +1826,28 @@ mod target_tests {
         );
         assert_eq!(active["bind_session_page"], true);
         assert!(active.get("script_file").is_none());
+    }
+
+    #[test]
+    fn trace_exports_keep_identical_digest_for_distinct_destinations() {
+        let request = Request::new("run", "web.run", json!({}));
+        let mut response = Response::ok(
+            &request,
+            json!({"trace_exports":[{"id":"same-digest","path":"first.zip"}]}),
+        );
+        response.artifacts.extend([
+            json!({"id":"same-digest","requested_path":"first.zip"}),
+            json!({"id":"same-digest","requested_path":"second.zip"}),
+        ]);
+
+        let exports = trace_exports(&response);
+        assert_eq!(
+            exports.len(),
+            2,
+            "same bytes can have multiple requested destinations"
+        );
+        assert!(exports.iter().any(|value| value["path"] == "first.zip"));
+        assert!(exports.iter().any(|value| value["path"] == "second.zip"));
     }
 
     #[test]
