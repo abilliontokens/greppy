@@ -829,6 +829,7 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
         ENV_BASE_REUSED,
         ENV_FALLBACK_REASON,
         ENV_DISABLE_AUTO_LINKED_WORKTREE,
+        greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES,
     ];
     let restore = names
         .into_iter()
@@ -855,8 +856,22 @@ pub(crate) fn prepare_auto_linked_worktree_overlay(
                     // from a stale Delta binding, rebuild that binding's pinned
                     // commit rather than silently moving it to the primary HEAD.
                     report_base_phase(progress_path, "preparing_base_checkout");
-                    let clean =
-                        TemporaryBaseWorktree::create(&primary, shared_data_root, &base_commit)?;
+                    let clean = TemporaryBaseWorktree::create(&primary, &base_commit)?;
+                    let mut inherited_leases =
+                        std::env::var_os(greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES)
+                            .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+                            .unwrap_or_default();
+                    inherited_leases.push(clean.lease_root().to_path_buf());
+                    let inherited_leases =
+                        std::env::join_paths(inherited_leases).map_err(|error| {
+                            Error::Invalid(format!(
+                                "cannot pass temporary Base checkout lease to index child: {error}"
+                            ))
+                        })?;
+                    std::env::set_var(
+                        greppy_core::cache::ENV_BASE_BUILD_STAGING_LEASES,
+                        inherited_leases,
+                    );
                     prepare_base_store_paths(
                         &primary,
                         clean.path(),
@@ -903,19 +918,33 @@ struct TemporaryBaseWorktree {
 }
 
 impl TemporaryBaseWorktree {
-    fn create(primary: &Path, shared_data_root: &Path, base_commit: &str) -> Result<Self> {
+    fn create(primary: &Path, base_commit: &str) -> Result<Self> {
         #[cfg(debug_assertions)]
         if std::env::var_os(ENV_TEST_FORBID_TEMP_BASE_CHECKOUT).is_some() {
             return Err(Error::Invalid(
                 "test forbids a second temporary Base checkout".into(),
             ));
         }
-        std::fs::create_dir_all(shared_data_root)
-            .map_err(|error| Error::io("create shared Base root", error))?;
+        let scratch_root = temporary_base_checkout_root()?;
+        // A killed Base builder can leave its disposable checkout behind. Keep
+        // the existing lease-aware reclamation after moving these directories
+        // away from the persistent Base Store root.
+        let _ = greppy_core::cache::reap_stale_base_build_dirs(
+            &scratch_root,
+            greppy_core::cache::BASE_BUILD_STAGING_TTL,
+        );
         let parent = tempfile::Builder::new()
             .prefix("greppy-linked-base-checkout-")
-            .tempdir_in(shared_data_root)
-            .map_err(|error| Error::io("create clean Base checkout parent", error))?;
+            .tempdir_in(&scratch_root)
+            .map_err(|error| {
+                Error::io(
+                    format!(
+                        "create clean Base checkout under scratch directory {}",
+                        scratch_root.display()
+                    ),
+                    error,
+                )
+            })?;
         let lease = greppy_core::cache::create_base_build_staging_lease(parent.path())
             .map_err(|error| Error::io("lease clean Base checkout", error))?;
         let path = parent.path().join("worktree");
@@ -944,6 +973,41 @@ impl TemporaryBaseWorktree {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn lease_root(&self) -> &Path {
+        self._parent.path()
+    }
+}
+
+fn temporary_base_checkout_root() -> Result<PathBuf> {
+    // Honor TMPDIR consistently on every platform. Rust's Windows
+    // `temp_dir()` follows GetTempPath and would otherwise ignore an explicit
+    // scratch directory supplied by the caller.
+    let root = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    if !root.is_absolute() {
+        return Err(Error::Invalid(format!(
+            "temporary Base checkout directory must be absolute: {}",
+            root.display()
+        )));
+    }
+    let metadata = std::fs::metadata(&root).map_err(|error| {
+        Error::io(
+            format!(
+                "inspect temporary Base checkout directory {}; set TMPDIR to an existing writable scratch directory",
+                root.display()
+            ),
+            error,
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(Error::Invalid(format!(
+            "temporary Base checkout directory is not a directory: {}; set TMPDIR to an existing writable scratch directory",
+            root.display()
+        )));
+    }
+    Ok(root)
 }
 
 fn base_identity(workspace: &greppy_agent::workspace::AgentWorkspace) -> Result<BaseStoreIdentity> {
@@ -1806,6 +1870,25 @@ fn take_field(fields: &[String], index: &mut usize, status: &str) -> Result<Stri
 mod tests {
     use super::*;
 
+    struct TmpdirRestore(Option<std::ffi::OsString>);
+
+    impl TmpdirRestore {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("TMPDIR");
+            std::env::set_var("TMPDIR", path);
+            Self(previous)
+        }
+    }
+
+    impl Drop for TmpdirRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("TMPDIR", value),
+                None => std::env::remove_var("TMPDIR"),
+            }
+        }
+    }
+
     fn git(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
@@ -1832,6 +1915,58 @@ mod tests {
         git(tmp.path(), &["add", "."]);
         git(tmp.path(), &["commit", "-q", "-m", "base"]);
         tmp
+    }
+
+    #[test]
+    fn temporary_base_checkout_uses_tmpdir_and_cleans_up() {
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch = tempfile::tempdir().unwrap();
+        let _restore = TmpdirRestore::set(scratch.path());
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let checkout = TemporaryBaseWorktree::create(repo.path(), &commit).unwrap();
+        let checkout_parent = checkout._parent.path().to_path_buf();
+        assert_eq!(checkout_parent.parent(), Some(scratch.path()));
+        assert!(checkout.path().join(".git").is_file());
+
+        drop(checkout);
+        assert!(!checkout_parent.exists());
+        assert!(git(repo.path(), &["worktree", "list", "--porcelain"])
+            .lines()
+            .all(|line| !line.contains("greppy-linked-base-checkout-")));
+    }
+
+    #[test]
+    fn temporary_base_checkout_refuses_missing_configured_tmpdir() {
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch_parent = tempfile::tempdir().unwrap();
+        let missing = scratch_parent.path().join("missing-scratch");
+        let _restore = TmpdirRestore::set(&missing);
+        let repo = fixture();
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let error = match TemporaryBaseWorktree::create(repo.path(), &commit) {
+            Ok(_) => panic!("missing TMPDIR unexpectedly accepted"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("temporary Base checkout directory"),
+            "{message}"
+        );
+        assert!(
+            message.contains(missing.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(
+            !missing.exists(),
+            "invalid TMPDIR must not be created or bypassed"
+        );
     }
 
     #[test]
