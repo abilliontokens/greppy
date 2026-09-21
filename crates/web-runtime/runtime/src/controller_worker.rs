@@ -48,8 +48,12 @@ mod trace_tests {
     #[test]
     fn captured_trace_limit_applies_to_aggregate_archives() {
         let mut captured = CapturedTraceArchives::default();
-        captured.push(&vec![0; 3 * 1024 * 1024], "a.zip".into()).unwrap();
-        captured.push(&vec![0; 3 * 1024 * 1024], "b.zip".into()).unwrap();
+        captured
+            .push(&vec![0; 3 * 1024 * 1024], "a.zip".into())
+            .unwrap();
+        captured
+            .push(&vec![0; 3 * 1024 * 1024], "b.zip".into())
+            .unwrap();
         assert!(captured.push(&[0], "c.zip".into()).is_err());
         assert_eq!(captured.encoded_bytes, MAX_CAPTURED_TRACE_BYTES);
         assert_eq!(captured.entries.len(), 2);
@@ -66,7 +70,10 @@ struct CapturedTraceArchives {
 }
 
 #[derive(Clone)]
-struct CapturedTraceArchive { encoded: String, requested_path: String }
+struct CapturedTraceArchive {
+    encoded: String,
+    requested_path: String,
+}
 
 const MAX_CAPTURED_TRACE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -83,7 +90,10 @@ impl CapturedTraceArchives {
             ));
         }
         self.encoded_bytes += encoded_len;
-        self.entries.push(CapturedTraceArchive { encoded: base64_encode_png(archive), requested_path });
+        self.entries.push(CapturedTraceArchive {
+            encoded: base64_encode_png(archive),
+            requested_path,
+        });
         Ok(())
     }
 }
@@ -556,13 +566,13 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                     })
                 })
                 .collect::<Vec<_>>();
-                let payload = serde_json::json!({ "stdout": captured, "trace_archives": trace_archives });
+                let payload =
+                    serde_json::json!({ "stdout": captured, "trace_archives": trace_archives });
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
                 match result {
-                    Ok(()) => write_message(
-                        &mut *stdout,
-                        &Message::script_complete(true, payload, None),
-                    )?,
+                    Ok(()) => {
+                        write_message(&mut *stdout, &Message::script_complete(true, payload, None))?
+                    }
                     Err(error) => write_message(
                         &mut *stdout,
                         &Message::script_complete(false, payload, Some(error)),
