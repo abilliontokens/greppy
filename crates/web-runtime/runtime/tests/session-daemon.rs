@@ -7936,10 +7936,10 @@ fn playwright_trace_overflow_preserves_completed_mutation() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&socket);
-    std::env::set_var(LIMIT_ENV, "512");
-    let _guard = Supervisor::spawn(&socket, "run_trace_overflow", |_| {});
+    let _guard = Supervisor::spawn(&socket, "run_trace_overflow", |command| {
+        command.env(LIMIT_ENV, "512");
+    });
     wait_for_socket(&socket, Duration::from_secs(30));
-    std::env::remove_var(LIMIT_ENV);
     let created = unix_request(
         &socket,
         &Request::new(
@@ -7976,7 +7976,7 @@ await browser.close();"#;
     let stdout = response.result.as_ref().unwrap()["stdout"]
         .as_str()
         .unwrap();
-    assert!(stdout.contains("mutation-count=1"), "{stdout}");
+    assert!(stdout.lines().any(|line| line == "mutation-count=1"), "{stdout}");
     assert!(
         stdout.contains("trace recording stopped after exceeding"),
         "{stdout}"
@@ -8067,7 +8067,8 @@ fn successful_script_remains_completed_when_trace_storage_hits_quota() {
         response.result.as_ref().unwrap()["stdout"]
             .as_str()
             .unwrap()
-            .contains("mutation-count=1"),
+            .lines()
+            .any(|line| line == "mutation-count=1"),
         "{response:?}"
     );
     assert_partial_trace_quota_result(&response);

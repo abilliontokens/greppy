@@ -1830,7 +1830,7 @@ mod target_tests {
 
     #[test]
     fn trace_exports_keep_identical_digest_for_distinct_destinations() {
-        let request = Request::new("run", "web.run", json!({}));
+        let request = greppy_web_client::Request::new("run", "web.run", json!({}));
         let mut response = Response::ok(
             &request,
             json!({"trace_exports":[{"id":"same-digest","path":"first.zip"}]}),
