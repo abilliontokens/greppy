@@ -77,6 +77,11 @@ impl TraceRecorder {
             ("trace.network", &self.network),
         ])
     }
+
+    #[cfg(test)]
+    pub(crate) fn fill_to_recording_limit(&mut self) {
+        self.trace.resize(MAX_RECORDING_BYTES, b' ');
+    }
 }
 
 fn wall_time_ms() -> u64 {

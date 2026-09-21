@@ -1015,7 +1015,7 @@ impl Daemon {
                 };
                 if let Some(message) = trace_error {
                     if response.status == "ok" {
-                        response = limit_error(&limit_request, message);
+                        append_nonfatal_warning(&mut response, &message);
                     }
                     if let Some(session) = self.sessions.get_mut(session_id) {
                         session.trace = None;
@@ -1886,7 +1886,9 @@ impl Daemon {
                                     "retry greppy web run",
                                 );
                                 object.session_id = Some(session_id.clone());
-                                return Response::error(request, object);
+                                let mut response = Response::error(request, object);
+                                response.artifacts = failure_trace_artifacts;
+                                return response;
                             }
                         }
                     }
@@ -1900,7 +1902,9 @@ impl Daemon {
                             "retry greppy web run",
                         );
                         object.session_id = Some(session_id.clone());
-                        return Response::error(request, object);
+                        let mut response = Response::error(request, object);
+                        response.artifacts = failure_trace_artifacts;
+                        return response;
                     }
                     self.journal(
                         &session_id,
@@ -1926,7 +1930,9 @@ impl Daemon {
                         "retry the script or send a new web.run",
                     );
                     object.session_id = Some(session_id.clone());
-                    return Response::error(request, object);
+                    let mut response = Response::error(request, object);
+                    response.artifacts = failure_trace_artifacts;
+                    return response;
                 }
                 if error.kind() == io::ErrorKind::TimedOut || message.contains("timed out") {
                     let content_cpu_ms = cpu_ms_since(content_pid, content_cpu_baseline_ns);
@@ -1946,14 +1952,15 @@ impl Daemon {
                     );
                     object.session_id = Some(session_id.clone());
                     let mut response = Response::error(request, object);
-                    if let Ok(manifest) = self.store.put(
-                        format!(
-                            "{{\"partial\":true,\"reason\":\"timeout\",\"session_id\":\"{session_id}\"}}"
-                        )
-                        .as_bytes(),
-                        "application/json",
+                    response.artifacts = failure_trace_artifacts;
+                    let timeout_manifest = format!(
+                        "{{\"partial\":true,\"reason\":\"timeout\",\"session_id\":\"{session_id}\"}}"
+                    );
+                    if let Ok(manifest) = self.store_bytes(
+                        request,
                         &session_id,
-                        &self.run_id,
+                        timeout_manifest.as_bytes(),
+                        "application/json",
                         "web.run.timeout",
                         false,
                     ) {
@@ -1970,6 +1977,7 @@ impl Daemon {
                 }
                 if let Some(limit) = message.strip_prefix("resource_limit: ") {
                     let mut response = limit_error(request, limit);
+                    response.artifacts = failure_trace_artifacts;
                     if let Some(error) = response.error.as_mut() {
                         error.session_id = Some(session_id);
                     }
@@ -4724,6 +4732,19 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn append_nonfatal_warning(response: &mut Response, message: &str) {
+    let warning: String = message.chars().take(256).collect();
+    let Some(result) = response.result.as_mut().and_then(|value| value.as_object_mut()) else {
+        return;
+    };
+    let warnings = result
+        .entry("warnings")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(warnings) = warnings.as_array_mut() {
+        warnings.push(json!(warning));
+    }
+}
+
 fn protocol_error(request: &Request, message: &str) -> Response {
     Response::error(
         request,
@@ -5569,10 +5590,11 @@ pub fn socket_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod script_stage_tests {
     use super::{
-        bind_socket_healing_stale, copy_granted_modules, isolated_id, path_is_within_root,
-        refuse_unbounded_script_root, remove_script_stage, script_stage_dir,
+        append_nonfatal_warning, bind_socket_healing_stale, copy_granted_modules, isolated_id,
+        path_is_within_root, refuse_unbounded_script_root, remove_script_stage, script_stage_dir,
         stage_script_for_controller,
     };
+    use serde_json::json;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -5597,6 +5619,37 @@ mod script_stage_tests {
         assert!(super::parse_result_cursor("offset=12").is_err());
         assert!(super::parse_result_cursor("sha256:short:0").is_err());
         assert!(super::parse_result_cursor(&format!("sha256:{digest}:x")).is_err());
+    }
+
+    #[test]
+    fn trace_overflow_warning_preserves_completed_mutation_outcome() {
+        let request = super::Request::new("trace-overflow", "web.click", json!({}));
+        let mut mutation_count = 0;
+        mutation_count += 1;
+        let mut response = super::Response::ok(
+            &request,
+            json!({"clicked": true, "mutation_count": mutation_count}),
+        );
+        let mut trace = crate::playwright_trace::TraceRecorder::new().unwrap();
+        trace.fill_to_recording_limit();
+        let overflow = trace
+            .record("web.click", crate::playwright_trace::trace_time_ms(), false)
+            .unwrap_err();
+
+        append_nonfatal_warning(&mut response, &overflow);
+
+        assert_eq!(mutation_count, 1);
+        assert_eq!(response.status, "ok");
+        assert_eq!(response.result.as_ref().unwrap()["clicked"], true);
+        assert_eq!(
+            response.result.as_ref().unwrap()["mutation_count"],
+            1
+        );
+        let warning = response.result.as_ref().unwrap()["warnings"][0]
+            .as_str()
+            .unwrap();
+        assert!(warning.contains("trace recording exceeded"));
+        assert!(warning.chars().count() <= 256);
     }
 
     #[test]

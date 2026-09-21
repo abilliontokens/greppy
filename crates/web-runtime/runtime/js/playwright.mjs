@@ -35,18 +35,25 @@ function traceTime() {
 }
 
 function traceEvent(value) {
-  if (!activeTrace) return;
+  if (!activeTrace || activeTrace.truncated) return;
   const line = JSON.stringify(value) + "\n";
   activeTrace.bytes += line.length;
   if (activeTrace.bytes > 8 * 1024 * 1024) {
-    activeTrace = null;
-    throw new Error("trace recording exceeded the 8 MiB in-memory limit; stop the trace sooner");
+    activeTrace.lines = [];
+    activeTrace.bytes = 0;
+    activeTrace.truncated = true;
+    console.warn("warning: trace recording stopped after exceeding the 8 MiB in-memory limit");
+    return;
   }
   activeTrace.lines.push(line);
 }
 
 globalThis.__greppyCaptureActiveTrace = () => {
   if (!activeTrace) return;
+  if (activeTrace.truncated) {
+    activeTrace = null;
+    return;
+  }
   traceEvent({ type: "event", time: traceTime(), class: "Greppy", method: "scriptFailed" });
   const trace = activeTrace.lines.join("");
   activeTrace = null;
@@ -2893,12 +2900,16 @@ class BrowserContext {
       start: async (options = {}) => {
         for (const key of ["screenshots", "snapshots", "sources"]) if (options[key]) throw new Error(`Tracing.start option ${key} is unsupported`);
         if (activeTrace) throw new Error("a trace is already recording in this controller");
-        activeTrace = { context: this._id, lines: [], bytes: 0, next: 1 };
+        activeTrace = { context: this._id, lines: [], bytes: 0, next: 1, truncated: false };
         traceEvent({ version: 8, type: "context-options", origin: "library", browserName: "greppy", options: {}, platform: "native", wallTime: Date.now(), monotonicTime: traceTime(), sdkLanguage: "javascript" });
       },
       stop: async (options = {}) => {
         for (const key of Object.keys(options)) if (key !== "path") throw new Error(`Tracing.stop option ${key} is unsupported`);
         if (!activeTrace || activeTrace.context !== this._id) throw new Error("no trace is recording for this BrowserContext");
+        if (activeTrace.truncated) {
+          activeTrace = null;
+          return;
+        }
         const trace = activeTrace.lines.join(""); activeTrace = null;
         ops.op_capture_trace_archive(trace, options.path == null ? "" : String(options.path));
       },

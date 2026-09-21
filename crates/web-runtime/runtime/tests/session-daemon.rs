@@ -7862,6 +7862,72 @@ throw new Error("intentional trace fixture failure");"#;
     assert!(failed.artifacts.iter().any(|artifact| artifact["requested_path"] == "failed-trace.zip"));
 }
 
+fn playwright_stopped_trace_survives_classified_failure(message: &str, code: &str) {
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-trace-failure-{}-{code}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_trace_failure", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_failure",
+            "web.session.create",
+            json!({"profile":"project"}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = format!(
+        r#"import {{ chromium }} from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start(); await page.title();
+await context.tracing.stop({{ path: "classified-failure.zip" }});
+throw new Error({message:?});"#
+    );
+    let failed = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_failure",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(failed.status, "error", "{failed:?}");
+    assert_eq!(failed.error.as_ref().unwrap().code, code, "{failed:?}");
+    assert!(
+        failed
+            .artifacts
+            .iter()
+            .any(|artifact| artifact["requested_path"] == "classified-failure.zip"),
+        "stored trace must remain visible on {code}: {failed:?}"
+    );
+}
+
+#[test]
+fn playwright_stopped_trace_survives_timeout_classification() {
+    playwright_stopped_trace_survives_classified_failure(
+        "timed out after stopped trace fixture",
+        "timeout",
+    );
+}
+
+#[test]
+fn playwright_stopped_trace_survives_cancel_classification() {
+    playwright_stopped_trace_survives_classified_failure(
+        "cancelled after stopped trace fixture",
+        "cancelled",
+    );
+}
+
 #[test]
 fn locator_strict_mode_rejects_ambiguous_click() {
     run_named_fixture("strict-mode.mjs", "run_strict");
