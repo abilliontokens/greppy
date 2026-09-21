@@ -2064,7 +2064,9 @@ impl Daemon {
         let observation = (!self.workflow_defer_observation)
             .then(|| self.observe_page(session_id, page));
         let navigation_error = match observation.as_ref() {
-            Some(Err(error)) if error.starts_with("navigation failed: ") => Some(error.clone()),
+            Some(Err(error))
+                if error.starts_with("navigation failed: ")
+                    || error.starts_with("policy_denied: navigation failed: ") => Some(error.clone()),
             _ => None,
         };
         if let Some(error) = navigation_error {

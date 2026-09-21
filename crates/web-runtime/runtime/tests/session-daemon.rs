@@ -3384,6 +3384,70 @@ fn click_navigation_wait_handles_redirect_reload_and_delayed_javascript() {
 }
 
 #[test]
+fn click_abort_and_policy_denial_finish_with_partial_receipts() {
+    let fixture = serve_fixture(
+        "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='policy' href='http://169.254.169.254/latest/meta-data/'>Policy</a>",
+    );
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-click-terminal-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _guard = Supervisor::spawn(&socket, "run_click_terminal", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_click_terminal", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("terminal click request")
+    };
+    let open_session = || {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str().unwrap().to_owned();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "open terminal fixture: {opened:?}");
+        session
+    };
+
+    let aborted_session = open_session();
+    let routed = call("web.run", json!({
+        "session_id": aborted_session.clone(),
+        "script_source": "inline",
+        "bind_session_page": true,
+        "script_text": "await page.route('**/aborted', route => route.abort());",
+    }));
+    assert_eq!(routed.status, "ok", "install abort route: {routed:?}");
+    for (session, selector, kind, code) in [
+        (aborted_session, "#abort", "route_aborted", "engine_error"),
+        (open_session(), "#policy", "policy_denied", "policy_denied"),
+    ] {
+        let started = Instant::now();
+        let clicked = call("web.click", json!({
+            "session_id": session,
+            "selector": {"type":"css","value":selector},
+            "timeout": 5_000,
+        }));
+        assert!(started.elapsed() < Duration::from_secs(5),
+            "known terminal navigation exhausted its action deadline: {clicked:?}");
+        assert_eq!(clicked.status, "error", "{kind}: {clicked:?}");
+        assert_eq!(clicked.error.as_ref().unwrap().code, code);
+        assert!(clicked.error.as_ref().unwrap().message.contains(&format!("kind={kind}")),
+            "{clicked:?}");
+        let receipt = clicked.result.as_ref().expect("partial action receipt");
+        assert_eq!(receipt["partial"], true);
+        assert_eq!(receipt["ok"], false);
+        assert!(receipt.get("dispatch").is_some(), "{clicked:?}");
+        assert_eq!(receipt["session_id"], session);
+        assert!(receipt["tab_id"].is_string());
+    }
+}
+
+#[test]
 fn oracle_skip_receipt_when_chromium_pin_missing() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")

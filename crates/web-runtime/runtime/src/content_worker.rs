@@ -421,6 +421,24 @@ impl Delegate {
         }
     }
 
+    fn record_main_frame_failure(
+        &self,
+        request_id: &str,
+        url: &str,
+        error_text: &str,
+        kind: &str,
+    ) {
+        if self.current_main_frame_request.borrow().as_deref() == Some(request_id) {
+            self.navigation_failure.replace(Some(json!({
+                "requestId": request_id,
+                "url": url,
+                "errorText": error_text,
+                "kind": kind,
+            })));
+            self.wake.wake();
+        }
+    }
+
     fn note_wait_signal(&self, text: &str) {
         let Some((token, status)) = parse_wait_done_signal(text) else {
             return;
@@ -626,6 +644,12 @@ impl WebViewDelegate for Delegate {
         if let UrlDecision::Deny { reason } = policy {
             if load.request.is_for_main_frame {
                 *self.denied_navigation.borrow_mut() = Some(reason.to_owned());
+                self.record_main_frame_failure(
+                    &request_id,
+                    &url,
+                    reason,
+                    "policy_denied",
+                );
             }
             let denied_url = load.request.url.clone();
             load.intercept(WebResourceResponse::new(denied_url))
@@ -659,6 +683,12 @@ impl WebViewDelegate for Delegate {
                 self.mark_request_failure(&request_id, "net::ERR_FAILED");
                 if load.request.is_for_main_frame {
                     *self.denied_navigation.borrow_mut() = Some("net::ERR_FAILED".to_owned());
+                    self.record_main_frame_failure(
+                        &request_id,
+                        &url,
+                        "net::ERR_FAILED",
+                        "route_aborted",
+                    );
                 }
                 load.intercept(WebResourceResponse::new(request_url))
                     .cancel();
@@ -763,13 +793,12 @@ impl WebViewDelegate for Delegate {
         }
         if let Some(failure) = response.failure {
             row["failure"] = json!({ "errorText": failure.clone() });
-            if self.current_main_frame_request.borrow().as_deref() == Some(request_id.as_str()) {
-                self.navigation_failure.replace(Some(json!({
-                    "requestId": request_id,
-                    "url": response.url.to_string(),
-                    "errorText": failure,
-                })));
-            }
+            self.record_main_frame_failure(
+                &request_id,
+                response.url.as_str(),
+                &failure,
+                "transport",
+            );
         }
         let mut responses = self.last_responses.borrow_mut();
         if let Some(existing) = responses.iter_mut().find(|existing| {
@@ -2698,9 +2727,15 @@ impl ContentEngine {
                     let request_id = failure.get("requestId").and_then(|value| value.as_str()).unwrap_or("unknown");
                     let url = failure.get("url").and_then(|value| value.as_str()).unwrap_or("unknown");
                     let error = failure.get("errorText").and_then(|value| value.as_str()).unwrap_or("transport failure");
-                    return Err(io::Error::other(format!(
-                        "navigation failed: {error} (request_id={request_id}, url={url})"
-                    )));
+                    let kind = failure.get("kind").and_then(|value| value.as_str()).unwrap_or("transport");
+                    let detail = format!(
+                        "navigation failed: {error} (kind={kind}, request_id={request_id}, url={url})"
+                    );
+                    return Err(io::Error::other(if kind == "policy_denied" {
+                        format!("policy_denied: {detail}")
+                    } else {
+                        detail
+                    }));
                 }
                 let query = params.get("query").and_then(|value| value.as_str());
                 let include_html = params
