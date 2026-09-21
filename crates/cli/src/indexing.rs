@@ -1187,12 +1187,8 @@ pub(crate) fn dispatch_index(
                 None
             },
         );
-        match &result {
-            Ok(0) => background_job.complete(),
-            Ok(_) => background_job.write_state("failed", Some("Delta index was incomplete")),
-            Err(error) => background_job.fail(error),
-        }
-        return result;
+        record_overlay_job_outcome(&mut background_job, &result);
+        return result.map(|_| 0);
     }
     // Holding the writer lock, build a fresh snapshot in a temp DB, validate
     // it, then publish it with one filesystem rename. The indexer crate still
@@ -1301,6 +1297,23 @@ pub(crate) fn dispatch_index(
     clippy::too_many_arguments,
     reason = "atomic Base+Delta publication requires every identity, policy, and progress input explicitly"
 )]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OverlayIndexOutcome {
+    Complete,
+    Degraded(String),
+}
+
+pub(crate) fn record_overlay_job_outcome(
+    background_job: &mut BackgroundJobGuard,
+    result: &Result<OverlayIndexOutcome>,
+) {
+    match result {
+        Ok(OverlayIndexOutcome::Complete) => background_job.complete(),
+        Ok(OverlayIndexOutcome::Degraded(reason)) => background_job.degraded(reason),
+        Err(error) => background_job.fail(error),
+    }
+}
+
 pub(crate) fn index_overlay_snapshot(
     active_path: &std::path::Path,
     target: &std::path::Path,
@@ -1310,7 +1323,7 @@ pub(crate) fn index_overlay_snapshot(
     index_options: &greppy_indexer::IndexOptions,
     announce: bool,
     mut progress: Option<&mut BackgroundJobGuard>,
-) -> Result<i32> {
+) -> Result<OverlayIndexOutcome> {
     cleanup_stale_snapshot_artifacts(active_path, false)?;
     let temp_path = unique_store_sibling(active_path, "delta-building");
     cleanup_sqlite_family(&temp_path)?;
@@ -1398,8 +1411,9 @@ pub(crate) fn index_overlay_snapshot(
     }
     if let Some(EmbeddingBuildOutcome::Degraded { reason, .. }) = embedding {
         eprintln!("greppy: Delta embeddings degraded: {reason}");
+        return Ok(OverlayIndexOutcome::Degraded(reason));
     }
-    Ok(0)
+    Ok(OverlayIndexOutcome::Complete)
 }
 
 pub(crate) fn index_atomic_snapshot(
