@@ -7898,11 +7898,31 @@ await context.tracing.stop({ path: "recorder-b.zip" }); await browser.close();"#
     .unwrap();
     let second_bytes =
         std::fs::read(second_path.result.unwrap()["path"].as_str().unwrap()).unwrap();
-    let second_text = String::from_utf8_lossy(&second_bytes);
-    assert!(
-        !second_text.contains("\"type\":\"after\""),
-        "recorder A completion leaked into recorder B: {second_text}"
-    );
+    // The native writer uses uncompressed ZIP entries; inspect trace.trace,
+    // allowing legitimate follow-up operations started by recorder B.
+    assert_eq!(&second_bytes[..4], b"PK\x03\x04");
+    let u16_at = |offset| u16::from_le_bytes(second_bytes[offset..offset + 2].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(second_bytes[18..22].try_into().unwrap()) as usize;
+    assert_eq!(u16_at(8), 0, "expected stored ZIP entry");
+    let name_len = u16_at(26);
+    assert_eq!(&second_bytes[30..30 + name_len], b"trace.trace");
+    let start = 30 + name_len + u16_at(28);
+    let trace = std::str::from_utf8(&second_bytes[start..start + size]).unwrap();
+    let mut pending = std::collections::HashSet::new();
+    for line in trace.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        match event["type"].as_str() {
+            Some("before") => {
+                assert_ne!(event["apiName"], "page.evaluate", "recorder A action leaked: {trace}");
+                assert!(pending.insert(event["callId"].as_str().unwrap().to_owned()));
+            }
+            Some("after") => {
+                assert!(pending.remove(event["callId"].as_str().unwrap()), "unmatched completion leaked from recorder A: {trace}");
+            }
+            _ => {}
+        }
+    }
+    assert!(pending.is_empty(), "recorder B did not finish its own operations: {trace}");
 }
 
 #[cfg(debug_assertions)]
@@ -8032,7 +8052,7 @@ fn assert_partial_trace_quota_result(response: &greppy_web_client::Response) {
         .expect("bounded trace-storage warning");
     assert_eq!(warnings.len(), 1, "{response:?}");
     let warning = warnings[0].as_str().unwrap();
-    assert!(warning.contains("artifact byte limit"), "{warning}");
+    assert!(warning.contains("artifact limit exceeded"), "{warning}");
     assert!(warning.chars().count() <= 256, "{warning}");
 }
 
