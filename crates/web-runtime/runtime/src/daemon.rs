@@ -1001,25 +1001,15 @@ impl Daemon {
             "web.trace.start" | "web.trace.stop"
         ) {
             if let Some(session_id) = session_id.as_deref() {
-                let trace_error = if let (Some(trace), Some(started)) = (
-                    self.sessions
-                        .get_mut(session_id)
-                        .and_then(|s| s.trace.as_mut()),
-                    trace_started,
-                ) {
-                    trace
-                        .record(&limit_request.operation, started, response.status != "ok")
-                        .err()
-                } else {
-                    None
-                };
-                if let Some(message) = trace_error {
-                    if response.status == "ok" {
-                        append_nonfatal_warning(&mut response, &message);
-                    }
-                    if let Some(session) = self.sessions.get_mut(session_id) {
-                        session.trace = None;
-                    }
+                if let (Some(session), Some(started)) =
+                    (self.sessions.get_mut(session_id), trace_started)
+                {
+                    record_trace_outcome(
+                        &mut session.trace,
+                        &limit_request.operation,
+                        started,
+                        &mut response,
+                    );
                 }
             }
         }
@@ -4745,6 +4735,23 @@ fn append_nonfatal_warning(response: &mut Response, message: &str) {
     }
 }
 
+fn record_trace_outcome(
+    trace: &mut Option<crate::playwright_trace::TraceRecorder>,
+    operation: &str,
+    started: u64,
+    response: &mut Response,
+) {
+    let Some(recorder) = trace.as_mut() else {
+        return;
+    };
+    if let Err(message) = recorder.record(operation, started, response.status != "ok") {
+        if response.status == "ok" {
+            append_nonfatal_warning(response, &message);
+        }
+        *trace = None;
+    }
+}
+
 fn protocol_error(request: &Request, message: &str) -> Response {
     Response::error(
         request,
@@ -5590,9 +5597,9 @@ pub fn socket_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod script_stage_tests {
     use super::{
-        append_nonfatal_warning, bind_socket_healing_stale, copy_granted_modules, isolated_id,
+        bind_socket_healing_stale, copy_granted_modules, isolated_id,
         path_is_within_root, refuse_unbounded_script_root, remove_script_stage, script_stage_dir,
-        stage_script_for_controller,
+        stage_script_for_controller, record_trace_outcome,
     };
     use serde_json::json;
     use std::fs;
@@ -5632,11 +5639,13 @@ mod script_stage_tests {
         );
         let mut trace = crate::playwright_trace::TraceRecorder::new().unwrap();
         trace.fill_to_recording_limit();
-        let overflow = trace
-            .record("web.click", crate::playwright_trace::trace_time_ms(), false)
-            .unwrap_err();
-
-        append_nonfatal_warning(&mut response, &overflow);
+        let mut trace = Some(trace);
+        record_trace_outcome(
+            &mut trace,
+            "web.click",
+            crate::playwright_trace::trace_time_ms(),
+            &mut response,
+        );
 
         assert_eq!(mutation_count, 1);
         assert_eq!(response.status, "ok");
@@ -5650,6 +5659,7 @@ mod script_stage_tests {
             .unwrap();
         assert!(warning.contains("trace recording exceeded"));
         assert!(warning.chars().count() <= 256);
+        assert!(trace.is_none(), "overflowed recorder must be discarded");
     }
 
     #[test]

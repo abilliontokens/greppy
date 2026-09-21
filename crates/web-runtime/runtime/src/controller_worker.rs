@@ -77,6 +77,17 @@ struct CapturedTraceArchive {
 
 const MAX_CAPTURED_TRACE_BYTES: usize = 8 * 1024 * 1024;
 
+#[op2(fast)]
+fn op_trace_limit_bytes() -> u32 {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var("GREPPY_TEST_TRACE_LIMIT_BYTES") {
+        if let Ok(value) = value.parse::<u32>() {
+            return value.max(1);
+        }
+    }
+    MAX_CAPTURED_TRACE_BYTES as u32
+}
+
 impl CapturedTraceArchives {
     fn reset(&mut self) {
         *self = Self::default();
@@ -394,7 +405,7 @@ fn op_trace_time_ms() -> f64 {
 
 extension!(
     greppy_playwright,
-    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png, op_capture_trace_archive, op_trace_time_ms],
+    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png, op_capture_trace_archive, op_trace_time_ms, op_trace_limit_bytes],
     options = { bridge: EngineBridge },
     state = |state, options| {
         state.put(options.bridge);

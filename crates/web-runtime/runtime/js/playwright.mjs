@@ -29,6 +29,7 @@ const disposedContexts = new Set();
 const disposedBrowsers = new Set();
 let activeTrace = null;
 const pageContexts = new Map();
+const traceLimitBytes = Number(ops.op_trace_limit_bytes()) || 8 * 1024 * 1024;
 
 function traceTime() {
   return ops.op_trace_time_ms();
@@ -38,7 +39,7 @@ function traceEvent(value) {
   if (!activeTrace || activeTrace.truncated) return;
   const line = JSON.stringify(value) + "\n";
   activeTrace.bytes += line.length;
-  if (activeTrace.bytes > 8 * 1024 * 1024) {
+  if (activeTrace.bytes > traceLimitBytes) {
     activeTrace.lines = [];
     activeTrace.bytes = 0;
     activeTrace.truncated = true;
@@ -55,6 +56,10 @@ globalThis.__greppyCaptureActiveTrace = () => {
     return;
   }
   traceEvent({ type: "event", time: traceTime(), class: "Greppy", method: "scriptFailed" });
+  if (activeTrace.truncated) {
+    activeTrace = null;
+    return;
+  }
   const trace = activeTrace.lines.join("");
   activeTrace = null;
   ops.op_capture_trace_archive(trace, "");

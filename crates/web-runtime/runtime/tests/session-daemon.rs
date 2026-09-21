@@ -7862,6 +7862,60 @@ throw new Error("intentional trace fixture failure");"#;
     assert!(failed.artifacts.iter().any(|artifact| artifact["requested_path"] == "failed-trace.zip"));
 }
 
+#[test]
+fn playwright_trace_overflow_preserves_completed_mutation() {
+    const LIMIT_ENV: &str = "GREPPY_TEST_TRACE_LIMIT_BYTES";
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-trace-overflow-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    std::env::set_var(LIMIT_ENV, "512");
+    let _guard = Supervisor::spawn(&socket, "run_trace_overflow", |_| {});
+    wait_for_socket(&socket, Duration::from_secs(30));
+    std::env::remove_var(LIMIT_ENV);
+    let created = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_overflow",
+            "web.session.create",
+            json!({"profile":"project"}),
+        ),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let session_id = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = r#"import { chromium } from "playwright";
+const browser = await chromium.launch(); const context = await browser.newContext();
+const page = await context.newPage(); await context.tracing.start();
+await page.evaluate(() => { globalThis.traceMutationCount = (globalThis.traceMutationCount || 0) + 1; });
+console.log("mutation-count=" + await page.evaluate(() => globalThis.traceMutationCount));
+await context.tracing.stop(); await browser.close();"#;
+    let response = unix_request(
+        &socket,
+        &Request::new(
+            "run_trace_overflow",
+            "web.run",
+            json!({"session_id":session_id,"script_text":source}),
+        ),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert_eq!(response.status, "ok", "{response:?}");
+    let stdout = response.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap();
+    assert!(stdout.contains("mutation-count=1"), "{stdout}");
+    assert!(
+        stdout.contains("trace recording stopped after exceeding"),
+        "{stdout}"
+    );
+    assert!(response.artifacts.is_empty(), "truncated trace must not be archived: {response:?}");
+}
+
 fn playwright_stopped_trace_survives_classified_failure(message: &str, code: &str) {
     let socket = std::env::temp_dir().join(format!(
         "greppy-web-trace-failure-{}-{code}.sock",
