@@ -421,14 +421,22 @@ impl Delegate {
         }
     }
 
-    fn record_main_frame_failure(
-        &self,
-        request_id: &str,
-        url: &str,
-        error_text: &str,
-        kind: &str,
-    ) {
+    fn record_main_frame_failure(&self, request_id: &str, url: &str, error_text: &str, kind: &str) {
         if self.current_main_frame_request.borrow().as_deref() == Some(request_id) {
+            let preserve_specific_failure = kind == "transport"
+                && self
+                    .navigation_failure
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|failure| {
+                        failure.get("requestId").and_then(|value| value.as_str())
+                            == Some(request_id)
+                            && failure.get("kind").and_then(|value| value.as_str())
+                                != Some("transport")
+                    });
+            if preserve_specific_failure {
+                return;
+            }
             self.navigation_failure.replace(Some(json!({
                 "requestId": request_id,
                 "url": url,
@@ -622,7 +630,8 @@ impl WebViewDelegate for Delegate {
         };
         let mut requests = self.requests.borrow_mut();
         if load.request.is_for_main_frame {
-            self.current_main_frame_request.replace(Some(request_id.clone()));
+            self.current_main_frame_request
+                .replace(Some(request_id.clone()));
             self.navigation_failure.replace(None);
         }
         requests.push(json!({
@@ -644,12 +653,7 @@ impl WebViewDelegate for Delegate {
         if let UrlDecision::Deny { reason } = policy {
             if load.request.is_for_main_frame {
                 *self.denied_navigation.borrow_mut() = Some(reason.to_owned());
-                self.record_main_frame_failure(
-                    &request_id,
-                    &url,
-                    reason,
-                    "policy_denied",
-                );
+                self.record_main_frame_failure(&request_id, &url, reason, "policy_denied");
             }
             let denied_url = load.request.url.clone();
             load.intercept(WebResourceResponse::new(denied_url))
@@ -4829,9 +4833,14 @@ mod serialize_tests {
             "url": "http://example.test/end",
             "errorText": "net::ERR_FAILED",
         });
-        assert!(navigation_failure_belongs_to_chain(Some(&aborted), Some("fetch-a")),
-            "terminal failure must settle an aborted navigation without a document commit");
-        assert!(!navigation_failure_belongs_to_chain(Some(&aborted), Some("fetch-b")));
+        assert!(
+            navigation_failure_belongs_to_chain(Some(&aborted), Some("fetch-a")),
+            "terminal failure must settle an aborted navigation without a document commit"
+        );
+        assert!(!navigation_failure_belongs_to_chain(
+            Some(&aborted),
+            Some("fetch-b")
+        ));
     }
 
     #[test]

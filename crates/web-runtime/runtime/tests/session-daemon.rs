@@ -3415,29 +3415,44 @@ fn click_abort_and_policy_denial_finish_with_partial_receipts() {
     };
 
     let aborted_session = open_session();
-    let routed = call("web.run", json!({
-        "session_id": aborted_session.clone(),
-        "script_source": "inline",
-        "bind_session_page": true,
-        "script_text": "await page.route('**/aborted', route => route.abort());",
-    }));
+    let routed = call(
+        "web.run",
+        json!({
+            "session_id": aborted_session.clone(),
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": "await page.route('**/aborted', route => route.abort());",
+        }),
+    );
     assert_eq!(routed.status, "ok", "install abort route: {routed:?}");
     for (session, selector, kind, code) in [
         (aborted_session, "#abort", "route_aborted", "engine_error"),
         (open_session(), "#policy", "policy_denied", "policy_denied"),
     ] {
         let started = Instant::now();
-        let clicked = call("web.click", json!({
-            "session_id": session,
-            "selector": {"type":"css","value":selector},
-            "timeout": 5_000,
-        }));
-        assert!(started.elapsed() < Duration::from_secs(5),
-            "known terminal navigation exhausted its action deadline: {clicked:?}");
+        let clicked = call(
+            "web.click",
+            json!({
+                "session_id": session,
+                "selector": {"type":"css","value":selector},
+                "timeout": 5_000,
+            }),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "known terminal navigation exhausted its action deadline: {clicked:?}"
+        );
         assert_eq!(clicked.status, "error", "{kind}: {clicked:?}");
         assert_eq!(clicked.error.as_ref().unwrap().code, code);
-        assert!(clicked.error.as_ref().unwrap().message.contains(&format!("kind={kind}")),
-            "{clicked:?}");
+        assert!(
+            clicked
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains(&format!("kind={kind}")),
+            "{clicked:?}"
+        );
         let receipt = clicked.result.as_ref().expect("partial action receipt");
         assert_eq!(receipt["partial"], true);
         assert_eq!(receipt["ok"], false);
