@@ -456,6 +456,21 @@ impl Delegate {
         }
     }
 
+    fn navigation_failure_after(
+        &self,
+        kind: &str,
+        baseline_epoch: u64,
+    ) -> Option<serde_json::Value> {
+        let current_epoch = self.main_frame_navigation_epoch.get();
+        self.navigation_failure
+            .borrow()
+            .as_ref()
+            .filter(|failure| {
+                navigation_failure_matches_after(failure, kind, current_epoch, baseline_epoch)
+            })
+            .cloned()
+    }
+
     fn note_wait_signal(&self, text: &str) {
         let Some((token, status)) = parse_wait_done_signal(text) else {
             return;
@@ -866,6 +881,16 @@ impl WebViewDelegate for Delegate {
         if let Some(status) = response.status_code {
             row["status"] = json!(status);
             row["ok"] = json!((200..400).contains(&status));
+            if status == 204
+                && self.current_main_frame_request.borrow().as_deref() == Some(request_id.as_str())
+            {
+                self.record_main_frame_failure(
+                    &request_id,
+                    response.url.as_str(),
+                    "HTTP 204 No Content cannot create a document",
+                    "no_document",
+                );
+            }
         }
         if let Some(failure) = response.failure {
             row["failure"] = json!({ "errorText": failure.clone() });
@@ -2326,6 +2351,8 @@ impl ContentEngine {
                 // Extra headers ride WebResourceLoad::continue_with_headers in
                 // the fetch pipeline (above TLS). UrlRequest/load_request is
                 // top-level navigation only and has stalled at HeadParsed.
+                delegate.navigation_failure.replace(None);
+                let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
                 webview.load(url.clone());
                 let loading = webview.clone();
                 let expected = url.clone();
@@ -2337,7 +2364,12 @@ impl ContentEngine {
                     &loading,
                     call_timeout(&params),
                     until,
-                    || denied.denied_navigation.borrow().is_some(),
+                    || {
+                        denied.denied_navigation.borrow().is_some()
+                            || denied
+                                .navigation_failure_after("no_document", navigation_epoch_before)
+                                .is_some()
+                    },
                     || {
                         let url_settled = loading.url().is_some_and(|current| {
                             urls_match(&current, &expected)
@@ -2375,6 +2407,26 @@ impl ContentEngine {
                         io::ErrorKind::PermissionDenied,
                         format!("policy_denied: {reason}"),
                     ));
+                }
+                let no_document = delegate
+                    .navigation_failure_after("no_document", navigation_epoch_before);
+                if let Some(failure) = no_document {
+                    delegate.navigation_failure.borrow_mut().take();
+                    let request_id = failure
+                        .get("requestId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let failure_url = failure
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let epoch = failure
+                        .get("navigationEpoch")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    return Err(io::Error::other(format!(
+                        "navigation failed: HTTP 204 No Content cannot create a document (kind=no_document, request_id={request_id}, navigation_epoch={epoch}, url={failure_url})"
+                    )));
                 }
                 if let Some(final_url) = webview.url() {
                     if let UrlDecision::Deny { reason } =
@@ -4769,6 +4821,17 @@ fn navigation_failure_belongs_to_epoch(
         == Some(expected_epoch)
 }
 
+fn navigation_failure_matches_after(
+    failure: &serde_json::Value,
+    kind: &str,
+    current_epoch: u64,
+    baseline_epoch: u64,
+) -> bool {
+    current_epoch > baseline_epoch
+        && failure.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
+        && navigation_failure_belongs_to_epoch(Some(failure), current_epoch)
+}
+
 fn response_for_request<'a>(
     responses: &'a [serde_json::Value],
     request_id: Option<&str>,
@@ -4925,6 +4988,39 @@ mod serialize_tests {
             "terminal failure must settle an aborted navigation without a document commit"
         );
         assert!(!navigation_failure_belongs_to_epoch(Some(&aborted), 6));
+    }
+
+    #[test]
+    fn stale_completion_before_new_navigation_epoch_cannot_abort_goto() {
+        let prior_completion = json!({
+            "requestId": "prior:0",
+            "navigationEpoch": 11,
+            "kind": "no_document",
+        });
+        assert!(!navigation_failure_matches_after(
+            &prior_completion,
+            "no_document",
+            11,
+            11,
+        ));
+
+        let current_completion = json!({
+            "requestId": "current:0",
+            "navigationEpoch": 12,
+            "kind": "no_document",
+        });
+        assert!(navigation_failure_matches_after(
+            &current_completion,
+            "no_document",
+            12,
+            11,
+        ));
+        assert!(!navigation_failure_matches_after(
+            &prior_completion,
+            "no_document",
+            12,
+            11,
+        ));
     }
 
     #[test]

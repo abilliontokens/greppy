@@ -800,6 +800,11 @@ fn serve_status_fixture() -> String {
                 let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
                 continue;
             }
+            if path == "/jump-empty" {
+                let location = format!("http://{address}/empty");
+                let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+                continue;
+            }
             if path == "/chunked" {
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
                 continue;
@@ -3399,6 +3404,139 @@ fn native_transport_failure_is_typed_without_classifying_page_words() {
         "transport navigation must fail: {navigation:?}"
     );
     assert_eq!(navigation.error.as_ref().unwrap().code, "engine_error");
+}
+
+#[test]
+fn top_level_204_terminates_without_replacing_the_document() {
+    let status_origin = serve_status_fixture();
+    let prior =
+        serve_fixture("<!doctype html><title>Prior</title><p id='prior'>preserved document</p>");
+    let subresource = serve_fixture(Box::leak(
+        format!(
+            "<!doctype html><p id='ready'>subresource page</p><img src='{status_origin}empty'>"
+        )
+        .into_boxed_str(),
+    ));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-no-document-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_no_document", |command| {
+        command.arg("--fixture-url").arg(&prior);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_no_document", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("no-document request")
+    };
+    let created = call("web.session.create", json!({"profile":"project"}));
+    let session = created.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let opened = call("web.goto", json!({"session_id":session,"url":prior}));
+    assert_eq!(opened.status, "ok", "prior document: {opened:?}");
+
+    for path in ["empty", "jump-empty"] {
+        let started = Instant::now();
+        let response = call(
+            "web.goto",
+            json!({"session_id":session,"url":format!("{status_origin}{path}")}),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "204 navigation waited for a nonexistent document: {response:?}"
+        );
+        assert_eq!(response.status, "error", "{path}: {response:?}");
+        assert_eq!(response.error.as_ref().unwrap().code, "engine_error");
+        assert!(
+            response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("kind=no_document"),
+            "{response:?}"
+        );
+        assert!(
+            !response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("timed out"),
+            "{response:?}"
+        );
+        let preserved = call(
+            "web.evaluate",
+            json!({"session_id":session,"source":"document.getElementById('prior')?.textContent"}),
+        );
+        assert_eq!(preserved.status, "ok", "{preserved:?}");
+        assert_eq!(
+            preserved.result.as_ref().unwrap()["value"],
+            "preserved document"
+        );
+    }
+
+    for (path, status) in [("landed", 200), ("missing", 404)] {
+        let response = call(
+            "web.goto",
+            json!({"session_id":session,"url":format!("{status_origin}{path}")}),
+        );
+        assert_eq!(response.status, "ok", "{path}: {response:?}");
+        assert_eq!(response.result.as_ref().unwrap()["status"], status);
+    }
+
+    let subresource_session = call("web.session.create", json!({"profile":"project"}));
+    let subresource_session = subresource_session.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let subresource_loaded = call(
+        "web.goto",
+        json!({"session_id":subresource_session,"url":subresource}),
+    );
+    assert_eq!(
+        subresource_loaded.status, "ok",
+        "subresource 204 must not poison its page: {subresource_loaded:?}"
+    );
+    let observed = call("web.observe", json!({"session_id":subresource_session}));
+    assert_eq!(observed.status, "ok", "subresource isolation: {observed:?}");
+
+    let controller_session = call("web.session.create", json!({"profile":"project"}));
+    let controller_session = controller_session.result.as_ref().unwrap()["session_id"]
+        .as_str()
+        .unwrap();
+    let controller_opened = call(
+        "web.goto",
+        json!({"session_id":controller_session,"url":prior}),
+    );
+    assert_eq!(controller_opened.status, "ok", "{controller_opened:?}");
+    let controller = call(
+        "web.run",
+        json!({
+            "session_id": controller_session,
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": format!(r#"
+let failure;
+try {{ await page.goto('{status_origin}empty'); }} catch (error) {{ failure = error.message; }}
+const missing = await page.goto('{status_origin}missing');
+const recovered = await page.goto('{status_origin}landed');
+console.log(JSON.stringify({{ failure, missing: missing.status(), recovered: recovered.status() }}));
+"#),
+        }),
+    );
+    assert_eq!(controller.status, "ok", "{controller:?}");
+    let stdout = controller.result.as_ref().unwrap()["stdout"]
+        .as_str()
+        .unwrap();
+    assert!(stdout.contains("kind=no_document"), "{controller:?}");
+    assert!(stdout.contains("\"missing\":404"), "{controller:?}");
+    assert!(stdout.contains("\"recovered\":200"), "{controller:?}");
 }
 
 #[test]
