@@ -7838,7 +7838,8 @@ await browser.close();"#;
         .collect::<Vec<_>>();
     let context_time = events
         .iter()
-        .find(|event| event["type"] == "context-options")["monotonicTime"]
+        .find(|event| event["type"] == "context-options")
+        .unwrap()["monotonicTime"]
         .as_f64()
         .unwrap();
     let before = events.iter().find(|event| event["type"] == "before").unwrap();

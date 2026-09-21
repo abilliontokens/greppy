@@ -387,9 +387,14 @@ fn op_capture_trace_archive(
     Ok("captured".to_owned())
 }
 
+#[op2(fast)]
+fn op_trace_time_ms() -> f64 {
+    crate::playwright_trace::trace_time_ms() as f64
+}
+
 extension!(
     greppy_playwright,
-    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png, op_capture_trace_archive],
+    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png, op_capture_trace_archive, op_trace_time_ms],
     options = { bridge: EngineBridge },
     state = |state, options| {
         state.put(options.bridge);

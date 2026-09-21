@@ -31,7 +31,7 @@ let activeTrace = null;
 const pageContexts = new Map();
 
 function traceTime() {
-  return performance.now();
+  return ops.op_trace_time_ms();
 }
 
 function traceEvent(value) {

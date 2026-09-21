@@ -32,7 +32,6 @@ impl TraceRecorder {
             "type": "context-options",
             "origin": "library",
             "browserName": "greppy",
-            "playwrightVersion": "1.52",
             "options": {},
             "platform": std::env::consts::OS,
             "wallTime": wall_time_ms(),
@@ -45,9 +44,9 @@ impl TraceRecorder {
     pub fn record(&mut self, operation: &str, start_time: u64, failed: bool) -> Result<(), String> {
         let call_id = format!("call@{}", self.next_call);
         self.next_call += 1;
-        self.append(json!({"type":"before","callId":call_id,"startTime":start_time,"apiName":operation,"class":"Greppy","method":operation,"params":{},"wallTime":start_time}))?;
+        self.append(json!({"type":"before","callId":call_id,"startTime":start_time,"apiName":operation,"class":"Greppy","method":operation,"params":{}}))?;
         let mut after =
-            json!({"type":"after","callId":call_id,"endTime":wall_time_ms(),"result":{}});
+            json!({"type":"after","callId":call_id,"endTime":trace_time_ms(),"result":{}});
         if failed {
             after["error"] = json!({"message": "action failed"});
         }
@@ -153,6 +152,15 @@ pub fn archive_jsonl(trace: &[u8], network: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn archive_events(archive: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(archive)
+            .lines()
+            .filter_map(|line| line.find('{').map(|start| &line[start..]))
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
     #[test]
     fn archive_has_v8_entries_without_sensitive_action_data() {
         let mut r = TraceRecorder::new().unwrap();
@@ -161,18 +169,41 @@ mod tests {
         assert!(z.windows(11).any(|w| w == b"trace.trace"));
         assert!(z.windows(13).any(|w| w == b"trace.network"));
         assert!(z.windows(11).any(|w| w == b"\"version\":8"));
+        assert!(!z
+            .windows(b"playwrightVersion".len())
+            .any(|window| window == b"playwrightVersion"));
         assert!(!z.windows(13).any(|w| w == b"authorization"));
     }
 
     #[test]
     fn records_real_start_and_generic_failure_without_payload() {
         let mut recorder = TraceRecorder::new().unwrap();
-        recorder.record("locator.fill", 1234, true).unwrap();
+        let start = trace_time_ms();
+        recorder.record("locator.fill", start, true).unwrap();
         let archive = recorder.finish();
         let text = String::from_utf8_lossy(&archive);
-        assert!(text.contains("\"startTime\":1234"));
         assert!(text.contains("action failed"));
         assert!(!text.contains("password"));
+        let events = archive_events(&archive);
+        let context_time = events
+            .iter()
+            .find(|event| event["type"] == "context-options")
+            .unwrap()["monotonicTime"]
+            .as_u64()
+            .unwrap();
+        let before = events
+            .iter()
+            .find(|event| event["type"] == "before")
+            .unwrap();
+        let after = events
+            .iter()
+            .find(|event| event["type"] == "after")
+            .unwrap();
+        let recorded_start = before["startTime"].as_u64().unwrap();
+        let end = after["endTime"].as_u64().unwrap();
+        assert!(recorded_start >= context_time);
+        assert!(end >= recorded_start);
+        assert!(end - recorded_start < 1_000);
     }
 
     #[test]
