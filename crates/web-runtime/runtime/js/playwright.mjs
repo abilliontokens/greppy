@@ -77,6 +77,30 @@ function engineCall(method, params) {
   return result;
 }
 
+async function rejectActionNavigationFailure(page, actionResult) {
+  const navigationEpoch = actionResult && actionResult.navigation_epoch;
+  if (navigationEpoch == null) return;
+  const result = await engineCall("page.take_navigation_failure", {
+    page: page._id,
+    navigation_epoch: navigationEpoch,
+  });
+  const failure = result && result.failure;
+  if (!failure) return;
+  const kind = String(failure.kind || "transport");
+  const requestId = String(failure.requestId || "unknown");
+  const url = String(failure.url || "unknown");
+  const detail = String(failure.errorText || "transport failure");
+  const error = new Error(
+    `navigation failed: ${detail} (kind=${kind}, request_id=${requestId}, url=${url})`,
+  );
+  error.name = "NavigationError";
+  error.code = kind;
+  error.kind = kind;
+  error.requestId = requestId;
+  error.url = url;
+  throw error;
+}
+
 function locatorParams(locator, extra) {
   if (locator._page && locator._page._closed) {
     throwObjectDisposed("Page");
@@ -487,9 +511,10 @@ class Locator {
     if (this._selector && this._selector.type === "css" && this._selector.value) {
       this._page._lastFileSelector = this._selector.value;
     }
-    await engineCall("locator.click", {
+    const result = await engineCall("locator.click", {
       ...locatorParams(this, { timeout }),
     });
+    await rejectActionNavigationFailure(this._page, result);
     await this._page._flushPopups();
   }
 

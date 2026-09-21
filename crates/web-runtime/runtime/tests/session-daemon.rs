@@ -4395,6 +4395,104 @@ console.log(JSON.stringify({
 }
 
 #[test]
+fn controller_locator_click_consumes_only_its_navigation_failure() {
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("closed port");
+    let refused = format!("http://{}/refused", closed_listener.local_addr().unwrap());
+    drop(closed_listener);
+    let destination = serve_status_fixture();
+    let fixture = serve_fixture(Box::leak(
+        format!(
+            "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='refused' href='{refused}'>Refused</a><a id='redirect' href='{destination}jump'>Redirect</a><button id='clean' onclick='window.clean=(window.clean||0)+1'>Clean</button>"
+        )
+        .into_boxed_str(),
+    ));
+    let socket = std::env::temp_dir().join(format!(
+        "greppy-web-controller-navigation-{}.sock",
+        std::process::id()
+    ));
+    let _guard = Supervisor::spawn(&socket, "run_controller_navigation", |command| {
+        command.arg("--fixture-url").arg(&fixture);
+    });
+    wait_for_socket(&socket, Duration::from_secs(30));
+    let call = |method: &str, payload| {
+        unix_request(
+            &socket,
+            &Request::new("run_controller_navigation", method, payload),
+            Duration::from_secs(30),
+        )
+        .expect("controller navigation request")
+    };
+    let create_page = || {
+        let created = call("web.session.create", json!({"profile":"project"}));
+        let session = created.result.as_ref().unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let opened = call("web.goto", json!({"session_id":session,"url":fixture}));
+        assert_eq!(opened.status, "ok", "open controller fixture: {opened:?}");
+        session
+    };
+    for (selector, expected_kind, install_route) in [
+        ("#abort", "route_aborted", true),
+        ("#refused", "transport", false),
+    ] {
+        let session = create_page();
+        let script = format!(
+            r#"
+{route}
+let failure;
+try {{
+  await page.locator({selector:?}).click();
+}} catch (error) {{
+  failure = {{ name:error.name, code:error.code, kind:error.kind, requestId:error.requestId, url:error.url, message:error.message }};
+}}
+await page.locator('#clean').click();
+console.log(JSON.stringify({{ failure, clean: await page.evaluate(() => window.clean) }}));
+"#,
+            route = if install_route {
+                "await page.route('**/aborted', route => route.abort());"
+            } else {
+                ""
+            },
+        );
+        let run = call(
+            "web.run",
+            json!({
+                "session_id": session,
+                "script_source": "inline",
+                "bind_session_page": true,
+                "script_text": script,
+            }),
+        );
+        assert_eq!(run.status, "ok", "{selector}: {run:?}");
+        let stdout = run.result.as_ref().unwrap()["stdout"].as_str().unwrap();
+        assert!(stdout.contains(&format!("\"kind\":\"{expected_kind}\"")), "{run:?}");
+        assert!(stdout.contains("\"requestId\":"), "{run:?}");
+        assert!(stdout.contains("\"url\":"), "{run:?}");
+        assert!(stdout.contains("\"clean\":1"), "{run:?}");
+    }
+
+    let session = create_page();
+    let redirected = call(
+        "web.run",
+        json!({
+            "session_id": session,
+            "script_source": "inline",
+            "bind_session_page": true,
+            "script_text": "await page.locator('#redirect').click(); console.log(page.url());",
+        }),
+    );
+    assert_eq!(redirected.status, "ok", "redirect: {redirected:?}");
+    assert!(
+        redirected.result.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("/landed"),
+        "{redirected:?}"
+    );
+}
+
+#[test]
 fn web_goto_does_not_treat_ordinary_page_text_as_a_servo_error() {
     let fixture = serve_navigation_lifecycle_fixture();
     let url = format!("{}/phrase", fixture.origin);
