@@ -3411,7 +3411,7 @@ fn query_wait_for_active_refresh_returns_fresh_results_without_retry() {
     .unwrap();
     let mut writer = hold_index_before_publish(&repo, &store, "bounded-query-refresh");
     let output = query_after_releasing_writer(
-        &["search-symbol", "refresh_marker", "--json"],
+        &["search-symbol", "refresh_marker", "--json", "--diagnostics"],
         &repo,
         &store,
         &mut writer,
