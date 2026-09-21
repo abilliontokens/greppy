@@ -1,61 +1,34 @@
 use super::*;
 use clap::Parser;
 
-struct TestOwnerPipe(std::sync::mpsc::Receiver<()>);
+struct InterruptedOnce {
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
 
-impl std::io::Read for TestOwnerPipe {
+impl std::io::Read for InterruptedOnce {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        match self.0.recv() {
-            Ok(()) => {
-                buffer[0] = 1;
-                Ok(1)
-            }
-            Err(_) => Ok(0),
+        let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if read == 0 {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        } else {
+            let _ = buffer;
+            Ok(0)
         }
     }
 }
 
 #[test]
-fn base_build_owner_alive_does_not_cancel_staging_child() {
-    let (owner, reader) = std::sync::mpsc::channel();
-    let (cancelled, cancellation) = std::sync::mpsc::channel();
-    let watcher = std::thread::spawn(move || {
-        watch_base_build_owner(TestOwnerPipe(reader), || cancelled.send(()).unwrap());
-    });
-
-    assert!(cancellation
-        .recv_timeout(std::time::Duration::from_millis(50))
-        .is_err());
-    owner.send(()).unwrap();
-    assert!(cancellation
-        .recv_timeout(std::time::Duration::from_millis(50))
-        .is_err());
-
-    drop(owner);
-    cancellation
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
-    watcher.join().unwrap();
-}
-
-#[test]
-fn base_build_owner_eof_cancels_staging_child() {
-    let (owner, reader) = std::sync::mpsc::channel();
-    let (cancelled, cancellation) = std::sync::mpsc::channel();
-    let watcher = std::thread::spawn(move || {
-        watch_base_build_owner(TestOwnerPipe(reader), || cancelled.send(()).unwrap());
-    });
-
-    drop(owner);
-    cancellation
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
-    watcher.join().unwrap();
-}
-
-#[test]
-fn ordinary_detached_process_does_not_request_base_owner_watchdog() {
-    assert!(!base_build_owner_watchdog_requested(None));
+fn base_build_owner_watchdog_retries_interrupted_reads() {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut cancelled = false;
+    watch_base_build_owner(
+        InterruptedOnce {
+            reads: reads.clone(),
+        },
+        || cancelled = true,
+    );
+    assert!(cancelled);
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[cfg(not(feature = "cpu-only"))]

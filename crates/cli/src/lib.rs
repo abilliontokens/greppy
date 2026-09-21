@@ -778,15 +778,16 @@ pub fn startup_trace(phase: &str) {
 /// index process to the builder's lifetime.
 pub const ENV_BASE_BUILD_OWNER_STDIN: &str = "GREPPY_INTERNAL_BASE_BUILD_OWNER_STDIN";
 
-fn base_build_owner_watchdog_requested(marker: Option<&std::ffi::OsStr>) -> bool {
-    marker.is_some()
-}
-
 fn watch_base_build_owner(mut owner: impl std::io::Read, owner_lost: impl FnOnce()) {
     let mut byte = [0_u8; 1];
     loop {
         match owner.read(&mut byte) {
-            Ok(0) | Err(_) => {
+            Ok(0) => {
+                owner_lost();
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
                 owner_lost();
                 return;
             }
@@ -804,7 +805,7 @@ fn watch_base_build_owner(mut owner: impl std::io::Read, owner_lost: impl FnOnce
 /// inherit the internal ownership contract.
 pub fn install_base_build_owner_watchdog() {
     let marker = std::env::var_os(ENV_BASE_BUILD_OWNER_STDIN);
-    if !base_build_owner_watchdog_requested(marker.as_deref()) {
+    if marker.is_none() {
         return;
     }
     std::env::remove_var(ENV_BASE_BUILD_OWNER_STDIN);
@@ -817,6 +818,38 @@ pub fn install_base_build_owner_watchdog() {
         eprintln!("greppy: cannot install immutable Base owner guard: {error}");
         std::process::exit(73);
     }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn base_build_owner_watchdog_descendant_probe() -> Option<u8> {
+    std::env::var_os("GREPPY_TEST_BASE_OWNER_DESCENDANT_PROBE")
+        .map(|_| u8::from(std::env::var_os(ENV_BASE_BUILD_OWNER_STDIN).is_some()))
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn run_base_build_owner_watchdog_test_harness() -> Option<u8> {
+    let hold_ms = std::env::var("GREPPY_TEST_BASE_OWNER_HOLD_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    let descendant = std::process::Command::new(std::env::current_exe().ok()?)
+        .env("GREPPY_TEST_BASE_OWNER_DESCENDANT_PROBE", "1")
+        .env_remove("GREPPY_TEST_BASE_OWNER_HOLD_MS")
+        .env_remove("GREPPY_TEST_BASE_OWNER_READY")
+        .status()
+        .ok()?;
+    if !descendant.success() {
+        return Some(74);
+    }
+    if let Some(ready) = std::env::var_os("GREPPY_TEST_BASE_OWNER_READY") {
+        if std::fs::write(ready, b"ready\n").is_err() {
+            return Some(74);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+    Some(0)
 }
 
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
