@@ -3357,12 +3357,12 @@ fn read_queries_serve_published_snapshot_during_lifecycle_contention_without_sil
         }
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(0), "{output:?}");
-        let response = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("lib.rs:1") && stdout.contains("lifecycle_marker"),
+            "unexpected stdout: {stdout}\nstderr: {stderr}"
         );
-        assert!(response.contains("lifecycle_marker"), "{response}");
     }
     drop(lease);
     let (code, out, err) = run(&["search-symbol", "lifecycle_marker"], &repo, &store);
