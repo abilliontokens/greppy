@@ -1,6 +1,5 @@
 use crate::protocol::{read_message, timeout_ms_from_json, write_message, Message, WorkerKind};
 use crate::worker::require_worker_auth;
-use std::fs::File;
 use deno_core::error::CoreError;
 use deno_core::url::Url;
 use deno_core::{
@@ -11,6 +10,7 @@ use deno_core::{
 use deno_error::JsErrorBox;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -30,14 +30,8 @@ struct EngineBridge {
     next_id: Arc<AtomicU64>,
     stdout: Arc<Mutex<File>>,
     script_stdout: Arc<Mutex<Vec<String>>>,
-    pending: Arc<
-        Mutex<
-            HashMap<
-                u64,
-                tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
-            >,
-        >,
-    >,
+    pending:
+        Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>>,
 }
 
 struct PlaywrightLoader {
@@ -311,9 +305,33 @@ fn op_read_temp_png(#[string] path: String) -> Result<String, JsErrorBox> {
     Ok(base64_encode_png(&bytes))
 }
 
+#[op2]
+fn op_write_trace_archive(
+    #[string] path: String,
+    #[string] trace: String,
+) -> Result<(), JsErrorBox> {
+    let archive = crate::playwright_trace::archive_jsonl(trace.as_bytes(), b"")
+        .map_err(JsErrorBox::generic)?;
+    let destination = PathBuf::from(path);
+    if destination.as_os_str().is_empty() {
+        return Err(JsErrorBox::generic(
+            "Tracing.stop requires a non-empty path",
+        ));
+    }
+    if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    }
+    let temporary = destination.with_extension("greppy-trace-tmp");
+    std::fs::write(&temporary, archive).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    std::fs::rename(&temporary, &destination).map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        JsErrorBox::generic(e.to_string())
+    })
+}
+
 extension!(
     greppy_playwright,
-    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png],
+    ops = [op_engine_call, op_sleep_ms, op_capture_stdout, op_read_temp_png, op_write_trace_archive],
     options = { bridge: EngineBridge },
     state = |state, options| {
         state.put(options.bridge);
@@ -465,10 +483,9 @@ fn run_with_tokio(tokio_runtime: tokio::runtime::Runtime) -> io::Result<()> {
                 let payload = serde_json::json!({ "stdout": captured });
                 let mut stdout = stdout.lock().unwrap_or_else(|error| error.into_inner());
                 match result {
-                    Ok(()) => write_message(
-                        &mut *stdout,
-                        &Message::script_complete(true, payload, None),
-                    )?,
+                    Ok(()) => {
+                        write_message(&mut *stdout, &Message::script_complete(true, payload, None))?
+                    }
                     Err(error) => write_message(
                         &mut *stdout,
                         &Message::script_complete(false, payload, Some(error)),

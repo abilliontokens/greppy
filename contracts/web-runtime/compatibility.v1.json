@@ -11855,12 +11855,12 @@
       "symbol": "Tracing.start",
       "kind": "method",
       "origin": "parser",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
-      "tests": [],
+      "schema": "implemented",
+      "source": "implemented",
+      "behavior": "implemented",
+      "tests": ["native-trace-v10"],
       "known_differences": [
-        "Calls MUST fail with unsupported_playwright_operation. No Chromium trace."
+        "Playwright trace schema v10 action recording is supported. screenshots, snapshots and sources options fail explicitly."
       ]
     },
     {
@@ -11895,12 +11895,12 @@
       "symbol": "Tracing.stop",
       "kind": "method",
       "origin": "parser",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
-      "tests": [],
+      "schema": "implemented",
+      "source": "implemented",
+      "behavior": "implemented",
+      "tests": ["native-trace-v10"],
       "known_differences": [
-        "Calls MUST fail with unsupported_playwright_operation. No Chromium trace."
+        "Writes a Playwright trace schema v10 archive containing trace.trace and trace.network."
       ]
     },
     {
@@ -15603,12 +15603,12 @@
       "symbol": "BrowserContext.tracing",
       "kind": "property",
       "origin": "types.d.ts recovery",
-      "schema": "unsupported",
-      "source": "unsupported",
-      "behavior": "unsupported",
-      "tests": [],
+      "schema": "implemented",
+      "source": "implemented",
+      "behavior": "implemented",
+      "tests": ["native-trace-v10"],
       "known_differences": [
-        "No Playwright trace.zip. start/stop MUST fail with unsupported_playwright_operation. Returning request/download dumps is not tracing compatibility."
+        "Action recording uses Playwright trace schema v10; snapshots, screenshots, sources, chunks and groups remain unsupported and fail explicitly."
       ]
     },
     {

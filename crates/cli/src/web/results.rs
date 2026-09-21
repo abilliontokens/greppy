@@ -477,7 +477,7 @@ pub(super) fn dispatch(command: ResultsCommand, root: Option<&str>) -> Result<i3
     }
 }
 
-fn artifact_export(
+pub(super) fn artifact_export(
     root: Option<&str>,
     session: Option<String>,
     id: String,

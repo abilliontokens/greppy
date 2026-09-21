@@ -27,6 +27,25 @@ function throwObjectDisposed(kind) {
 const disposedPages = new Set();
 const disposedContexts = new Set();
 const disposedBrowsers = new Set();
+let activeTrace = null;
+
+function traceEvent(value) {
+  if (!activeTrace) return;
+  const line = JSON.stringify(value) + "\n";
+  activeTrace.bytes += line.length;
+  if (activeTrace.bytes > 8 * 1024 * 1024) {
+    activeTrace = null;
+    throw new Error("trace recording exceeded the 8 MiB in-memory limit; stop the trace sooner");
+  }
+  activeTrace.lines.push(line);
+}
+
+function traceRedact(value, key = "") {
+  if (/authorization|cookie|password|token|secret/i.test(key)) return "<redacted>";
+  if (Array.isArray(value)) return value.map((entry) => traceRedact(entry));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, traceRedact(entry, name)]));
+  return value;
+}
 
 function screenshotBuffer(result) {
   if (result && result.png_path) {
@@ -56,10 +75,13 @@ function engineCall(method, params) {
     payload.timeout = 30_000;
   }
   const result = ops.op_engine_call(method, payload);
+  const callId = activeTrace ? "call@" + activeTrace.next++ : null;
+  if (callId) traceEvent({ type: "before", callId, startTime: Date.now(), apiName: method, class: "Greppy", method, params: traceRedact(payload), wallTime: Date.now() });
   if (result && typeof result.then === "function") {
     return result.then(
-      (value) => value,
+      (value) => { if (callId) traceEvent({ type: "after", callId, endTime: Date.now(), result: traceRedact(value) }); return value; },
       (error) => {
+        if (callId) traceEvent({ type: "after", callId, endTime: Date.now(), error: { message: String(error && error.message ? error.message : error) } });
         const message = String(error && error.message ? error.message : error);
         if (message.includes("timed out") || message.includes("timeout")) {
           throw new TimeoutError(message);
@@ -2852,13 +2874,21 @@ class BrowserContext {
     this._initScripts = [];
     this._closed = false;
     this._handlers = {};
-    this.tracing = withUnsupported(
-      {
-        start: async () => unsupported("BrowserContext.tracing.start")(),
-        stop: async () => unsupported("BrowserContext.tracing.stop")(),
+    this.tracing = withUnsupported({
+      start: async (options = {}) => {
+        for (const key of ["screenshots", "snapshots", "sources"]) if (options[key]) throw new Error(`Tracing.start option ${key} is unsupported`);
+        if (activeTrace) throw new Error("a trace is already recording in this controller");
+        activeTrace = { context: this._id, lines: [], bytes: 0, next: 1 };
+        traceEvent({ version: 10, type: "context-options", origin: "library", browserName: "greppy", playwrightVersion: "1.52", options: {}, platform: "native", wallTime: Date.now(), monotonicTime: 0, sdkLanguage: "javascript" });
       },
-      "Tracing",
-    );
+      stop: async (options = {}) => {
+        for (const key of Object.keys(options)) if (key !== "path") throw new Error(`Tracing.stop option ${key} is unsupported`);
+        if (!activeTrace || activeTrace.context !== this._id) throw new Error("no trace is recording for this BrowserContext");
+        const trace = activeTrace.lines.join(""); activeTrace = null;
+        if (options.path == null) return;
+        ops.op_write_trace_archive(String(options.path), trace);
+      },
+    }, "Tracing");
     this.clock = withUnsupported(
       {
         install: unsupported("Clock.install"),
