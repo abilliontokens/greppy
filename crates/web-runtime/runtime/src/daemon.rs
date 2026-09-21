@@ -2011,6 +2011,9 @@ impl Daemon {
             "query": query, "include_html": include_html,
         }), timeout, recover_worker)?;
         let object = tree.as_object_mut().ok_or("observe returned no page object")?;
+        if let Some(error) = observed_navigation_error(object) {
+            return Err(format!("navigation failed: {error}"));
+        }
         let token = object.remove("ref_snapshot")
             .and_then(|value| value.as_str().map(str::to_owned))
             .ok_or("observe returned no document scope")?;
@@ -2057,12 +2060,19 @@ impl Daemon {
         mut result: serde_json::Value,
     ) -> Response {
         // Observe exactly once, before the original operation becomes idle.
-        // Observation failure cannot replay or erase a completed side effect.
-        let state = if self.workflow_defer_observation {
-            None
-        } else {
-            Some(page_state_envelope(self.observe_page(session_id, page)))
-        };
+        // Ordinary observation failure cannot replay or erase a completed
+        // side effect. Servo's transport-error document is the result of a
+        // navigation action, so surface that specific failure as the action's
+        // typed engine error instead of reporting the error page as success.
+        let observation = (!self.workflow_defer_observation)
+            .then(|| self.observe_page(session_id, page));
+        if let Some(Err(error)) = observation.as_ref()
+            && error.starts_with("navigation failed: ")
+        {
+            self.finish_session(session_id);
+            return engine_error(request, error, 34);
+        }
+        let state = observation.map(page_state_envelope);
         if let Some(object) = result.as_object_mut() {
             // Identity comes from the resolved native target, including an
             // implicit active tab, not from an optional CLI request field.
@@ -4587,6 +4597,13 @@ fn page_state_envelope(observation: Result<serde_json::Value, String>) -> serde_
     }
 }
 
+fn observed_navigation_error(object: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    let title = object.get("title").and_then(serde_json::Value::as_str)?;
+    let text = object.get("text").and_then(serde_json::Value::as_str)?;
+    (title == "Error loading page" && text.starts_with("Could not load the requested page:"))
+        .then_some(text)
+}
+
 fn locator_error(request: &Request, message: impl Into<String>) -> Response {
     let message = redact_secrets(&message.into());
     let (code, next_action) = recovery_for_locator_error(&message);
@@ -5872,6 +5889,34 @@ mod redirect_chain_tests {
         assert_eq!(payload["path"], format!("objects/sha256/{digest}"));
         assert_eq!(payload["label"], "web.read");
         assert_eq!(payload["redaction_status"], "redacted_for_model");
+    }
+
+    #[test]
+    fn servo_transport_error_document_is_not_a_successful_observation() {
+        let failed = json!({
+            "title": "Error loading page",
+            "text": "Could not load the requested page: client error (SendRequest)",
+        });
+        assert_eq!(
+            super::observed_navigation_error(failed.as_object().unwrap()),
+            Some("Could not load the requested page: client error (SendRequest)")
+        );
+
+        for ordinary in [
+            json!({
+                "title": "Troubleshooting",
+                "text": "Could not load the requested page: an example for readers",
+            }),
+            json!({
+                "title": "Error loading page",
+                "text": "The application reported a validation error",
+            }),
+        ] {
+            assert_eq!(
+                super::observed_navigation_error(ordinary.as_object().unwrap()),
+                None
+            );
+        }
     }
 
     #[test]
