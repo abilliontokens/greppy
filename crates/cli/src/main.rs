@@ -3,6 +3,7 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    greppy::install_base_build_owner_watchdog();
     greppy::startup_trace("main.enter");
     // Tracing initialisation is best-effort: a failure should not block
     // the binary from running.

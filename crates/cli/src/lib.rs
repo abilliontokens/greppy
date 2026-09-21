@@ -774,6 +774,51 @@ pub fn startup_trace(phase: &str) {
     );
 }
 
+/// Private contract used by the immutable Base builder to bind its staging
+/// index process to the builder's lifetime.
+pub const ENV_BASE_BUILD_OWNER_STDIN: &str = "GREPPY_INTERNAL_BASE_BUILD_OWNER_STDIN";
+
+fn base_build_owner_watchdog_requested(marker: Option<&std::ffi::OsStr>) -> bool {
+    marker.is_some()
+}
+
+fn watch_base_build_owner(mut owner: impl std::io::Read, owner_lost: impl FnOnce()) {
+    let mut byte = [0_u8; 1];
+    loop {
+        match owner.read(&mut byte) {
+            Ok(0) | Err(_) => {
+                owner_lost();
+                return;
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Installs the lifetime guard for a nested immutable Base staging index.
+///
+/// The parent holds the write side of stdin until the nested index exits. If
+/// the parent disappears, EOF stops this process before it can keep indexing a
+/// staging database that no surviving process can publish. The marker is
+/// removed before CLI dispatch so model daemons spawned by this process do not
+/// inherit the internal ownership contract.
+pub fn install_base_build_owner_watchdog() {
+    let marker = std::env::var_os(ENV_BASE_BUILD_OWNER_STDIN);
+    if !base_build_owner_watchdog_requested(marker.as_deref()) {
+        return;
+    }
+    std::env::remove_var(ENV_BASE_BUILD_OWNER_STDIN);
+    if let Err(error) = std::thread::Builder::new()
+        .name("greppy-base-build-owner".into())
+        .spawn(|| {
+            watch_base_build_owner(std::io::stdin(), || std::process::exit(73));
+        })
+    {
+        eprintln!("greppy: cannot install immutable Base owner guard: {error}");
+        std::process::exit(73);
+    }
+}
+
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     startup_trace("run_os.enter");
     // Hidden Landlock launcher (Linux only): the agent sandbox rewrites tool

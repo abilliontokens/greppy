@@ -1376,14 +1376,25 @@ fn prepare_base_store_paths(
         .env_remove(ENV_MODE)
         .env_remove(ENV_BASE_PATH)
         .env_remove(ENV_BASE_COMMIT)
-        .stdin(Stdio::null())
+        .env(crate::ENV_BASE_BUILD_OWNER_STDIN, "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null());
     if let Some(path) = progress_path {
         command.env(crate::ENV_DELEGATED_BACKGROUND_JOB, path);
     }
-    let status = command
-        .status()
+    let mut child = command
+        .spawn()
         .map_err(|error| Error::io("start immutable Base index build", error))?;
+    // Child::wait closes a still-attached stdin. Take the pipe and retain its
+    // writer explicitly so EOF means that this owner died, not that it waited.
+    let owner_writer = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Invalid("immutable Base index build has no owner pipe".into()))?;
+    let status = child
+        .wait()
+        .map_err(|error| Error::io("wait for immutable Base index build", error))?;
+    drop(owner_writer);
     if !status.success() {
         return Err(Error::Invalid(format!(
             "immutable Base index build exited {status}"

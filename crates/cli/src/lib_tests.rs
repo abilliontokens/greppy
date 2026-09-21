@@ -1,6 +1,63 @@
 use super::*;
 use clap::Parser;
 
+struct TestOwnerPipe(std::sync::mpsc::Receiver<()>);
+
+impl std::io::Read for TestOwnerPipe {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.recv() {
+            Ok(()) => {
+                buffer[0] = 1;
+                Ok(1)
+            }
+            Err(_) => Ok(0),
+        }
+    }
+}
+
+#[test]
+fn base_build_owner_alive_does_not_cancel_staging_child() {
+    let (owner, reader) = std::sync::mpsc::channel();
+    let (cancelled, cancellation) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        watch_base_build_owner(TestOwnerPipe(reader), || cancelled.send(()).unwrap());
+    });
+
+    assert!(cancellation
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+    owner.send(()).unwrap();
+    assert!(cancellation
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+
+    drop(owner);
+    cancellation
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    watcher.join().unwrap();
+}
+
+#[test]
+fn base_build_owner_eof_cancels_staging_child() {
+    let (owner, reader) = std::sync::mpsc::channel();
+    let (cancelled, cancellation) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        watch_base_build_owner(TestOwnerPipe(reader), || cancelled.send(()).unwrap());
+    });
+
+    drop(owner);
+    cancellation
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    watcher.join().unwrap();
+}
+
+#[test]
+fn ordinary_detached_process_does_not_request_base_owner_watchdog() {
+    assert!(!base_build_owner_watchdog_requested(None));
+}
+
 #[cfg(not(feature = "cpu-only"))]
 #[test]
 fn product_build_contains_embedding_and_summary_gpu_backends() {
