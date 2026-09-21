@@ -1730,13 +1730,17 @@ pub(crate) fn index_embeddings_into_temp_store(
         // semantic query (or the spawned background job) re-runs the
         // embedding pass, reusing every vector that DID embed by content
         // hash and retrying only the failed documents.
-        let reason = format!(
+        let mut reason = format!(
             "{} of {} embedding documents failed inference",
             embedding_report.nodes_failed,
             embedding_report
                 .nodes_failed
                 .saturating_add(embedding_report.nodes_embedded)
         );
+        if let Some(cause) = provider.last_error() {
+            reason.push_str(": ");
+            reason.push_str(cause);
+        }
         return Ok(EmbeddingBuildOutcome::Degraded {
             report: Some(embedding_report),
             reason,
