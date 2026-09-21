@@ -1,16 +1,22 @@
 use std::process::{Command, Stdio};
+#[cfg(debug_assertions)]
 use std::time::{Duration, Instant};
 
+#[cfg(debug_assertions)]
 const OWNER_MARKER: &str = "GREPPY_INTERNAL_BASE_BUILD_OWNER_STDIN";
+#[cfg(debug_assertions)]
 const HOLD_MS: &str = "GREPPY_TEST_BASE_OWNER_HOLD_MS";
+#[cfg(debug_assertions)]
 const READY: &str = "GREPPY_TEST_BASE_OWNER_READY";
 
 fn greppy() -> Command {
     Command::new(env!("CARGO_BIN_EXE_greppy"))
 }
 
+#[cfg(debug_assertions)]
 struct ChildGuard(std::process::Child);
 
+#[cfg(debug_assertions)]
 impl ChildGuard {
     fn wait_bounded(&mut self, timeout: Duration) -> std::process::ExitStatus {
         let deadline = Instant::now() + timeout;
@@ -27,6 +33,7 @@ impl ChildGuard {
     }
 }
 
+#[cfg(debug_assertions)]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if self.0.try_wait().ok().flatten().is_none() {
@@ -37,6 +44,7 @@ impl Drop for ChildGuard {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn held_owner_pipe_allows_completion_and_is_not_inherited() {
     let mut child = ChildGuard(
         greppy()
@@ -55,6 +63,7 @@ fn held_owner_pipe_allows_completion_and_is_not_inherited() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn closing_owner_pipe_stops_nested_process_with_io_exit() {
     let temp = tempfile::tempdir().unwrap();
     let ready = temp.path().join("ready");
