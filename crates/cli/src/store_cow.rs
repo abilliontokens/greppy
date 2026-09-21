@@ -1142,30 +1142,27 @@ impl Drop for TemporaryBaseWorktree {
 
 fn primary_worktree_root(root: &Path) -> Result<PathBuf> {
     let expected_repository = canonical_repository_identity(root)?;
-    let paths = compatible_worktree_paths(|nul_terminated| {
-        let mut command = Command::new("git");
-        command
-            .arg("-C")
-            .arg(root)
-            .args(["worktree", "list", "--porcelain"]);
-        if nul_terminated {
-            command.arg("-z");
-        }
-        let output = command
-            .output()
-            .map_err(|error| Error::io("list linked Git worktrees", error))?;
-        if output.status.success() {
-            Ok(output.stdout)
-        } else {
-            Err(Error::Invalid(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ))
-        }
-    })?;
-    for path in paths {
-        let path = std::str::from_utf8(&path)
-            .map_err(|_| Error::Invalid("Git worktree path is not valid UTF-8".into()))?;
-        let candidate = PathBuf::from(path);
+    let paths = compatible_worktree_paths(
+        || {
+            let mut command = Command::new("git");
+            command
+                .arg("-C")
+                .arg(root)
+                .args(["worktree", "list", "--porcelain", "-z"]);
+            let output = command
+                .output()
+                .map_err(|error| Error::io("list linked Git worktrees", error))?;
+            if output.status.success() {
+                Ok(output.stdout)
+            } else {
+                Err(Error::Invalid(
+                    String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                ))
+            }
+        },
+        || canonical_repository_common_dir(root),
+    )?;
+    for candidate in paths {
         if candidate.join(".git").is_dir()
             && canonical_repository_identity(&candidate)? == expected_repository
         {
@@ -1179,110 +1176,44 @@ fn primary_worktree_root(root: &Path) -> Result<PathBuf> {
 }
 
 fn compatible_worktree_paths(
-    mut list: impl FnMut(bool) -> Result<Vec<u8>>,
-) -> Result<Vec<Vec<u8>>> {
-    match list(true) {
+    list_nul: impl FnOnce() -> Result<Vec<u8>>,
+    common_dir: impl FnOnce() -> Result<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    match list_nul() {
         Ok(output) => parse_nul_worktree_paths(&output),
-        Err(nul_error) => match list(false) {
-            Ok(output) => parse_legacy_worktree_paths(&output),
-            Err(legacy_error) => Err(Error::Invalid(format!(
-                "cannot list linked Git worktrees with NUL or legacy porcelain output: {nul_error}; {legacy_error}"
-            ))),
-        },
-    }
-}
-
-fn parse_nul_worktree_paths(output: &[u8]) -> Result<Vec<Vec<u8>>> {
-    Ok(output
-        .split(|byte| *byte == 0)
-        .filter_map(|field| field.strip_prefix(b"worktree ").map(<[u8]>::to_vec))
-        .collect())
-}
-
-fn parse_legacy_worktree_paths(output: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let path_and_records = output
-        .strip_prefix(b"worktree ")
-        .ok_or_else(|| Error::Invalid("legacy Git worktree list has no primary record".into()))?;
-    for (newline, _) in path_and_records
-        .iter()
-        .enumerate()
-        .filter(|(_, byte)| **byte == b'\n')
-    {
-        let metadata = &path_and_records[newline + 1..];
-        if metadata.starts_with(b"bare\n") || legacy_head_record(metadata) {
-            return unquote_git_path(&path_and_records[..newline]).map(|path| vec![path]);
-        }
-    }
-    Err(Error::Invalid(
-        "legacy Git worktree list has no complete primary record".into(),
-    ))
-}
-
-fn legacy_head_record(metadata: &[u8]) -> bool {
-    let Some(after_head) = metadata.strip_prefix(b"HEAD ") else {
-        return false;
-    };
-    let Some(newline) = after_head.iter().position(|byte| *byte == b'\n') else {
-        return false;
-    };
-    let object_id = &after_head[..newline];
-    let state = &after_head[newline + 1..];
-    matches!(object_id.len(), 40 | 64)
-        && object_id.iter().all(u8::is_ascii_hexdigit)
-        && (state.starts_with(b"branch ") || state.starts_with(b"detached\n"))
-}
-
-fn unquote_git_path(path: &[u8]) -> Result<Vec<u8>> {
-    if !path.starts_with(b"\"") {
-        return Ok(path.to_vec());
-    }
-    if path.len() < 2 || !path.ends_with(b"\"") {
-        return Err(Error::Invalid(
-            "malformed quoted path in git worktree list output".into(),
-        ));
-    }
-    let mut decoded = Vec::with_capacity(path.len() - 2);
-    let mut bytes = path[1..path.len() - 1].iter().copied().peekable();
-    while let Some(byte) = bytes.next() {
-        if byte != b'\\' {
-            decoded.push(byte);
-            continue;
-        }
-        let escaped = bytes
-            .next()
-            .ok_or_else(|| Error::Invalid("truncated escape in git worktree path".into()))?;
-        match escaped {
-            b'a' => decoded.push(0x07),
-            b'b' => decoded.push(0x08),
-            b't' => decoded.push(b'\t'),
-            b'n' => decoded.push(b'\n'),
-            b'v' => decoded.push(0x0b),
-            b'f' => decoded.push(0x0c),
-            b'r' => decoded.push(b'\r'),
-            b'\\' | b'\"' => decoded.push(escaped),
-            b'0'..=b'7' => {
-                let mut value = escaped - b'0';
-                for _ in 0..2 {
-                    let Some(next @ b'0'..=b'7') = bytes.peek().copied() else {
-                        break;
-                    };
-                    bytes.next();
-                    value = value
-                        .checked_mul(8)
-                        .and_then(|value| value.checked_add(next - b'0'))
-                        .ok_or_else(|| Error::Invalid("invalid octal Git path escape".into()))?;
-                }
-                decoded.push(value);
-            }
-            _ => {
+        Err(nul_error) => {
+            let common_dir = common_dir().map_err(|common_error| {
+                Error::Invalid(format!(
+                    "cannot list linked Git worktrees with NUL porcelain output: {nul_error}; cannot resolve the common Git directory: {common_error}"
+                ))
+            })?;
+            if common_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
                 return Err(Error::Invalid(format!(
-                    "invalid escape in git worktree path: \\{}",
-                    char::from(escaped)
-                )))
+                    "cannot list linked Git worktrees with NUL porcelain output: {nul_error}; common Git directory {} does not identify a primary checkout",
+                    common_dir.display()
+                )));
             }
+            let primary = common_dir.parent().ok_or_else(|| {
+                Error::Invalid(format!(
+                    "common Git directory {} has no parent checkout",
+                    common_dir.display()
+                ))
+            })?;
+            Ok(vec![primary.to_path_buf()])
         }
     }
-    Ok(decoded)
+}
+
+fn parse_nul_worktree_paths(output: &[u8]) -> Result<Vec<PathBuf>> {
+    output
+        .split(|byte| *byte == 0)
+        .filter_map(|field| field.strip_prefix(b"worktree "))
+        .map(|path| {
+            std::str::from_utf8(path)
+                .map(PathBuf::from)
+                .map_err(|_| Error::Invalid("Git worktree path is not valid UTF-8".into()))
+        })
+        .collect()
 }
 
 pub(crate) fn prepare_base_store(
@@ -1863,21 +1794,22 @@ fn base_identity_parts(repo: &Path, base_commit: &str) -> Result<BaseStoreIdenti
 }
 
 pub(crate) fn canonical_repository_identity(repo: &Path) -> Result<String> {
-    let common_dir = git_output(
+    let common_path = canonical_repository_common_dir(repo)?;
+    Ok(format!("git-common-dir:{}", common_path.display()))
+}
+
+fn canonical_repository_common_dir(repo: &Path) -> Result<PathBuf> {
+    let path = git_path_output(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
-    .or_else(|_| git_output(repo, &["rev-parse", "--git-common-dir"]))?;
-    let common_path = {
-        let path = PathBuf::from(&common_dir);
-        let absolute = if path.is_absolute() {
-            path
-        } else {
-            repo.join(path)
-        };
-        absolute.canonicalize().unwrap_or(absolute)
+    .or_else(|_| git_path_output(repo, &["rev-parse", "--git-common-dir"]))?;
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
     };
-    Ok(format!("git-common-dir:{}", common_path.display()))
+    Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
 pub(crate) fn visibility_against(root: &Path, base_commit: &str) -> Result<VisibilityIndex> {
@@ -1972,6 +1904,38 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     Ok(value)
 }
 
+fn git_path_output(root: &Path, args: &[&str]) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|error| Error::io(format!("run git {}", args.join(" ")), error))?;
+    if !output.status.success() {
+        return Err(Error::Invalid(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut value = output.stdout;
+    if value.last() == Some(&b'\n') {
+        value.pop();
+        if value.last() == Some(&b'\r') {
+            value.pop();
+        }
+    }
+    if value.is_empty() {
+        return Err(Error::Invalid(format!(
+            "git {} returned empty output",
+            args.join(" ")
+        )));
+    }
+    let value = String::from_utf8(value)
+        .map_err(|_| Error::Invalid(format!("git {} returned non-UTF-8", args.join(" "))))?;
+    Ok(PathBuf::from(value))
+}
+
 fn nul_fields(bytes: &[u8]) -> Result<Vec<String>> {
     bytes
         .split(|byte| *byte == 0)
@@ -2044,59 +2008,45 @@ mod tests {
 
     #[test]
     fn worktree_list_prefers_nul_porcelain_and_preserves_newlines() {
-        let mut invocations = Vec::new();
-        let paths = compatible_worktree_paths(|nul_terminated| {
-            invocations.push(nul_terminated);
-            Ok(b"worktree /repo with spaces\0HEAD deadbeef\0\0worktree /repo\nwith-newline\0bare\0\0".to_vec())
-        })
+        let mut common_dir_called = false;
+        let paths = compatible_worktree_paths(
+            || {
+                Ok(b"worktree /repo with spaces\0HEAD deadbeef\0\0worktree /repo\nwith-newline\0bare\0\0".to_vec())
+            },
+            || {
+                common_dir_called = true;
+                Ok(PathBuf::from("/unused/.git"))
+            },
+        )
         .unwrap();
 
-        assert_eq!(invocations, [true]);
+        assert!(!common_dir_called);
         assert_eq!(
             paths,
             [
-                b"/repo with spaces".to_vec(),
-                b"/repo\nwith-newline".to_vec()
+                PathBuf::from("/repo with spaces"),
+                PathBuf::from("/repo\nwith-newline")
             ]
         );
     }
 
     #[test]
-    fn worktree_list_falls_back_to_legacy_git_and_unquotes_paths() {
-        let mut invocations = Vec::new();
-        let paths = compatible_worktree_paths(|nul_terminated| {
-            invocations.push(nul_terminated);
-            if nul_terminated {
-                Err(Error::Invalid("unknown switch `z'".into()))
-            } else {
-                Ok(b"worktree /plain path  \nwith-newline\tand-tab\nHEAD 0123456789abcdef0123456789abcdef01234567\nbranch refs/heads/main\n\nworktree /linked\nHEAD 0123456789abcdef0123456789abcdef01234567\ndetached\n\n".to_vec())
-            }
-        })
-        .unwrap();
-
-        assert_eq!(invocations, [true, false]);
-        assert_eq!(paths, [b"/plain path  \nwith-newline\tand-tab".to_vec()]);
-    }
-
-    #[test]
-    fn legacy_worktree_path_decodes_c_quoted_variant() {
-        let paths = parse_legacy_worktree_paths(
-            b"worktree \"/quoted\\npath\\040with\\011tab\\\"and\\\\slash\"\nHEAD 0123456789abcdef0123456789abcdef01234567\ndetached\n\n",
+    fn worktree_list_falls_back_to_common_dir_without_parsing_legacy_output() {
+        let paths = compatible_worktree_paths(
+            || Err(Error::Invalid("unknown switch `z'".into())),
+            || Ok(PathBuf::from("/primary path\nwith-newline/.git")),
         )
         .unwrap();
 
-        assert_eq!(paths, [b"/quoted\npath with\ttab\"and\\slash".to_vec()]);
+        assert_eq!(paths, [PathBuf::from("/primary path\nwith-newline")]);
     }
 
     #[test]
-    fn worktree_list_reports_both_modern_and_legacy_failures() {
-        let error = compatible_worktree_paths(|nul_terminated| {
-            Err(Error::Invalid(if nul_terminated {
-                "unknown switch `z'".into()
-            } else {
-                "not a git repository".into()
-            }))
-        })
+    fn worktree_list_reports_modern_and_common_dir_failures() {
+        let error = compatible_worktree_paths(
+            || Err(Error::Invalid("unknown switch `z'".into())),
+            || Err(Error::Invalid("not a git repository".into())),
+        )
         .unwrap_err()
         .to_string();
 
@@ -2105,19 +2055,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_worktree_path_rejects_malformed_quotes_and_escapes() {
-        for malformed in [
-            b"\"".as_slice(),
-            b"\"unterminated".as_slice(),
-            b"\"invalid\\q\"".as_slice(),
-        ] {
-            let error = unquote_git_path(malformed).unwrap_err().to_string();
-            assert!(
-                error.contains("malformed quoted path")
-                    || error.contains("invalid escape in git worktree path"),
-                "{malformed:?}: {error}"
-            );
-        }
+    fn worktree_list_rejects_bare_common_dir_fallback() {
+        let error = compatible_worktree_paths(
+            || Err(Error::Invalid("unknown switch `z'".into())),
+            || Ok(PathBuf::from("/repositories/project.git")),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("does not identify a primary checkout"),
+            "{error}"
+        );
     }
 
     #[test]
