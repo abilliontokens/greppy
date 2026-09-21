@@ -48,10 +48,10 @@ mod trace_tests {
     #[test]
     fn captured_trace_limit_applies_to_aggregate_archives() {
         let mut captured = CapturedTraceArchives::default();
-        captured.push(&vec![0; MAX_CAPTURED_TRACE_BYTES / 2], "a.zip".into()).unwrap();
-        captured.push(&vec![0; MAX_CAPTURED_TRACE_BYTES / 2], "b.zip".into()).unwrap();
+        captured.push(&vec![0; 3 * 1024 * 1024], "a.zip".into()).unwrap();
+        captured.push(&vec![0; 3 * 1024 * 1024], "b.zip".into()).unwrap();
         assert!(captured.push(&[0], "c.zip".into()).is_err());
-        assert_eq!(captured.raw_bytes, MAX_CAPTURED_TRACE_BYTES);
+        assert_eq!(captured.encoded_bytes, MAX_CAPTURED_TRACE_BYTES);
         assert_eq!(captured.entries.len(), 2);
     }
 }
@@ -59,7 +59,7 @@ mod trace_tests {
 #[derive(Clone, Default)]
 struct CapturedTraceArchives {
     entries: Vec<CapturedTraceArchive>,
-    raw_bytes: usize,
+    encoded_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -69,12 +69,13 @@ const MAX_CAPTURED_TRACE_BYTES: usize = 8 * 1024 * 1024;
 
 impl CapturedTraceArchives {
     fn push(&mut self, archive: &[u8], requested_path: String) -> Result<(), JsErrorBox> {
-        if self.raw_bytes.saturating_add(archive.len()) > MAX_CAPTURED_TRACE_BYTES {
+        let encoded_len = archive.len().saturating_add(2) / 3 * 4;
+        if self.encoded_bytes.saturating_add(encoded_len) > MAX_CAPTURED_TRACE_BYTES {
             return Err(JsErrorBox::generic(
                 "captured trace archives exceeded the 8 MiB per-script limit",
             ));
         }
-        self.raw_bytes += archive.len();
+        self.encoded_bytes += encoded_len;
         self.entries.push(CapturedTraceArchive { encoded: base64_encode_png(archive), requested_path });
         Ok(())
     }
