@@ -2349,6 +2349,7 @@ impl ContentEngine {
                     _ => None,
                 };
                 if let Some(failure) = recorded_failure {
+                    delegate.navigation_failure.borrow_mut().take();
                     return Err(io::Error::other(format!(
                         "navigation failed: {failure}"
                     )));

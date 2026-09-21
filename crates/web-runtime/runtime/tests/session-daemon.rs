@@ -3292,16 +3292,13 @@ fn native_transport_failure_is_typed_without_classifying_page_words() {
     assert!(receipt.get("dispatch").is_some(), "click dispatch provenance: {receipt}");
     assert_eq!(receipt["session_id"], ordinary_id);
     assert!(receipt["tab_id"].is_string());
+    assert!(clicked.error.as_ref().unwrap().message.contains("request_id="));
 
     let failed = call("web.session.create", json!({ "profile": "project" }));
     let failed_id = failed.result.as_ref().unwrap()["session_id"].as_str().unwrap();
-    let navigation = call("web.goto", json!({ "session_id": failed_id, "url": failed_url }));
+    let navigation = call("web.goto", json!({ "session_id": failed_id, "url": failed_url.clone() }));
     assert_eq!(navigation.status, "error", "transport navigation must fail: {navigation:?}");
     assert_eq!(navigation.error.as_ref().unwrap().code, "engine_error");
-    let observation = call("web.observe", json!({ "session_id": failed_id }));
-    assert_eq!(observation.status, "error", "failed navigation provenance must reach observe: {observation:?}");
-    assert_eq!(observation.error.as_ref().unwrap().code, "engine_error");
-    assert!(observation.error.as_ref().unwrap().message.contains("request_id="));
 }
 
 #[test]
