@@ -258,6 +258,49 @@ fn semantic_embedding_wait_propagates_recorded_failure() {
 }
 
 #[test]
+fn semantic_embedding_wait_observes_owner_publication_lifecycle() {
+    let active = serde_json::json!({"kind": "embedding", "state": "embedding"});
+    assert_eq!(
+        observe_background_embedding(Some(&active), true, false, false),
+        BackgroundEmbeddingObservation::Pending
+    );
+    assert_eq!(
+        observe_background_embedding(None, false, true, false),
+        BackgroundEmbeddingObservation::Published
+    );
+}
+
+#[test]
+fn semantic_embedding_wait_propagates_failed_owner_after_release() {
+    let failed = serde_json::json!({
+        "kind": "embedding",
+        "state": "failed",
+        "last_error": "model execution failed",
+    });
+    assert_eq!(
+        observe_background_embedding(Some(&failed), false, false, false),
+        BackgroundEmbeddingObservation::Failed("model execution failed".into())
+    );
+}
+
+#[test]
+fn semantic_embedding_wait_follows_structural_owner_into_embedding() {
+    let index = serde_json::json!({"kind": "index", "state": "refreshing"});
+    assert_eq!(
+        observe_background_embedding(Some(&index), true, false, true),
+        BackgroundEmbeddingObservation::Pending
+    );
+    assert_eq!(
+        observe_background_embedding(None, false, false, true),
+        BackgroundEmbeddingObservation::FollowIndex
+    );
+    assert_eq!(
+        observe_background_embedding(None, false, false, false),
+        BackgroundEmbeddingObservation::MissingPublication
+    );
+}
+
+#[test]
 fn semantic_fallback_commands_use_query_tokens() {
     let commands = semantic_fallback_commands("find semantic progress marker", &[], None);
     assert_eq!(commands[0], "greppy search-symbol marker");

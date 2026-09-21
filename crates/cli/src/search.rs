@@ -1296,8 +1296,8 @@ pub(crate) fn dispatch_semantic(
     let allow_reindex = vector_auto_reindex_can_rebuild(embedding_args);
     let decision =
         freshness_serve_decision_with_policy(&store, root, &project, allow_reindex, false, false);
-    let incomplete_providers = incomplete_provider_json(&store, &project)?;
-    let freshness = decision.freshness().clone();
+    let mut incomplete_providers = incomplete_provider_json(&store, &project)?;
+    let mut freshness = decision.freshness().clone();
 
     if provider_policy_blocks_query(&incomplete_providers)? {
         if json {
@@ -1371,6 +1371,56 @@ pub(crate) fn dispatch_semantic(
             let root_path = resolve_root(root)?;
             drop(store);
             store = wait_for_embedding_publication(root, &root_path, &project, generation, &cfg)?;
+            let reopened_decision = freshness_serve_decision_with_policy(
+                &store,
+                root,
+                &project,
+                allow_reindex,
+                false,
+                false,
+            );
+            freshness = reopened_decision.freshness().clone();
+            incomplete_providers = incomplete_provider_json(&store, &project)?;
+            if provider_policy_blocks_query(&incomplete_providers)? {
+                if json {
+                    semantic_provider_incomplete_json(
+                        &project,
+                        "vector",
+                        Some(&freshness),
+                        &incomplete_providers,
+                    )?;
+                } else {
+                    println!(
+                        "{}",
+                        provider_incomplete_skip_message(
+                            "semantic-search",
+                            incomplete_providers.len()
+                        )
+                    );
+                }
+                return Ok(1);
+            }
+            if !freshness_json_is_fresh(&freshness) {
+                if json {
+                    semantic_vector_json(
+                        &store,
+                        &project,
+                        &cfg,
+                        current_graph_generation(&store, root)?,
+                        0,
+                        candidate_limit,
+                        Some(&freshness),
+                        "skipped_stale_index",
+                        &[],
+                    )?;
+                } else {
+                    println!(
+                        "{}",
+                        vector_stale_skip_message("semantic-search", &freshness)
+                    );
+                }
+                return Ok(freshness_refusal_exit(&freshness));
+            }
         }
         let generation = current_graph_generation(&store, root)?;
         let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
@@ -1537,30 +1587,48 @@ fn wait_for_embedding_publication(
                     error,
                 )
             })?;
-            if !owner_active {
-                break;
+            if matches!(
+                observe_background_embedding(
+                    read_background_job(launch.path()).as_ref(),
+                    owner_active,
+                    false,
+                    attached_to_index,
+                ),
+                BackgroundEmbeddingObservation::Pending
+            ) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            break;
         }
         if let BackgroundJobLaunch::Owned { child, .. } = &mut launch {
             let _ = child.wait();
         }
-        if let Some(detail) =
-            read_background_job(launch.path()).and_then(background_embedding_failure)
-        {
-            return Err(Error::Index(format!(
-                "semantic embedding failed for {}: {detail}",
-                effective_root.display()
-            )));
-        }
         let store = open_default_store_query_writer(root)?;
         let published_generation = current_graph_generation(&store, root)?;
-        if embedding_generation_complete(&store, project, published_generation, &cfg.model_id) {
-            return Ok(store);
-        }
-        if attached_to_index {
-            drop(store);
-            continue;
+        let publication_complete =
+            embedding_generation_complete(&store, project, published_generation, &cfg.model_id);
+        match observe_background_embedding(
+            read_background_job(launch.path()).as_ref(),
+            false,
+            publication_complete,
+            attached_to_index,
+        ) {
+            BackgroundEmbeddingObservation::Published => return Ok(store),
+            BackgroundEmbeddingObservation::FollowIndex => {
+                drop(store);
+                continue;
+            }
+            BackgroundEmbeddingObservation::Failed(detail) => {
+                return Err(Error::Index(format!(
+                    "semantic embedding failed for {}: {detail}",
+                    effective_root.display()
+                )));
+            }
+            BackgroundEmbeddingObservation::MissingPublication => {}
+            BackgroundEmbeddingObservation::Pending => {
+                unreachable!("inactive owner cannot remain pending")
+            }
         }
         return Err(Error::Index(format!(
             "semantic embedding for {} exited without publishing generation {requested_generation} for model {}",
@@ -1568,6 +1636,36 @@ fn wait_for_embedding_publication(
             cfg.model_id
         )));
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BackgroundEmbeddingObservation {
+    Pending,
+    Published,
+    FollowIndex,
+    Failed(String),
+    MissingPublication,
+}
+
+pub(crate) fn observe_background_embedding(
+    job: Option<&serde_json::Value>,
+    owner_active: bool,
+    publication_complete: bool,
+    attached_to_index: bool,
+) -> BackgroundEmbeddingObservation {
+    if owner_active {
+        return BackgroundEmbeddingObservation::Pending;
+    }
+    if let Some(detail) = job.cloned().and_then(background_embedding_failure) {
+        return BackgroundEmbeddingObservation::Failed(detail);
+    }
+    if publication_complete {
+        return BackgroundEmbeddingObservation::Published;
+    }
+    if attached_to_index {
+        return BackgroundEmbeddingObservation::FollowIndex;
+    }
+    BackgroundEmbeddingObservation::MissingPublication
 }
 
 pub(crate) fn background_embedding_failure(job: serde_json::Value) -> Option<String> {
