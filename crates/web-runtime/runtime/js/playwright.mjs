@@ -27,6 +27,31 @@ function throwObjectDisposed(kind) {
 const disposedPages = new Set();
 const disposedContexts = new Set();
 const disposedBrowsers = new Set();
+let activeTrace = null;
+const pageContexts = new Map();
+
+function traceTime() {
+  return ops.op_trace_time_ms();
+}
+
+function traceEvent(value) {
+  if (!activeTrace) return;
+  const line = JSON.stringify(value) + "\n";
+  activeTrace.bytes += line.length;
+  if (activeTrace.bytes > 8 * 1024 * 1024) {
+    activeTrace = null;
+    throw new Error("trace recording exceeded the 8 MiB in-memory limit; stop the trace sooner");
+  }
+  activeTrace.lines.push(line);
+}
+
+globalThis.__greppyCaptureActiveTrace = () => {
+  if (!activeTrace) return;
+  traceEvent({ type: "event", time: traceTime(), class: "Greppy", method: "scriptFailed" });
+  const trace = activeTrace.lines.join("");
+  activeTrace = null;
+  ops.op_capture_trace_archive(trace, "");
+};
 
 function screenshotBuffer(result) {
   if (result && result.png_path) {
@@ -55,11 +80,20 @@ function engineCall(method, params) {
   if (payload.timeout == null) {
     payload.timeout = 30_000;
   }
-  const result = ops.op_engine_call(method, payload);
+  const belongsToTrace = activeTrace && (payload.context === activeTrace.context || pageContexts.get(payload.page) === activeTrace.context);
+  const callId = belongsToTrace ? "call@" + activeTrace.next++ : null;
+  if (callId) traceEvent({ type: "before", callId, startTime: traceTime(), apiName: method, class: "Greppy", method, params: {} });
+  let result;
+  try { result = ops.op_engine_call(method, payload); }
+  catch (error) {
+    if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } });
+    throw error;
+  }
   if (result && typeof result.then === "function") {
     return result.then(
-      (value) => value,
+      (value) => { if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), result: {} }); return value; },
       (error) => {
+        if (callId) traceEvent({ type: "after", callId, endTime: traceTime(), error: { message: "action failed" } });
         const message = String(error && error.message ? error.message : error);
         if (message.includes("timed out") || message.includes("timeout")) {
           throw new TimeoutError(message);
@@ -2286,6 +2320,7 @@ class Page {
     if (!page) {
       page = new Page(id);
       page._context = this._context;
+      if (this._context) pageContexts.set(id, this._context._id);
       if (this._context) {
         this._context._pages = this._context._pages || [];
         this._context._pages.push(page);
@@ -2704,6 +2739,7 @@ class Page {
       }
       const page = new Page(this._openerId);
       page._context = this._context;
+      if (this._context) pageContexts.set(this._openerId, this._context._id);
       return page;
     }
     const result = await engineCall("page.opener", { page: this._id });
@@ -2714,6 +2750,7 @@ class Page {
     }
     const page = new Page(result.page);
     page._context = this._context;
+    if (this._context) pageContexts.set(result.page, this._context._id);
     return page;
   }
 
@@ -2852,13 +2889,20 @@ class BrowserContext {
     this._initScripts = [];
     this._closed = false;
     this._handlers = {};
-    this.tracing = withUnsupported(
-      {
-        start: async () => unsupported("BrowserContext.tracing.start")(),
-        stop: async () => unsupported("BrowserContext.tracing.stop")(),
+    this.tracing = withUnsupported({
+      start: async (options = {}) => {
+        for (const key of ["screenshots", "snapshots", "sources"]) if (options[key]) throw new Error(`Tracing.start option ${key} is unsupported`);
+        if (activeTrace) throw new Error("a trace is already recording in this controller");
+        activeTrace = { context: this._id, lines: [], bytes: 0, next: 1 };
+        traceEvent({ version: 8, type: "context-options", origin: "library", browserName: "greppy", options: {}, platform: "native", wallTime: Date.now(), monotonicTime: traceTime(), sdkLanguage: "javascript" });
       },
-      "Tracing",
-    );
+      stop: async (options = {}) => {
+        for (const key of Object.keys(options)) if (key !== "path") throw new Error(`Tracing.stop option ${key} is unsupported`);
+        if (!activeTrace || activeTrace.context !== this._id) throw new Error("no trace is recording for this BrowserContext");
+        const trace = activeTrace.lines.join(""); activeTrace = null;
+        ops.op_capture_trace_archive(trace, options.path == null ? "" : String(options.path));
+      },
+    }, "Tracing");
     this.clock = withUnsupported(
       {
         install: unsupported("Clock.install"),
@@ -2894,6 +2938,7 @@ class BrowserContext {
     });
     const page = new Page(result.page, result.generation);
     page._context = this;
+    pageContexts.set(result.page, this._id);
     this._lastPage = result.page;
     this._pages = this._pages || [];
     this._pages.push(page);
@@ -3382,6 +3427,7 @@ async function greppyAttachPage(pageId) {
   context._lastPage = result.page;
   browser._contexts = [context];
   page._context = context;
+  pageContexts.set(result.page, result.context);
   return { browser, context, page };
 }
 

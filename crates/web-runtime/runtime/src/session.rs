@@ -60,6 +60,7 @@ pub struct Session {
     pub discarded_engine_results: u64,
     pub persistent_profile: Option<String>,
     pub owner: Option<String>,
+    pub trace: Option<crate::playwright_trace::TraceRecorder>,
 }
 
 impl Session {
@@ -91,6 +92,7 @@ impl Session {
             discarded_engine_results: 0,
             persistent_profile: None,
             owner: None,
+            trace: None,
         }
     }
 

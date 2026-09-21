@@ -903,6 +903,11 @@ impl Daemon {
             .flatten()
             .and_then(|value| value.get("bytes").and_then(|b| b.as_u64()));
         let limit_request = request.clone();
+        let trace_started = session_id
+            .as_deref()
+            .and_then(|id| self.sessions.get(id))
+            .and_then(|session| session.trace.as_ref())
+            .map(|_| crate::playwright_trace::trace_time_ms());
         let mut response = self.dispatch_operation(request);
         if response.metrics.wall_ms == 0 {
             response.metrics.wall_ms = dispatch_started.elapsed().as_millis() as u64;
@@ -991,6 +996,33 @@ impl Daemon {
                 }
             }
         }
+        if !matches!(
+            limit_request.operation.as_str(),
+            "web.trace.start" | "web.trace.stop"
+        ) {
+            if let Some(session_id) = session_id.as_deref() {
+                let trace_error = if let (Some(trace), Some(started)) = (
+                    self.sessions
+                        .get_mut(session_id)
+                        .and_then(|s| s.trace.as_mut()),
+                    trace_started,
+                ) {
+                    trace
+                        .record(&limit_request.operation, started, response.status != "ok")
+                        .err()
+                } else {
+                    None
+                };
+                if let Some(message) = trace_error {
+                    if response.status == "ok" {
+                        response = limit_error(&limit_request, message);
+                    }
+                    if let Some(session) = self.sessions.get_mut(session_id) {
+                        session.trace = None;
+                    }
+                }
+            }
+        }
         response
     }
 
@@ -1013,6 +1045,8 @@ impl Daemon {
             "web.result.next" => self.web_result_next(&request),
             "web.artifact.show" => self.web_artifact_show(&request),
             "web.artifact.path" => self.web_artifact_path(&request),
+            "web.trace.start" => self.web_trace_start(&request),
+            "web.trace.stop" => self.web_trace_stop(&request),
             "web.goto" => self.web_goto(&request),
             "web.back" => self.web_history(&request, "page.goBack", "web.back"),
             "web.forward" => self.web_history(&request, "page.goForward", "web.forward"),
@@ -1769,14 +1803,21 @@ impl Daemon {
                     .get("stdout")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
+                let (trace_artifacts, trace_exports) =
+                    match self.store_trace_archives(request, &session_id, &result) {
+                        Ok(stored) => stored,
+                        Err(response) => return response,
+                    };
                 let mut response = Response::ok(
                     request,
                     serde_json::json!({
                         "session_id": session_id,
                         "completed": true,
                         "stdout": stdout,
+                        "trace_exports": trace_exports,
                     }),
                 );
+                response.artifacts = trace_artifacts;
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
@@ -1787,6 +1828,16 @@ impl Daemon {
                 response
             }
             Err(error) => {
+                let failure_trace_artifacts = error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<crate::supervisor::ScriptFailure>())
+                    .map(|failure| self.store_trace_archives(request, &session_id, &failure.result))
+                    .transpose();
+                let failure_trace_artifacts = match failure_trace_artifacts {
+                    Ok(Some((artifacts, _))) => artifacts,
+                    Ok(None) => Vec::new(),
+                    Err(response) => return response,
+                };
                 let message = error.to_string();
                 if message.contains("cancelled") {
                     let pair = (session_id.clone(), operation_id.clone());
@@ -1946,6 +1997,7 @@ impl Daemon {
                 // came to look like a broken counter rather than a missing
                 // assignment.
                 let mut response = Response::error(request, object);
+                response.artifacts = failure_trace_artifacts;
                 response.metrics.wall_ms = started.elapsed().as_millis() as u64;
                 response.metrics.network_bytes = network_bytes;
                 response.metrics.peak_rss_bytes = peak_rss.max(sample_rss_bytes(content_pid));
@@ -4013,6 +4065,113 @@ impl Daemon {
                 sensitive,
             )
             .map_err(|error| engine_error(request, error.to_string(), 39))
+    }
+
+    fn store_trace_archives(
+        &mut self,
+        request: &Request,
+        session_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), Response> {
+        let mut artifacts = Vec::new();
+        let mut exports = Vec::new();
+        let Some(archives) = result
+            .get("trace_archives")
+            .and_then(|value| value.as_array())
+        else {
+            return Ok((artifacts, exports));
+        };
+        for archive in archives {
+            let Some(encoded) = archive.get("encoded").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let bytes = decode_base64(encoded).map_err(|error| engine_error(request, error, 39))?;
+            let manifest = self.store_bytes(
+                request,
+                session_id,
+                &bytes,
+                "application/zip",
+                "web.run.trace",
+                true,
+            )?;
+            let digest = manifest.digest.hex;
+            let requested_path = archive
+                .get("requested_path")
+                .and_then(|value| value.as_str())
+                .filter(|path| !path.is_empty());
+            if let Some(path) = requested_path {
+                exports.push(json!({"id":digest.clone(),"path":path}));
+            }
+            artifacts.push(json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true,"requested_path":requested_path}));
+        }
+        Ok((artifacts, exports))
+    }
+
+    fn web_trace_start(&mut self, request: &Request) -> Response {
+        let Some(session_id) = request
+            .payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .or(request.session_id.as_deref())
+        else {
+            return protocol_error(request, "web.trace.start requires session_id");
+        };
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return missing_session(request, session_id);
+        };
+        if session.trace.is_some() {
+            return protocol_error(request, "a trace is already recording for this session");
+        }
+        match crate::playwright_trace::TraceRecorder::new() {
+            Ok(trace) => {
+                session.trace = Some(trace);
+                Response::ok(
+                    request,
+                    json!({"session_id":session_id,"schema_version":crate::playwright_trace::TRACE_SCHEMA_VERSION}),
+                )
+            }
+            Err(error) => engine_error(request, error, 39),
+        }
+    }
+
+    fn web_trace_stop(&mut self, request: &Request) -> Response {
+        let Some(session_id) = request
+            .payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .or(request.session_id.as_deref())
+            .map(str::to_owned)
+        else {
+            return protocol_error(request, "web.trace.stop requires session_id");
+        };
+        let Some(trace) = self
+            .sessions
+            .get_mut(&session_id)
+            .and_then(|s| s.trace.take())
+        else {
+            return protocol_error(request, "no trace is recording for this session");
+        };
+        let bytes = trace.finish();
+        match self.store_bytes(
+            request,
+            &session_id,
+            &bytes,
+            "application/zip",
+            "web.trace.stop",
+            true,
+        ) {
+            Ok(manifest) => {
+                let digest = manifest.digest.hex;
+                let artifact = json!({"id":digest.clone(),"digest":digest,"byte_count":manifest.byte_count,"media_type":manifest.media_type,"sensitive":true});
+                let mut response = Response::ok(
+                    request,
+                    json!({"session_id":session_id,"artifact":artifact.clone(),"schema_version":crate::playwright_trace::TRACE_SCHEMA_VERSION}),
+                );
+                response.artifacts.push(artifact);
+                response
+            }
+            Err(response) => response,
+        }
     }
 
     fn search_url(&self, query: &str) -> String {

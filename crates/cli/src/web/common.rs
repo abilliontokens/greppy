@@ -394,7 +394,99 @@ pub(super) fn run(
         timeout,
         mode,
     );
-    rpc(root, json, "web.run", payload, Some(session))
+    match rpc_response(root, "web.run", payload, Some(session.clone())) {
+        Err(error) => emit_error(json, error),
+        Ok(mut response) => {
+            if let Err(error) = export_trace_artifacts(root, &session, &response) {
+                if response.status == "ok" {
+                    return emit_error(json, error);
+                }
+                response.artifacts.push(json!({
+                    "kind": "trace_export_error",
+                    "code": error.code,
+                    "message": error.message,
+                    "requested_exports_preserved": true,
+                }));
+            }
+            emit_response(json, response)
+        }
+    }
+}
+
+fn export_trace_artifacts(
+    root: Option<&str>,
+    session: &str,
+    response: &Response,
+) -> std::result::Result<(), ErrorObject> {
+    let exports = trace_exports(response);
+    for export in &exports {
+        let id = export
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let destination = export
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if id.is_empty() || destination.is_empty() {
+            return Err(invalid("trace export metadata was incomplete"));
+        }
+        let artifact = rpc_response(
+            root,
+            "web.artifact.path",
+            json!({"session_id":session,"id":id}),
+            Some(session.to_owned()),
+        )?;
+        if artifact.status != "ok" {
+            return Err(artifact
+                .error
+                .unwrap_or_else(|| invalid("trace artifact path failed")));
+        }
+        let source = artifact
+            .result
+            .as_ref()
+            .and_then(|value| value.get("path"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let bytes = std::fs::read(source).map_err(|error| {
+            ErrorObject::new(
+                "ARTIFACT_IO",
+                format!("cannot read trace artifact: {error}"),
+                response.request_id.clone(),
+                EXIT_WEB_ARTIFACT,
+                "retry web run",
+            )
+        })?;
+        export_regular_file(Path::new(destination), &bytes)?;
+    }
+    Ok(())
+}
+
+fn trace_exports(response: &Response) -> Vec<serde_json::Value> {
+    let mut exports = response
+        .result
+        .as_ref()
+        .and_then(|value| value.get("trace_exports"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for artifact in &response.artifacts {
+        if let (Some(id), Some(path)) = (
+            artifact.get("id").and_then(|value| value.as_str()),
+            artifact
+                .get("requested_path")
+                .and_then(|value| value.as_str()),
+        ) {
+            let duplicate = exports.iter().any(|export| {
+                export.get("id").and_then(|value| value.as_str()) == Some(id)
+                    && export.get("path").and_then(|value| value.as_str()) == Some(path)
+            });
+            if !path.is_empty() && !duplicate {
+                exports.push(json!({"id":id,"path":path}));
+            }
+        }
+    }
+    exports
 }
 
 fn build_run_payload(
@@ -1734,6 +1826,28 @@ mod target_tests {
         );
         assert_eq!(active["bind_session_page"], true);
         assert!(active.get("script_file").is_none());
+    }
+
+    #[test]
+    fn trace_exports_keep_identical_digest_for_distinct_destinations() {
+        let request = Request::new("run", "web.run", json!({}));
+        let mut response = Response::ok(
+            &request,
+            json!({"trace_exports":[{"id":"same-digest","path":"first.zip"}]}),
+        );
+        response.artifacts.extend([
+            json!({"id":"same-digest","requested_path":"first.zip"}),
+            json!({"id":"same-digest","requested_path":"second.zip"}),
+        ]);
+
+        let exports = trace_exports(&response);
+        assert_eq!(
+            exports.len(),
+            2,
+            "same bytes can have multiple requested destinations"
+        );
+        assert!(exports.iter().any(|value| value["path"] == "first.zip"));
+        assert!(exports.iter().any(|value| value["path"] == "second.zip"));
     }
 
     #[test]
