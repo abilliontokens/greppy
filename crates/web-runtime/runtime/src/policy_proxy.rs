@@ -886,7 +886,9 @@ mod tests {
 
         let (mut client, proxy_client) = connected_pair();
         let (proxy_server, mut origin) = connected_pair();
-        proxy_client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        proxy_client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let (done, completed) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             let result = splice(proxy_client, proxy_server, Arc::new(AtomicU64::new(0)));

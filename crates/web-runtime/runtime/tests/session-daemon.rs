@@ -4402,7 +4402,7 @@ fn controller_locator_click_consumes_only_its_navigation_failure() {
     let destination = serve_status_fixture();
     let fixture = serve_fixture(Box::leak(
         format!(
-            "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='refused' href='{refused}'>Refused</a><a id='redirect' href='{destination}jump'>Redirect</a><button id='clean' onclick='window.clean=(window.clean||0)+1'>Clean</button>"
+            "<!doctype html><a id='abort' href='/aborted'>Abort</a><a id='refused' href='{refused}'>Refused</a><a id='redirect' href='{destination}jump'>Redirect</a><button id='clean' onclick='window.__controllerCleanClicks=(window.__controllerCleanClicks||0)+1'>Clean</button>"
         )
         .into_boxed_str(),
     ));
@@ -4447,7 +4447,7 @@ try {{
   failure = {{ name:error.name, code:error.code, kind:error.kind, requestId:error.requestId, url:error.url, message:error.message }};
 }}
 await page.locator('#clean').click();
-console.log(JSON.stringify({{ failure, clean: await page.evaluate(() => window.clean) }}));
+console.log(JSON.stringify({{ failure, clean: await page.evaluate(() => window.__controllerCleanClicks) }}));
 "#,
             route = if install_route {
                 "await page.route('**/aborted', route => route.abort());"
