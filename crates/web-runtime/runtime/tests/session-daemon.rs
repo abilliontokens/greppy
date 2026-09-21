@@ -4446,9 +4446,17 @@ try {{
 }} catch (error) {{
   failure = {{ name:error.name, code:error.code, kind:error.kind, requestId:error.requestId, url:error.url, message:error.message }};
 }}
+{restore_page}
 await page.locator('#clean').click();
 console.log(JSON.stringify({{ failure, clean: await page.evaluate(() => window.__controllerCleanClicks) }}));
 "#,
+            restore_page = if install_route {
+                String::new()
+            } else {
+                // A real transport failure commits the engine error document;
+                // recover to a known page before targeting its clean button.
+                format!("await page.goto({fixture:?});")
+            },
             route = if install_route {
                 "await page.route('**/aborted', route => route.abort());"
             } else {
