@@ -515,6 +515,11 @@ class Locator {
       ...locatorParams(this, { timeout }),
     });
     await rejectActionNavigationFailure(this._page, result);
+    if (result && result.navigation_epoch != null) {
+      // The native action waited for this navigation. Publish its final URL
+      // before returning so synchronous page.url() cannot report the old page.
+      await this._page._flushNavigation();
+    }
     await this._page._flushPopups();
   }
 
