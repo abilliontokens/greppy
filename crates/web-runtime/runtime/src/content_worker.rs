@@ -11,11 +11,11 @@ use serde_json::json;
 use servo::{
     ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EmbedderControl, EventLoopWaker,
     InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences, RenderingContext,
-    RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext, TouchEvent,
-    TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript, WebResourceLoad,
-    WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder, WebViewDelegate,
-    WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences,
+    RenderingContext, RgbaImage, Servo, ServoBuilder, SimpleDialog, SoftwareRenderingContext,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType, UserContentManager, UserScript,
+    WebResourceLoad, WebResourceResponse, WebResourceResponseCompleted, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -352,6 +352,12 @@ struct Delegate {
     last_file_choosers: RefCell<Vec<serde_json::Value>>,
     last_responses: RefCell<Vec<serde_json::Value>>,
     dropped_responses: Cell<u64>,
+    current_main_frame_request: RefCell<Option<String>>,
+    main_frame_navigation_epoch: Cell<u64>,
+    navigation_intent_generation: Cell<u64>,
+    pending_navigation_intent: RefCell<Option<(u64, String, Option<String>)>>,
+    promoted_navigation_url: RefCell<Option<String>>,
+    navigation_failure: RefCell<Option<serde_json::Value>>,
     rendering_context: Rc<dyn RenderingContext>,
     wait_notices: RefCell<HashMap<String, String>>,
     /// Main-document lifecycle, owned by Servo rather than page script. A
@@ -396,6 +402,12 @@ impl Delegate {
             last_file_choosers: RefCell::new(Vec::new()),
             last_responses: RefCell::new(Vec::new()),
             dropped_responses: Cell::new(0),
+            current_main_frame_request: RefCell::new(None),
+            main_frame_navigation_epoch: Cell::new(0),
+            navigation_intent_generation: Cell::new(0),
+            pending_navigation_intent: RefCell::new(None),
+            promoted_navigation_url: RefCell::new(None),
+            navigation_failure: RefCell::new(None),
             opener_id: RefCell::new(None),
             rendering_context,
             wait_notices: RefCell::new(HashMap::new()),
@@ -413,6 +425,33 @@ impl Delegate {
             })
         {
             row["failure"] = json!({ "errorText": error_text });
+            self.wake.wake();
+        }
+    }
+
+    fn record_main_frame_failure(&self, request_id: &str, url: &str, error_text: &str, kind: &str) {
+        if self.current_main_frame_request.borrow().as_deref() == Some(request_id) {
+            let preserve_specific_failure = kind == "transport"
+                && self
+                    .navigation_failure
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|failure| {
+                        failure.get("requestId").and_then(|value| value.as_str())
+                            == Some(request_id)
+                            && failure.get("kind").and_then(|value| value.as_str())
+                                != Some("transport")
+                    });
+            if preserve_specific_failure {
+                return;
+            }
+            self.navigation_failure.replace(Some(json!({
+                "requestId": request_id,
+                "url": url,
+                "errorText": error_text,
+                "kind": kind,
+                "navigationEpoch": self.main_frame_navigation_epoch.get(),
+            })));
             self.wake.wake();
         }
     }
@@ -437,7 +476,47 @@ impl Delegate {
 }
 
 impl WebViewDelegate for Delegate {
+    fn request_navigation(&self, _webview: WebView, navigation: NavigationRequest) {
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=intent main_frame={} url={}",
+                navigation.is_for_main_frame, navigation.url
+            );
+        }
+        if !navigation.is_for_main_frame {
+            match decide_url(self.profile.get(), navigation.url.as_str()) {
+                UrlDecision::Allow => navigation.allow(),
+                UrlDecision::Deny { .. } => navigation.deny(),
+            }
+            return;
+        }
+        let generation = self.navigation_intent_generation.get().wrapping_add(1);
+        self.navigation_intent_generation.set(generation);
+        let decision = decide_url(self.profile.get(), navigation.url.as_str());
+        let denied = match &decision {
+            UrlDecision::Deny { reason } => Some((*reason).to_owned()),
+            UrlDecision::Allow => None,
+        };
+        self.pending_navigation_intent.replace(Some((
+            generation,
+            navigation.url.to_string(),
+            denied,
+        )));
+        self.wake.wake();
+        if matches!(decision, UrlDecision::Deny { .. }) {
+            navigation.deny();
+            return;
+        }
+        navigation.allow();
+    }
+
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=load-status status={status:?} epoch={}",
+                self.main_frame_navigation_epoch.get()
+            );
+        }
         if status == LoadStatus::HeadParsed {
             self.document_generation
                 .set(self.document_generation.get().wrapping_add(1));
@@ -599,6 +678,26 @@ impl WebViewDelegate for Delegate {
             UrlDecision::Allow => None,
         };
         let mut requests = self.requests.borrow_mut();
+        if load.request.is_for_main_frame {
+            let promoted = self.promoted_navigation_url.borrow().as_deref() == Some(url.as_str());
+            if !load.request.is_redirect && !promoted {
+                self.main_frame_navigation_epoch
+                    .set(self.main_frame_navigation_epoch.get().wrapping_add(1));
+            }
+            if promoted {
+                self.promoted_navigation_url.replace(None);
+            }
+            self.current_main_frame_request
+                .replace(Some(request_id.clone()));
+            self.navigation_failure.replace(None);
+            if NavTrace::enabled() {
+                eprintln!(
+                    "web-runtime: nav-event phase=request request_id={request_id} redirect={} promoted={promoted} epoch={} url={url}",
+                    load.request.is_redirect,
+                    self.main_frame_navigation_epoch.get()
+                );
+            }
+        }
         requests.push(json!({
             "requestId": request_id,
             "url": url,
@@ -618,6 +717,7 @@ impl WebViewDelegate for Delegate {
         if let UrlDecision::Deny { reason } = policy {
             if load.request.is_for_main_frame {
                 *self.denied_navigation.borrow_mut() = Some(reason.to_owned());
+                self.record_main_frame_failure(&request_id, &url, reason, "policy_denied");
             }
             let denied_url = load.request.url.clone();
             load.intercept(WebResourceResponse::new(denied_url))
@@ -651,6 +751,12 @@ impl WebViewDelegate for Delegate {
                 self.mark_request_failure(&request_id, "net::ERR_FAILED");
                 if load.request.is_for_main_frame {
                     *self.denied_navigation.borrow_mut() = Some("net::ERR_FAILED".to_owned());
+                    self.record_main_frame_failure(
+                        &request_id,
+                        &url,
+                        "net::ERR_FAILED",
+                        "route_aborted",
+                    );
                 }
                 load.intercept(WebResourceResponse::new(request_url))
                     .cancel();
@@ -730,6 +836,14 @@ impl WebViewDelegate for Delegate {
         response: WebResourceResponseCompleted,
     ) {
         let request_id = format!("{}:{}", response.id.fetch_id, response.id.redirect_count);
+        if NavTrace::enabled() {
+            eprintln!(
+                "web-runtime: nav-event phase=response-completed request_id={request_id} failure={:?} epoch={} url={}",
+                response.failure,
+                self.main_frame_navigation_epoch.get(),
+                response.url
+            );
+        }
         let headers: serde_json::Map<String, serde_json::Value> = response
             .headers
             .iter()
@@ -754,7 +868,13 @@ impl WebViewDelegate for Delegate {
             row["ok"] = json!((200..400).contains(&status));
         }
         if let Some(failure) = response.failure {
-            row["failure"] = json!({ "errorText": failure });
+            row["failure"] = json!({ "errorText": failure.clone() });
+            self.record_main_frame_failure(
+                &request_id,
+                response.url.as_str(),
+                &failure,
+                "transport",
+            );
         }
         let mut responses = self.last_responses.borrow_mut();
         if let Some(existing) = responses.iter_mut().find(|existing| {
@@ -1223,6 +1343,7 @@ impl ContentEngine {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                trace.timeout(webview);
                 return Ok(false);
             }
             match poll_wake_step(
@@ -1232,6 +1353,7 @@ impl ContentEngine {
             ) {
                 WakePoll::Ready | WakePoll::TimedOut => {
                     if Instant::now() >= deadline {
+                        trace.timeout(webview);
                         return Ok(false);
                     }
                 }
@@ -2298,12 +2420,9 @@ impl ContentEngine {
                     .url()
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| url.to_string());
+                let current_request = delegate.current_main_frame_request.borrow().clone();
                 let recorded = delegate.last_responses.borrow();
-                let matched = recorded.iter().rev().find(|row| {
-                    row.get("url")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|recorded_url| recorded_url == final_url)
-                });
+                let matched = response_for_request(&recorded, current_request.as_deref());
                 let http = url.scheme() == "http" || url.scheme() == "https";
                 let recorded_status = matched
                     .and_then(|row| row.get("status"))
@@ -2317,6 +2436,10 @@ impl ContentEngine {
                     .and_then(|row| row.get("headers"))
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                let recorded_failure = matched
+                    .and_then(|row| row.pointer("/failure/errorText"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
                 drop(recorded);
                 // A failed probe means UNKNOWN, never "empty": on a page
                 // whose script thread is still busy (a 7.6MB spec mid-parse)
@@ -2329,22 +2452,10 @@ impl ContentEngine {
                     Ok(JSValue::String(text)) => Some(text),
                     _ => None,
                 };
-                let servo_error_shell = match self.evaluate(
-                    webview.clone(),
-                    "document.title === 'Error loading page' && document.body && document.body.children.length === 1 && document.body.firstElementChild.tagName === 'P' && document.body.firstElementChild.innerText.startsWith('Could not load the requested page:')",
-                ) {
-                    Ok(JSValue::Boolean(matches)) => matches,
-                    _ => false,
-                };
-                // Servo 0.5 exposes no typed transport-failure callback for a
-                // pass-through WebResourceLoad. A missing recorded response is
-                // also normal for some CONNECT-tunnel traffic, so keep this as
-                // a deliberately narrow structural fallback matching Servo's
-                // baked-in neterror.html instead of classifying body text.
-                if recorded_status.is_none() && servo_error_shell {
+                if let Some(failure) = recorded_failure {
+                    delegate.navigation_failure.borrow_mut().take();
                     return Err(io::Error::other(format!(
-                        "navigation failed: {}",
-                        text.as_deref().unwrap_or("Servo network error")
+                        "navigation failed: {failure}"
                     )));
                 }
                 let html =
@@ -2353,8 +2464,9 @@ impl ContentEngine {
                         _ => None,
                     };
                 // CONNECT-tunneled fetches often never match last_responses, so a
-                // missing recorded status is not proof of failure. The Servo error
-                // shell is already rejected above; accept a rendered document.
+                // missing recorded status is not proof of failure. A typed
+                // terminal transport failure is rejected above; otherwise accept
+                // a rendered document.
                 //
                 // Empty innerText plus tiny HTML is not proof either: a
                 // <frameset> page has no body at all, so its innerText is
@@ -2393,8 +2505,9 @@ impl ContentEngine {
             }
             "locator.click" => {
                 let resolved = self.resolve_actionable(&params)?;
-                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
-                Ok(json!({ "dispatch": dispatch }))
+                let (dispatch, navigation_epoch) =
+                    self.dispatch_locator_click(&params, &resolved)?;
+                Ok(json!({ "dispatch": dispatch, "navigation_epoch": navigation_epoch }))
             }
             "locator.tap" => {
                 let resolved = self.resolve_actionable(&params)?;
@@ -2676,6 +2789,24 @@ impl ContentEngine {
                     other => Err(io::Error::other(format!("content returned {other:?}"))),
                 }
             }
+            "page.take_navigation_failure" => {
+                let page_id = required_str(&params, "page")?;
+                let expected_epoch = params
+                    .get("navigation_epoch")
+                    .and_then(serde_json::Value::as_u64);
+                let (_, delegate) = self.page(&page_id)?.clone();
+                let matches_action = delegate
+                    .navigation_failure
+                    .borrow()
+                    .as_ref()
+                    .and_then(|failure| failure.get("navigationEpoch"))
+                    .and_then(serde_json::Value::as_u64)
+                    == expected_epoch;
+                let failure = matches_action
+                    .then(|| delegate.navigation_failure.borrow_mut().take())
+                    .flatten();
+                Ok(json!({ "failure": failure }))
+            }
             "page.observe" => {
                 let page_id = required_str(&params, "page")?;
                 let snapshot = params.get("snapshot").and_then(|value| value.as_str());
@@ -2688,7 +2819,21 @@ impl ContentEngine {
                     .get("ref_last")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
-                let (webview, _) = self.page(&page_id)?.clone();
+                let (webview, delegate) = self.page(&page_id)?.clone();
+                if let Some(failure) = delegate.navigation_failure.borrow_mut().take() {
+                    let request_id = failure.get("requestId").and_then(|value| value.as_str()).unwrap_or("unknown");
+                    let url = failure.get("url").and_then(|value| value.as_str()).unwrap_or("unknown");
+                    let error = failure.get("errorText").and_then(|value| value.as_str()).unwrap_or("transport failure");
+                    let kind = failure.get("kind").and_then(|value| value.as_str()).unwrap_or("transport");
+                    let detail = format!(
+                        "navigation failed: {error} (kind={kind}, request_id={request_id}, url={url})"
+                    );
+                    return Err(io::Error::other(if kind == "policy_denied" {
+                        format!("policy_denied: {detail}")
+                    } else {
+                        detail
+                    }));
+                }
                 let query = params.get("query").and_then(|value| value.as_str());
                 let include_html = params
                     .get("include_html")
@@ -2831,14 +2976,15 @@ impl ContentEngine {
                 // assignment. Reuse the same acknowledged native click path
                 // as `locator.click` so click/input/change and framework
                 // handlers all observe one real transition (Fund 033).
-                let dispatch = self.dispatch_locator_click(&params, &resolved)?;
+                let (dispatch, navigation_epoch) =
+                    self.dispatch_locator_click(&params, &resolved)?;
                 let actual = self.locator_checked_state(&params)?;
                 if actual != checked {
                     return Err(io::Error::other(format!(
                         "checkbox activation did not produce the requested state: expected checked={checked}, observed checked={actual}"
                     )));
                 }
-                Ok(json!({ "dispatch": dispatch }))
+                Ok(json!({ "dispatch": dispatch, "navigation_epoch": navigation_epoch }))
             }
             "locator.selectOption" => {
                 let _ = self.resolve_actionable(&params)?;
@@ -3895,9 +4041,13 @@ impl ContentEngine {
         &mut self,
         params: &serde_json::Value,
         resolved: &ResolvedNode,
-    ) -> io::Result<String> {
+    ) -> io::Result<(String, Option<u64>)> {
         let page_id = required_str(params, "page")?;
         let (webview, delegate) = self.page(&page_id)?.clone();
+        let action_started = Instant::now();
+        let navigation_epoch_before = delegate.main_frame_navigation_epoch.get();
+        let navigation_intent_before = delegate.navigation_intent_generation.get();
+        let document_generation_before = delegate.document_generation.get();
         let probe = format!(
             "{}-{}",
             std::process::id(),
@@ -3934,6 +4084,49 @@ impl ContentEngine {
             Err(_) => "document-changed".to_owned(),
             Ok(_) => "unknown".to_owned(),
         };
+        if let Some((generation, url, denied)) = delegate
+            .pending_navigation_intent
+            .borrow()
+            .clone()
+            .filter(|(generation, _, _)| *generation != navigation_intent_before)
+            .filter(|_| delegate.main_frame_navigation_epoch.get() == navigation_epoch_before)
+        {
+            let epoch = delegate.main_frame_navigation_epoch.get().wrapping_add(1);
+            delegate.main_frame_navigation_epoch.set(epoch);
+            let request_id = format!("navigation-intent:{generation}");
+            delegate
+                .current_main_frame_request
+                .replace(Some(request_id.clone()));
+            delegate.promoted_navigation_url.replace(Some(url.clone()));
+            delegate.navigation_failure.replace(None);
+            if let Some(reason) = denied {
+                delegate.record_main_frame_failure(&request_id, &url, &reason, "policy_denied");
+            }
+        }
+        let navigation_epoch_after = delegate.main_frame_navigation_epoch.get();
+        let navigation_epoch =
+            (navigation_epoch_after != navigation_epoch_before).then_some(navigation_epoch_after);
+        if let Some(expected_epoch) = navigation_epoch {
+            let remaining = call_timeout(params).saturating_sub(action_started.elapsed());
+            if !self.spin_until_loaded_until(
+                &webview,
+                remaining,
+                WaitUntil::Load,
+                || {
+                    let failure = delegate.navigation_failure.borrow();
+                    navigation_failure_belongs_to_epoch(failure.as_ref(), expected_epoch)
+                },
+                || {
+                    delegate.document_generation.get() != document_generation_before
+                        && delegate.main_frame_navigation_epoch.get() == expected_epoch
+                },
+            )? {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for click navigation",
+                ));
+            }
+        }
         if let Some(selector) = params
             .get("selector")
             .and_then(|value| value.get("value"))
@@ -3941,7 +4134,7 @@ impl ContentEngine {
         {
             let _ = self.assign_pending_files(&page_id, selector);
         }
-        Ok(dispatch)
+        Ok((dispatch, navigation_epoch))
     }
 
     fn locator_checked_state(&self, params: &serde_json::Value) -> io::Result<bool> {
@@ -4385,6 +4578,16 @@ impl NavTrace {
         );
         }
     }
+
+    fn timeout(&self, webview: &WebView) {
+        if self.started.is_some() {
+            eprintln!(
+                "web-runtime: nav-event phase=wait-timeout load_status={:?} url={:?}",
+                webview.load_status(),
+                webview.url().map(|url| url.to_string())
+            );
+        }
+    }
 }
 
 /// Engine preferences for a content worker reachable only through `proxy_uri`.
@@ -4556,6 +4759,26 @@ fn urls_match(current: &Url, expected: &Url) -> bool {
         && current.path().trim_end_matches('/') == expected.path().trim_end_matches('/')
 }
 
+fn navigation_failure_belongs_to_epoch(
+    failure: Option<&serde_json::Value>,
+    expected_epoch: u64,
+) -> bool {
+    failure
+        .and_then(|value| value.get("navigationEpoch"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(expected_epoch)
+}
+
+fn response_for_request<'a>(
+    responses: &'a [serde_json::Value],
+    request_id: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    let request_id = request_id?;
+    responses.iter().rev().find(|row| {
+        row.get("requestId").and_then(serde_json::Value::as_str) == Some(request_id)
+    })
+}
+
 fn required_str(params: &serde_json::Value, key: &str) -> io::Result<String> {
     params
         .get(key)
@@ -4688,6 +4911,33 @@ fn serialize_jsvalue(value: JSValue) -> io::Result<serde_json::Value> {
 mod serialize_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn click_navigation_epoch_survives_redirect_request_id_changes() {
+        let aborted = json!({
+            "requestId": "different-fetch-uuid:2",
+            "navigationEpoch": 7,
+            "url": "http://example.test/end",
+            "errorText": "net::ERR_FAILED",
+        });
+        assert!(
+            navigation_failure_belongs_to_epoch(Some(&aborted), 7),
+            "terminal failure must settle an aborted navigation without a document commit"
+        );
+        assert!(!navigation_failure_belongs_to_epoch(Some(&aborted), 6));
+    }
+
+    #[test]
+    fn current_request_identity_beats_stale_same_url_response() {
+        let responses = vec![
+            json!({"requestId":"old:0","url":"http://example.test/same","failure":{"errorText":"stale"}}),
+            json!({"requestId":"current:0","url":"http://example.test/same","status":200}),
+        ];
+        let current = response_for_request(&responses, Some("current:0")).unwrap();
+        assert_eq!(current["status"], 200);
+        assert!(current.get("failure").is_none());
+        assert!(response_for_request(&responses, Some("missing:0")).is_none());
+    }
 
     #[test]
     fn terminal_response_merge_is_order_independent_and_keeps_failure_details() {
