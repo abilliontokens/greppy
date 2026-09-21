@@ -488,7 +488,7 @@ impl WebViewDelegate for Delegate {
         self.navigation_intent_generation.set(generation);
         let decision = decide_url(self.profile.get(), navigation.url.as_str());
         let denied = match &decision {
-            UrlDecision::Deny { reason } => Some(reason.to_owned()),
+            UrlDecision::Deny { reason } => Some((*reason).to_owned()),
             UrlDecision::Allow => None,
         };
         self.pending_navigation_intent.replace(Some((
