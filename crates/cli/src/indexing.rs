@@ -1293,10 +1293,6 @@ pub(crate) fn dispatch_index(
     Ok(0)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "atomic Base+Delta publication requires every identity, policy, and progress input explicitly"
-)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OverlayIndexOutcome {
     Complete,
@@ -1314,6 +1310,10 @@ pub(crate) fn record_overlay_job_outcome(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "atomic Base+Delta publication requires every identity, policy, and progress input explicitly"
+)]
 pub(crate) fn index_overlay_snapshot(
     active_path: &std::path::Path,
     target: &std::path::Path,
