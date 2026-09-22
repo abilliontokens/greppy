@@ -467,14 +467,25 @@ class ReleaseArtifactTests(unittest.TestCase):
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(workflow.count("matrix.name != 'windows-x86_64'"), 2)
+        self.assertEqual(workflow.count("windows-signing-secrets"), 5)
         self.assertEqual(
-            workflow.count("secrets.WINDOWS_CERTIFICATE_PASSWORD != ''"), 2
-        )
-        self.assertEqual(
-            workflow.count("secrets.WINDOWS_SIGNED_WINFSP_DRIVER_BASE64 != ''"),
+            workflow.count(
+                "needs.windows-signing-secrets.outputs.enabled == 'true' "
+                "&& 'do-not-exclude' || 'windows-x86_64'"
+            ),
             2,
         )
+        self.assertNotIn("secrets.WINDOWS_SIGNED_WINFSP_DRIVER_BASE64 !=", workflow)
+        gate = workflow.split("windows-signing-secrets:", 1)[1].split("\n  build:", 1)[0]
+        for secret in (
+            "WINDOWS_SIGNED_WINFSP_DRIVER_BASE64",
+            "WINDOWS_SIGNED_WINFSP_CATALOG_BASE64",
+            "WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64",
+            "WINDOWS_CERTIFICATE_PFX_BASE64",
+            "WINDOWS_CERTIFICATE_PASSWORD",
+        ):
+            self.assertIn(f"[ -n \"${secret}\" ]", gate)
+            self.assertIn(f"secrets.{secret}", gate)
         self.assertIn("cow_performance_ok", workflow)
         self.assertIn("cow_performance_failed", workflow)
         self.assertIn("Exact-SHA three-platform performance set", workflow)

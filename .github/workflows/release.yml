@@ -222,21 +222,36 @@ jobs:
         with:
           subject-path: greppy-qwen35-training-evidence.tar.gz
 
+  windows-signing-secrets:
+    name: windows signing secrets
+    runs-on: ubuntu-22.04
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Record whether every Windows signing secret is set
+        id: check
+        env:
+          WINDOWS_SIGNED_WINFSP_DRIVER_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_DRIVER_BASE64 }}
+          WINDOWS_SIGNED_WINFSP_CATALOG_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_CATALOG_BASE64 }}
+          WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64: ${{ secrets.WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64 }}
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        shell: bash
+        run: |
+          if [ -n "$WINDOWS_SIGNED_WINFSP_DRIVER_BASE64" ] \
+            && [ -n "$WINDOWS_SIGNED_WINFSP_CATALOG_BASE64" ] \
+            && [ -n "$WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64" ] \
+            && [ -n "$WINDOWS_CERTIFICATE_PFX_BASE64" ] \
+            && [ -n "$WINDOWS_CERTIFICATE_PASSWORD" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build (${{ matrix.name }})
-    needs: model-redistribution
+    needs: [model-redistribution, windows-signing-secrets]
     runs-on: ${{ matrix.os }}
-    # 0.4.0 ships macOS and Linux when the Windows signing secrets are absent.
-    # The leg runs, and still fails closed, only when every secret is set.
-    if: >-
-      matrix.name != 'windows-x86_64' ||
-      (
-        secrets.WINDOWS_SIGNED_WINFSP_DRIVER_BASE64 != '' &&
-        secrets.WINDOWS_SIGNED_WINFSP_CATALOG_BASE64 != '' &&
-        secrets.WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64 != '' &&
-        secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' &&
-        secrets.WINDOWS_CERTIFICATE_PASSWORD != ''
-      )
     timeout-minutes: 360
     permissions:
       contents: read
@@ -282,6 +297,10 @@ jobs:
             runner_os: Windows
             runner_arch: X64
             rust_host: x86_64-pc-windows-msvc
+        exclude:
+          # jobs.<job_id>.if cannot read secrets or matrix. Drop the Windows
+          # cell unless the gate job saw every signing secret.
+          - name: ${{ needs.windows-signing-secrets.outputs.enabled == 'true' && 'do-not-exclude' || 'windows-x86_64' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Restore model assets
@@ -1031,19 +1050,8 @@ jobs:
 
   verify-packages:
     name: clean package (${{ matrix.name }})
-    needs: build
+    needs: [build, windows-signing-secrets]
     runs-on: ${{ matrix.os }}
-    # Same secret gate as the build matrix: do not require a Windows package
-    # that the build leg skipped.
-    if: >-
-      matrix.name != 'windows-x86_64' ||
-      (
-        secrets.WINDOWS_SIGNED_WINFSP_DRIVER_BASE64 != '' &&
-        secrets.WINDOWS_SIGNED_WINFSP_CATALOG_BASE64 != '' &&
-        secrets.WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64 != '' &&
-        secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' &&
-        secrets.WINDOWS_CERTIFICATE_PASSWORD != ''
-      )
     permissions:
       contents: read
     strategy:
@@ -1063,6 +1071,8 @@ jobs:
             os: windows-2022
             asset: greppy-windows-x86_64.msi
             rust_host: x86_64-pc-windows-msvc
+        exclude:
+          - name: ${{ needs.windows-signing-secrets.outputs.enabled == 'true' && 'do-not-exclude' || 'windows-x86_64' }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
