@@ -6,7 +6,7 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 Nothing yet.
 
-## [0.4.0] — 2026-09-02
+## [0.4.0] — 2026-09-22
 
 ### Web tool for the agent, and worktrees that reuse the shared inference cache
 
