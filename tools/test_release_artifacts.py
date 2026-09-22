@@ -467,25 +467,31 @@ class ReleaseArtifactTests(unittest.TestCase):
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(workflow.count("windows-signing-secrets"), 5)
-        self.assertEqual(
-            workflow.count(
-                "needs.windows-signing-secrets.outputs.enabled == 'true' "
-                "&& 'do-not-exclude' || 'windows-x86_64'"
-            ),
-            2,
+        self.assertIn(
+            "fromJSON(needs.windows-signing-secrets.outputs.build_include)",
+            workflow,
         )
-        self.assertNotIn("secrets.WINDOWS_SIGNED_WINFSP_DRIVER_BASE64 !=", workflow)
-        gate = workflow.split("windows-signing-secrets:", 1)[1].split("\n  build:", 1)[0]
-        for secret in (
-            "WINDOWS_SIGNED_WINFSP_DRIVER_BASE64",
-            "WINDOWS_SIGNED_WINFSP_CATALOG_BASE64",
-            "WINDOWS_SIGNED_WINFSP_DRIVER_CONTRACT_BASE64",
-            "WINDOWS_CERTIFICATE_PFX_BASE64",
-            "WINDOWS_CERTIFICATE_PASSWORD",
-        ):
-            self.assertIn(f"[ -n \"${secret}\" ]", gate)
-            self.assertIn(f"secrets.{secret}", gate)
+        self.assertIn(
+            "fromJSON(needs.windows-signing-secrets.outputs.verify_include)",
+            workflow,
+        )
+        self.assertNotIn("do-not-exclude", workflow)
+        import tools.emit_release_matrix as matrix_emit
+
+        self.assertFalse(matrix_emit.signing_enabled({}))
+        self.assertTrue(
+            matrix_emit.signing_enabled({name: "set" for name in matrix_emit.SECRET_ENV})
+        )
+        without = matrix_emit.filtered_includes(False)
+        with_windows = matrix_emit.filtered_includes(True)
+        for key in ("build", "verify"):
+            self.assertNotIn("windows-x86_64", [row["name"] for row in without[key]])
+            self.assertIn("windows-x86_64", [row["name"] for row in with_windows[key]])
+            self.assertIn("macos-arm64", [row["name"] for row in without[key]])
+        windows_build = next(
+            row for row in with_windows["build"] if row["name"] == "windows-x86_64"
+        )
+        self.assertEqual(windows_build["features"], "cpu-only")
         self.assertIn("cow_performance_ok", workflow)
         self.assertIn("cow_performance_failed", workflow)
         self.assertIn("Exact-SHA three-platform performance set", workflow)
@@ -511,11 +517,14 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("native agent fallback", ci_workflow)
         self.assertIn("portable agent fail-closed", ci_workflow)
         self.assertIn("tools.test_portable_cow_performance", workflow)
-        windows_matrix = workflow.split("- name: windows-x86_64", 1)[1].split(
-            "steps:", 1
-        )[0]
-        self.assertIn("features: cpu-only", windows_matrix)
-        self.assertNotIn("features: cpu\n", windows_matrix)
+        matrix = json.loads(
+            (REPOSITORY_ROOT / "tools/release_matrix.json").read_text(encoding="utf-8")
+        )
+        windows_build = next(
+            row for row in matrix["build"] if row["name"] == "windows-x86_64"
+        )
+        self.assertEqual(windows_build["features"], "cpu-only")
+        self.assertNotEqual(windows_build["features"], "cpu")
         self.assertIn("--features ${{ matrix.features }}", workflow)
         self.assertIn("record-build-environment", workflow)
         self.assertEqual(
@@ -540,7 +549,10 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("Exact-SHA three-platform performance set", workflow)
         self.assertIn("cow_performance_ok", workflow)
         self.assertNotIn("greppy-agent-benchmark", workflow)
-        self.assertIn("greppy-macos-arm64.pkg", workflow)
+        self.assertEqual(
+            next(row["asset"] for row in matrix["build"] if row["name"] == "macos-arm64"),
+            "greppy-macos-arm64.pkg",
+        )
         self.assertIn("platform/macos/build-fskit-pkg.sh", workflow)
         application_import = workflow.index("Import macOS application identity")
         application_notarize = workflow.index(
