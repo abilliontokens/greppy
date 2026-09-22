@@ -520,8 +520,9 @@ python3 "$CLIENT" wait-active "$SUMMARY_SOCK" 120 >/dev/null \
 # accept/reader stages; only requests parked behind the real summary would
 # wait longer, and abandoning them must not harm the daemon (asserted below).
 python3 "$CLIENT" flood "$SUMMARY_SOCK" 48 5 >"$WORK/out/summary-flood.json"
-jq -e '.capacity >= 1' "$WORK/out/summary-flood.json" >/dev/null \
-  || fail "summarize flood produced no classified capacity rejection: $(cat "$WORK/out/summary-flood.json")"
+jq -e '.sent == 48 and .responded == 48 and .echo_ok == 48 and .capacity == 0 and .client_errors == 0' \
+  "$WORK/out/summary-flood.json" >/dev/null \
+  || fail "summarize ping flood was shed or dropped: $(cat "$WORK/out/summary-flood.json")"
 echo "summary flood: $(cat "$WORK/out/summary-flood.json")"
 
 wait "$BRIEF_PID" || fail "brief failed under flood: $(cat "$WORK/out/brief.err")"
