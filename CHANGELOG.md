@@ -247,13 +247,16 @@ the notarized build of every candidate above.
    repeatedly replacing the app. Earlier notarized builds were mounted on
    macOS 26.2; each final release bundle still needs its own device acceptance.
 
-2. **Windows packaging waits for Microsoft driver approval.** The private
-   WinFsp fork requires an HLK-tested, Hardware-Dev-Center-signed driver and
-   catalog. Greppy's release workflow rejects attestation-only, self-signed or
-   unbound substitutes and remains blocked until Microsoft returns the exact
-   signed payload and the MSI passes installation, upgrade, uninstall, mounted
-   CoW and performance gates. The Web tool is not included on Windows in
-   0.4.0; its linked runtime follows in a later release.
+2. **0.4.0 publishes macOS and Linux, not Windows.** The private WinFsp
+   fork still requires an HLK-tested, Hardware-Dev-Center-signed driver and
+   catalog, plus an Authenticode certificate. Those signing secrets are not
+   configured, so the release workflow skips the Windows build and
+   clean-package legs instead of failing the macOS and Linux publish. The
+   Windows asset group is published only as a whole, and only when every
+   signing secret is set; a partial group is still an error, and a present
+   secret set still fails closed on an unsigned or unbound driver. The Web
+   tool is not included on Windows; its linked runtime follows in a later
+   release.
 
 3. **Six tests use debug-only fault or certificate injection.**
    `GREPPY_WEB_TEST_IGNORE_CERTS`, `GREPPY_TEST_BASE_SUMMARY_FAIL`, and
@@ -277,6 +280,12 @@ the notarized build of every candidate above.
    `chromium-1234` runtime. A machine with only `chromium-1223` reports a
    missing test dependency; with the pinned browser installed, the test
    passes.
+
+6. **The macOS FSKit performance runner is not attached.** The exact-SHA
+   three-platform CoW performance set needs a self-hosted runner labeled
+   `greppy-fskit-performance`. That runner is not registered, so the job stays
+   skipped. A skipped or absent result does not block the 0.4.0 publish. A
+   completed failure of that job still does.
 
 ## [0.3.4] — 2026-08-30
 

@@ -774,11 +774,16 @@ def load_contract(path: pathlib.Path) -> dict[str, Any]:
         raise ReleaseArtifactError(
             f"unexpected generated release assets: {sorted(generated)}"
         )
+    _optional_groups(assets)
     return contract
 
 
+def _source_matches(source_root: pathlib.Path, name: str) -> list[pathlib.Path]:
+    return [path for path in source_root.rglob(name) if path.is_file()]
+
+
 def _find_source_asset(source_root: pathlib.Path, name: str) -> pathlib.Path:
-    matches = [path for path in source_root.rglob(name) if path.is_file()]
+    matches = _source_matches(source_root, name)
     if len(matches) != 1:
         raise ReleaseArtifactError(
             f"expected exactly one source asset named {name}, found {len(matches)}"
@@ -786,6 +791,68 @@ def _find_source_asset(source_root: pathlib.Path, name: str) -> pathlib.Path:
     if matches[0].is_symlink():
         raise ReleaseArtifactError(f"release source asset is a symlink: {matches[0]}")
     return matches[0]
+
+
+def _optional_groups(assets: list[dict[str, Any]]) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for asset in assets:
+        group = asset.get("optional_group")
+        if group is None:
+            continue
+        if not isinstance(group, str) or not group or group != group.strip():
+            raise ReleaseArtifactError(
+                f"optional_group for {asset.get('name')} is invalid"
+            )
+        if asset.get("generated") is True:
+            raise ReleaseArtifactError(
+                f"generated asset {asset['name']} cannot be optional"
+            )
+        groups.setdefault(group, []).append(asset["name"])
+    return groups
+
+
+def _partial_optional_group(group: str, names: list[str], present: list[str]) -> None:
+    if present and len(present) != len(names):
+        missing = [name for name in names if name not in present]
+        raise ReleaseArtifactError(
+            f"optional release group {group} is partial; missing={missing}"
+        )
+
+
+def _omitted_optional_assets(
+    assets: list[dict[str, Any]], present_names: set[str]
+) -> set[str]:
+    omitted: set[str] = set()
+    for group, names in _optional_groups(assets).items():
+        present = [name for name in names if name in present_names]
+        _partial_optional_group(group, names, present)
+        if not present:
+            omitted.update(names)
+    return omitted
+
+
+def _omitted_optional_sources(
+    assets: list[dict[str, Any]], source_root: pathlib.Path
+) -> set[str]:
+    omitted: set[str] = set()
+    for group, names in _optional_groups(assets).items():
+        found: list[str] = []
+        for name in names:
+            matches = _source_matches(source_root, name)
+            if len(matches) > 1:
+                raise ReleaseArtifactError(
+                    f"expected exactly one source asset named {name}, found {len(matches)}"
+                )
+            if len(matches) == 1:
+                if matches[0].is_symlink():
+                    raise ReleaseArtifactError(
+                        f"release source asset is a symlink: {matches[0]}"
+                    )
+                found.append(name)
+        _partial_optional_group(group, names, found)
+        if not found:
+            omitted.update(names)
+    return omitted
 
 
 def _parse_checksum_file(path: pathlib.Path) -> tuple[str, str]:
@@ -815,14 +882,16 @@ def stage_release(
     output_root.mkdir(parents=True, exist_ok=True)
 
     assets = contract["assets"]
-    for asset in assets:
+    omitted = _omitted_optional_sources(assets, source_root)
+    staged_assets = [asset for asset in assets if asset["name"] not in omitted]
+    for asset in staged_assets:
         if asset.get("generated") is True:
             continue
         source = _find_source_asset(source_root, asset["name"])
         shutil.copyfile(source, output_root / asset["name"])
 
     manifest_assets: list[dict[str, Any]] = []
-    for asset in assets:
+    for asset in staged_assets:
         destination = output_root / asset["name"]
         generated = asset.get("generated") is True
         manifest_assets.append(
@@ -845,7 +914,9 @@ def stage_release(
     )
 
     checksummed_names = sorted(
-        asset["name"] for asset in assets if asset["name"] != AGGREGATE_CHECKSUM_NAME
+        asset["name"]
+        for asset in staged_assets
+        if asset["name"] != AGGREGATE_CHECKSUM_NAME
     )
     checksum_lines = [
         f"{_sha256_file(output_root / name)}  {name}" for name in checksummed_names
@@ -866,9 +937,14 @@ def verify_staged_release(
     cargo_lock: pathlib.Path | None = None,
 ) -> None:
     contract = load_contract(contract_path)
-    expected_names = {asset["name"] for asset in contract["assets"]}
     actual_names = {path.name for path in output_root.iterdir() if path.is_file()}
     directory_names = {path.name for path in output_root.iterdir() if path.is_dir()}
+    omitted = _omitted_optional_assets(contract["assets"], actual_names)
+    expected_names = {
+        asset["name"]
+        for asset in contract["assets"]
+        if asset["name"] not in omitted
+    }
     if directory_names or actual_names != expected_names:
         raise ReleaseArtifactError(
             f"staged asset mismatch; missing={sorted(expected_names - actual_names)}, "
@@ -885,7 +961,11 @@ def verify_staged_release(
         raise ReleaseArtifactError("release manifest repository is invalid")
     if manifest.get("git_commit") != git_commit or manifest.get("tag") != tag:
         raise ReleaseArtifactError("release manifest subject does not match release")
-    expected_order = [asset["name"] for asset in contract["assets"]]
+    expected_order = [
+        asset["name"]
+        for asset in contract["assets"]
+        if asset["name"] not in omitted
+    ]
     manifest_assets = manifest.get("assets")
     if (
         not isinstance(manifest_assets, list)
