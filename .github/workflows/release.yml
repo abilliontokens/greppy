@@ -260,6 +260,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        name: [macos-arm64, linux-x86_64, windows-x86_64]
         include:
           # GPU-accelerated where the platform supports it; the binary always
           # runs on CPU when no GPU is present (Metal detected at runtime, CUDA
@@ -1057,6 +1058,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        name: [macos-arm64, linux-x86_64-no-toolkit, windows-x86_64]
         include:
           - name: macos-arm64
             os: macos-latest
