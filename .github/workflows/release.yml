@@ -1136,7 +1136,7 @@ jobs:
             security cms -D -i "$extension_profile" \
               -o "$profile_evidence/extension-profile.plist"
             codesign -d \
-              --extract-certificates "$profile_evidence/codesign" "$app"
+              --extract-certificates="$profile_evidence/codesign" "$app"
             test -s "$profile_evidence/codesign0"
             python3 tools/validate_macos_fskit_profile.py \
               --plist "$profile_evidence/app-profile.plist" \

@@ -587,7 +587,7 @@ class ReleaseArtifactTests(unittest.TestCase):
             workflow,
         )
         self.assertIn(
-            '--extract-certificates "$profile_evidence/codesign" "$app"',
+            '--extract-certificates="$profile_evidence/codesign" "$app"',
             workflow,
         )
         self.assertIn(
