@@ -109,6 +109,9 @@ Unix-socket control surface rather than silently changing behavior.
 
 **Web security hardening.** The embedded Servo runtime now honors its HSTS
 preload database on first navigation instead of globally bypassing it.
+Its HTTP client is locked to rustls 0.23.45, so a TLS 1.3 handshake
+message that crosses an encryption-level boundary is rejected
+(RUSTSEC-2026-0285); 0.23.43 accepted it.
 `SubtleCrypto` is temporarily unavailable because Servo 0.5.0 reaches the
 timing-vulnerable `rsa` 0.10.0-rc.18 RSA-OAEP private-key path
 (RUSTSEC-2023-0071); `crypto.getRandomValues` and `crypto.randomUUID` remain
