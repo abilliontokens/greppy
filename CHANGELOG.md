@@ -230,6 +230,10 @@ privilege boundary.
   answering for its old path, so lookups relative to it and its removal
   failed with ENOENT (`rm -r` after `mv`); the item and every cached
   descendant now follow the rename.
+- Removing a directory that was created inside a workspace and then renamed
+  returned ENOENT. The directory lived only as a path redirect, and unlink
+  tried to promote a baseline object that does not exist. The new name and
+  the old name are both removed.
 
 These corrections do not replace the required real-device, parallel-agent or
 exact-SHA release gates. The macOS device acceptance (setup, doctor, kernel

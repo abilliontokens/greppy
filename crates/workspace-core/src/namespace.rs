@@ -1031,6 +1031,30 @@ impl WorkspaceCore {
                 changed_unix_ns: 0,
             }));
         }
+        // A directory created inside the workspace and then renamed exists only
+        // as a redirect. Its source row is a tombstone, so it is not a baseline
+        // object and not an overlay inode at the new path. Treat the redirect
+        // itself as the directory; otherwise getattr/rmdir report ENOENT.
+        let redirected: bool = connection
+            .query_row(
+                "SELECT 1 FROM cow_redirects WHERE workspace_id = ?1 AND destination = ?2",
+                params![workspace.id, path],
+                |_| Ok(1_i64),
+            )
+            .optional()?
+            .is_some();
+        if redirected {
+            return Ok(Some(NodeMetadata {
+                kind: NodeKind::Directory,
+                mode: 0o040755,
+                size: 0,
+                inode: stable_inode(&workspace.id, &path),
+                nlink: 2,
+                accessed_unix_ns: 0,
+                modified_unix_ns: 0,
+                changed_unix_ns: 0,
+            }));
+        }
         Ok(None)
     }
 
@@ -1525,6 +1549,38 @@ impl WorkspaceCore {
             .ok_or_else(|| Error::NotFound(path.clone()))?;
         if metadata.kind == NodeKind::Directory && !self.read_dir(workspace, &path)?.is_empty() {
             return Err(Error::DirectoryNotEmpty(path));
+        }
+        if metadata.kind == NodeKind::Directory {
+            // materialize() promotes a baseline object. A directory that was
+            // created in the overlay and renamed is only a cow_redirects row,
+            // so that promotion returns NotFound and rmdir fails with ENOENT
+            // after mv. Tombstone the new name, the redirect's source, and
+            // drop the redirect.
+            let _writer = self.lock_metadata_writer()?;
+            let mut connection = self.lock_metadata()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let like = escape_like(&(path.clone() + "/")) + "%";
+            let source: Option<String> = transaction
+                .query_row(
+                    "SELECT source FROM cow_redirects
+                     WHERE workspace_id = ?1 AND destination = ?2",
+                    params![workspace.id, path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            transaction.execute(
+                "DELETE FROM cow_redirects
+                 WHERE workspace_id = ?1
+                   AND (destination = ?2 OR destination LIKE ?3 ESCAPE '\\')",
+                params![workspace.id, path, like],
+            )?;
+            insert_tombstone(&transaction, &workspace.id, &path)?;
+            if let Some(source) = source {
+                insert_tombstone(&transaction, &workspace.id, &source)?;
+            }
+            transaction.commit()?;
+            return Ok(());
         }
         let _inode = self.materialize(workspace, &path)?;
         let _writer = self.lock_metadata_writer()?;
@@ -3521,6 +3577,50 @@ mod tests {
             b"replacement"
         );
         assert_eq!(core.chunks().stats().unwrap().referenced_chunks, before - 1);
+    }
+
+    #[test]
+    fn directory_rename_of_an_overlay_directory_unlinks_both_names() {
+        let (_repo, _storage, core, workspace) = fixture();
+        core.mkdir(&workspace, "d1", 0o040755).unwrap();
+        core.create_file(&workspace, "d1/child.txt", 0o100644)
+            .unwrap();
+        core.write(&workspace, "d1/child.txt", 0, b"c\n").unwrap();
+        core.rename(&workspace, "d1", "d2").unwrap();
+
+        let mut names: Vec<_> = core
+            .read_dir(&workspace, "")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .filter(|name| name == "d1" || name == "d2")
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["d2".to_string()]);
+        assert!(core.metadata(&workspace, "d1").unwrap().is_none());
+        assert_eq!(core.read(&workspace, "d2/child.txt", 0, 2).unwrap(), b"c\n");
+
+        core.unlink(&workspace, "d2/child.txt").unwrap();
+        core.unlink(&workspace, "d2").unwrap();
+        assert!(core.metadata(&workspace, "d1").unwrap().is_none());
+        assert!(core.metadata(&workspace, "d2").unwrap().is_none());
+        assert!(core.metadata(&workspace, "d2/child.txt").unwrap().is_none());
+        let left: Vec<_> = core
+            .read_dir(&workspace, "")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .filter(|name| name == "d1" || name == "d2")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+
+        core.mkdir(&workspace, "f1", 0o040755).unwrap();
+        core.rename(&workspace, "f1", "f2").unwrap();
+        assert!(core.metadata(&workspace, "f2").unwrap().is_some());
+        assert!(core.metadata(&workspace, "f1").unwrap().is_none());
+        core.unlink(&workspace, "f2").unwrap();
+        assert!(core.metadata(&workspace, "f1").unwrap().is_none());
+        assert!(core.metadata(&workspace, "f2").unwrap().is_none());
     }
 
     #[test]
