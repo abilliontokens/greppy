@@ -230,6 +230,11 @@ privilege boundary.
   answering for its old path, so lookups relative to it and its removal
   failed with ENOENT (`rm -r` after `mv`); the item and every cached
   descendant now follow the rename.
+- Renaming a directory that was created inside a workspace keeps it
+  reachable. The core moved only the directory's contents and left no entry
+  at the new name, so `ls`, `rmdir` and `rm -r` of the renamed directory
+  failed with ENOENT on every platform. Directories from the repository were
+  not affected.
 
 These corrections do not replace the required real-device, parallel-agent or
 exact-SHA release gates. The macOS device acceptance (setup, doctor, kernel
