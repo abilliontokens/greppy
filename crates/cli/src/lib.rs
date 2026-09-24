@@ -8660,6 +8660,10 @@ struct IndexSnapshotReport {
     /// never cost the caller the graph index (nor the vectors that DID
     /// embed).
     embedding_degraded: Option<String>,
+    /// Summary of workspace edits made while the snapshot was being built.
+    /// The snapshot is still published; query-time freshness refreshes
+    /// those paths.
+    changed_during_index: Option<String>,
 }
 
 /// Outcome of the inline embedding pass over the freshly built temp store.
@@ -8831,7 +8835,7 @@ fn replace_active_with_temp(
             }
         },
         PublishRenameMode::RemoveExistingFirst => {
-            remove_file_if_exists(active_path)?;
+            remove_active_waiting_for_readers(active_path)?;
             match std::fs::rename(temp_path, active_path) {
                 Ok(()) => Ok(()),
                 Err(e) => {
@@ -8918,10 +8922,40 @@ fn prepare_existing_active_store(active_path: &std::path::Path) -> Result<()> {
         ))
     })?;
     drop(store);
-    cleanup_sqlite_sidecars(active_path)?;
+    // The checkpoint above emptied the WAL into the main file. On Windows a
+    // concurrent reader keeps the sidecars open and removal fails with a
+    // sharing violation; the reader's truncated WAL is harmless to leave.
+    match cleanup_sqlite_sidecars(active_path) {
+        Err(Error::Io { source, .. }) if sharing_violation(&source) => {}
+        other => other?,
+    }
     workspace_locator::ensure_db_mode(active_path)
         .map_err(|e| Error::io(format!("chmod db {}", active_path.display()), e))?;
     Ok(())
+}
+
+/// `ERROR_SHARING_VIOLATION`: another process holds the file open. Never
+/// produced off Windows.
+fn sharing_violation(error: &std::io::Error) -> bool {
+    cfg!(windows) && error.raw_os_error() == Some(32)
+}
+
+/// Remove the active snapshot so the temp one can take its name. On Windows
+/// a query holding the old snapshot open blocks removal; queries are short
+/// and a waiting query gives up within 2s, so retry for a bounded time.
+#[cfg(any(not(unix), test))]
+fn remove_active_waiting_for_readers(active_path: &std::path::Path) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match remove_file_if_exists(active_path) {
+            Err(Error::Io { source, .. })
+                if sharing_violation(&source) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
 }
 
 fn quarantine_active_store(active_path: &std::path::Path) -> Result<std::path::PathBuf> {
