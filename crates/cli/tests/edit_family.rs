@@ -230,17 +230,22 @@ fn malformed_patch_reports_input_line_and_preserves_the_file() {
 }
 
 #[cfg(unix)]
-fn install_fake_tsc(fixture: &Fixture, script: &str) {
+fn install_fake_typescript_compiler(directory: &Path, name: &str, script: &str) {
     use std::os::unix::fs::PermissionsExt as _;
 
-    std::fs::write(fixture.repo.join("package.json"), "{}\n").unwrap();
-    let bin = fixture.repo.join("node_modules/.bin");
+    let bin = directory.join("node_modules/.bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let tsc = bin.join("tsc");
-    std::fs::write(&tsc, script).unwrap();
-    let mut permissions = std::fs::metadata(&tsc).unwrap().permissions();
+    let compiler = bin.join(name);
+    std::fs::write(&compiler, script).unwrap();
+    let mut permissions = std::fs::metadata(&compiler).unwrap().permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(tsc, permissions).unwrap();
+    std::fs::set_permissions(compiler, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn install_fake_tsc(fixture: &Fixture, script: &str) {
+    std::fs::write(fixture.repo.join("package.json"), "{}\n").unwrap();
+    install_fake_typescript_compiler(&fixture.repo, "tsc", script);
 }
 
 #[cfg(unix)]
@@ -271,6 +276,91 @@ fn verify_selects_the_touched_typescript_project_and_reports_live_status() {
     assert!(stdout.contains("verify: passed — local TypeScript check"));
     assert_file(&fixture.repo.join("tsc-ran"), "typescript verifier ran");
     assert_file(&fixture.repo.join("ui.ts"), "const newValue = 1;\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_discovers_workspace_tsgo_and_runs_it_from_owning_package() {
+    let fixture = Fixture::new("verify-workspace-tsgo");
+    std::fs::write(fixture.repo.join("package.json"), "{}\n").unwrap();
+    let package = fixture.repo.join("apps/server");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("package.json"), "{}\n").unwrap();
+    std::fs::write(package.join("ui.ts"), "const oldValue = 1;\n").unwrap();
+    install_fake_typescript_compiler(
+        &fixture.repo,
+        "tsgo",
+        "#!/bin/sh\nprintf workspace-tsgo > workspace-tsgo-ran\nexit 0\n",
+    );
+
+    let output = fixture.run(&[
+        "replace-text",
+        "apps/server/ui.ts",
+        "oldValue",
+        "newValue",
+        "--verify",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(combined(&output).contains("verify: passed — local TypeScript check"));
+    assert_file(&package.join("workspace-tsgo-ran"), "workspace-tsgo");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_prefers_package_compiler_and_does_not_climb_above_workspace() {
+    let fixture = Fixture::new("verify-typescript-compiler-bounds");
+    std::fs::write(fixture.repo.join("package.json"), "{}\n").unwrap();
+    let package = fixture.repo.join("apps/server");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("package.json"), "{}\n").unwrap();
+    std::fs::write(package.join("ui.ts"), "const oldValue = 1;\n").unwrap();
+    install_fake_typescript_compiler(
+        &fixture.repo,
+        "tsgo",
+        "#!/bin/sh\nprintf root > root-compiler-ran\nexit 0\n",
+    );
+    install_fake_typescript_compiler(
+        &package,
+        "tsc",
+        "#!/bin/sh\nprintf package > package-compiler-ran\nexit 0\n",
+    );
+
+    let output = fixture.run(&[
+        "replace-text",
+        "apps/server/ui.ts",
+        "oldValue",
+        "newValue",
+        "--verify",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_file(&package.join("package-compiler-ran"), "package");
+    assert!(!package.join("root-compiler-ran").exists());
+
+    std::fs::remove_dir_all(package.join("node_modules")).unwrap();
+    std::fs::remove_dir_all(fixture.repo.join("node_modules")).unwrap();
+    install_fake_typescript_compiler(
+        &fixture.base,
+        "tsgo",
+        "#!/bin/sh\nprintf escaped > escaped-compiler-ran\nexit 0\n",
+    );
+    let skipped = fixture.run(&[
+        "replace-text",
+        "apps/server/ui.ts",
+        "newValue",
+        "finalValue",
+        "--verify",
+    ]);
+    assert!(skipped.status.success(), "{}", combined(&skipped));
+    let diagnostic = combined(&skipped);
+    assert!(
+        diagnostic.contains("no local TypeScript compiler from"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("through workspace root"),
+        "{diagnostic}"
+    );
+    assert!(!fixture.base.join("escaped-compiler-ran").exists());
 }
 
 #[cfg(unix)]
