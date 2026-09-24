@@ -438,7 +438,11 @@ pub(crate) fn freshness_serve_decision_with_policy(
     } else {
         nav_freshness_json(store, root, project)
     };
-    if freshness_json_is_fresh(&freshness) {
+    let verified_metadata_refresh = freshness
+        .get("metadata_refresh_pending")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if freshness_json_is_fresh(&freshness) && (!writer_active || verified_metadata_refresh) {
         return FreshnessServe::Fresh(freshness);
     }
     if writer_active {
