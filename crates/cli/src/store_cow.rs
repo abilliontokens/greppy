@@ -408,16 +408,26 @@ fn persisted_delta_path_matches(
     identities: &std::collections::HashMap<String, greppy_store::FileIdentity>,
 ) -> Result<bool> {
     let path = root.join(rel_path);
-    let metadata = std::fs::metadata(&path)
-        .map_err(|error| Error::io(format!("stat Store-CoW Delta path {rel_path}"), error))?;
-    if !metadata.is_file() {
-        return Ok(false);
-    }
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return persisted_sparse_delta_path_matches(root, store, project, rel_path);
+        }
+        Err(error) => {
+            return Err(Error::io(
+                format!("stat Store-CoW Delta path {rel_path}"),
+                error,
+            ));
+        }
+    };
     let current = greppy_discover::stable_metadata(&metadata);
     if let Some(state) = store
         .get_file_state(project, rel_path)
         .map_err(|error| Error::Store(format!("read Store-CoW file state: {error}")))?
     {
+        if !metadata.is_file() {
+            return Ok(false);
+        }
         let identity = identities.get(rel_path);
         let stat_matches = state.size >= 0
             && state.size as u64 == current.size
@@ -446,6 +456,42 @@ fn persisted_delta_path_matches(
             && skip.file_id == current.file_id);
     }
     Ok(false)
+}
+
+fn persisted_sparse_delta_path_matches(
+    root: &Path,
+    store: &greppy_store::Store,
+    project: &str,
+    rel_path: &str,
+) -> Result<bool> {
+    let listed = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-v", "-z", "--", rel_path])
+        .output()
+        .map_err(|error| Error::io("inspect sparse Store-CoW Delta path", error))?;
+    if !listed.status.success()
+        || listed.stdout.first().copied() != Some(b'S')
+        || nul_fields(&listed.stdout)?.len() != 1
+    {
+        return Ok(false);
+    }
+    let Some(state) = store
+        .get_file_state(project, rel_path)
+        .map_err(|error| Error::Store(format!("read sparse Store-CoW file state: {error}")))?
+    else {
+        return Ok(false);
+    };
+    let staged = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "blob", &format!(":{rel_path}")])
+        .output()
+        .map_err(|error| Error::io("read sparse Store-CoW Delta blob", error))?;
+    if !staged.status.success() || state.size < 0 || staged.stdout.len() as i64 != state.size {
+        return Ok(false);
+    }
+    Ok(greppy_store::file_state::sha256_hex(&staged.stdout) == state.sha256)
 }
 
 fn paths_resolve_equal(left: &Path, right: &Path) -> bool {
@@ -2305,6 +2351,117 @@ mod tests {
             &store,
             "p",
             ".github/workflows/ci.yml",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn sparse_checkout_delta_freshness_uses_the_staged_blob() {
+        let repo = fixture();
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+        std::fs::write(repo.path().join("docs/added.rs"), "fn added() {}\n").unwrap();
+        git(repo.path(), &["add", "docs/added.rs"]);
+        git(repo.path(), &["commit", "-q", "-m", "add sparse file"]);
+
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        let options = greppy_indexer::IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from([
+                "docs/added.rs".to_string()
+            ])),
+            ..greppy_indexer::IndexOptions::default()
+        };
+        greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
+        assert!(store
+            .get_file_state("p", "docs/added.rs")
+            .unwrap()
+            .is_some());
+
+        git(repo.path(), &["sparse-checkout", "init", "--cone"]);
+        git(repo.path(), &["sparse-checkout", "set", "src"]);
+        assert!(!repo.path().join("docs/added.rs").exists());
+        let visibility = visibility_against(repo.path(), &base).unwrap();
+        assert!(visibility.is_dirty_path("docs/added.rs"));
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+        )
+        .unwrap());
+
+        let replacement = repo.path().join("replacement.rs");
+        std::fs::write(&replacement, "fn replacement() {}\n").unwrap();
+        let replacement_oid = git(
+            repo.path(),
+            &["hash-object", "-w", replacement.to_str().unwrap()],
+        );
+        let cache_entry = format!("100644,{replacement_oid},docs/added.rs");
+        git(repo.path(), &["update-index", "--cacheinfo", &cache_entry]);
+        git(
+            repo.path(),
+            &["update-index", "--skip-worktree", "docs/added.rs"],
+        );
+        assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+        )
+        .unwrap());
+
+        git(
+            repo.path(),
+            &["update-index", "--force-remove", "docs/added.rs"],
+        );
+        assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+        )
+        .unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_symlink_skip_uses_symlink_identity_without_following_target() {
+        use std::os::unix::fs::symlink;
+
+        let repo = fixture();
+        std::fs::write(repo.path().join("AGENTS.md"), "small target\n").unwrap();
+        symlink("AGENTS.md", repo.path().join("CLAUDE.md")).unwrap();
+        git(repo.path(), &["add", "AGENTS.md", "CLAUDE.md"]);
+        git(repo.path(), &["commit", "-q", "-m", "add tracked symlink"]);
+
+        let mut store = greppy_store::Store::open_memory().unwrap();
+        let options = greppy_indexer::IndexOptions {
+            only_paths: Some(std::collections::BTreeSet::from(["CLAUDE.md".to_string()])),
+            ..greppy_indexer::IndexOptions::default()
+        };
+        greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
+        assert!(store.get_index_skip("p", "CLAUDE.md").unwrap().is_some());
+
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "CLAUDE.md",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
+
+        std::fs::remove_file(repo.path().join("CLAUDE.md")).unwrap();
+        symlink("MISSING.md", repo.path().join("CLAUDE.md")).unwrap();
+        assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "CLAUDE.md",
             &std::collections::HashMap::new(),
         )
         .unwrap());
