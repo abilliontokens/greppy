@@ -2933,7 +2933,7 @@ fn monitor_index_startup(
 }
 
 fn cancel_background_job(launch: &mut crate::BackgroundJobLaunch) {
-    if let crate::BackgroundJobLaunch::Owned { child, path } = launch {
+    if let crate::BackgroundJobLaunch::Owned { child, path, .. } = launch {
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_file(path);
@@ -3864,6 +3864,7 @@ mod tests {
         let mut launch = crate::BackgroundJobLaunch::Attached {
             path: path.clone(),
             root: dir.path().to_path_buf(),
+            demand: None,
         };
 
         cancel_background_job(&mut launch);
@@ -3883,6 +3884,7 @@ mod tests {
         let mut launch = crate::BackgroundJobLaunch::Owned {
             child,
             path: path.clone(),
+            demand: None,
         };
 
         cancel_background_job(&mut launch);

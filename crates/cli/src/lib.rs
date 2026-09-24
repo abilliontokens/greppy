@@ -4177,12 +4177,88 @@ fn vector_auto_reindex_can_rebuild(args: EmbeddingCliArgs<'_>) -> bool {
 
 /// Atomically published status for the one allowed background index job.
 const BACKGROUND_JOB_FILE: &str = "index.job";
+const ENV_BACKGROUND_DEMAND_LOCK: &str = "GREPPY_BACKGROUND_DEMAND_LOCK";
 
 fn background_job_path(root: &std::path::Path) -> std::path::PathBuf {
     workspace_locator::store_path(root)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(BACKGROUND_JOB_FILE)
+}
+
+fn background_job_demand_name(root: &std::path::Path, kind: &str) -> String {
+    let hash = greppy_core::workspace::workspace_hash(root);
+    format!("workspace-{hash}.{kind}-query-demand")
+}
+
+fn acquire_background_job_demand(
+    root: &std::path::Path,
+    kind: &str,
+) -> std::io::Result<Option<greppy_core::cache::FileLock>> {
+    greppy_core::cache::acquire_named_lock(
+        &background_job_demand_name(root, kind),
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+}
+
+fn start_background_demand_monitor(job_path: &std::path::Path) {
+    let Some(lock_name) = std::env::var_os(ENV_BACKGROUND_DEMAND_LOCK) else {
+        return;
+    };
+    let lock_name = lock_name.to_string_lossy().into_owned();
+    let job_path = job_path.to_owned();
+    let monitor_path = job_path.clone();
+    let spawned = std::thread::Builder::new()
+        .name("greppy-query-demand".into())
+        .spawn(move || loop {
+            match greppy_core::cache::acquire_named_lock(
+                &lock_name,
+                greppy_core::cache::LockMode::Exclusive,
+                true,
+            ) {
+                Ok(Some(_exclusive)) => {
+                    finish_background_demand_monitor(
+                        &job_path,
+                        "cancelled",
+                        "automatic index stopped after its last query waiter exited",
+                        130,
+                    );
+                }
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => finish_background_demand_monitor(
+                    &job_path,
+                    "failed",
+                    &format!("automatic index demand monitor failed: {error}"),
+                    70,
+                ),
+            }
+        });
+    if let Err(error) = spawned {
+        finish_background_demand_monitor(
+            &monitor_path,
+            "failed",
+            &format!("automatic index demand monitor could not start: {error}"),
+            70,
+        );
+    }
+}
+
+fn finish_background_demand_monitor(
+    job_path: &std::path::Path,
+    state: &str,
+    detail: &str,
+    exit_code: i32,
+) -> ! {
+    if let Some(mut job) = read_background_job(job_path) {
+        job["state"] = serde_json::json!(state);
+        job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+        job["last_error"] = serde_json::json!(detail);
+        let _ = write_background_job(job_path, &job);
+    }
+    std::process::exit(exit_code);
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -4363,6 +4439,7 @@ impl BackgroundJobGuard {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
+                start_background_demand_monitor(path);
             }
         }
         let published = path.as_deref().and_then(read_background_job);
@@ -4735,10 +4812,12 @@ pub(crate) enum BackgroundJobLaunch {
     Owned {
         child: std::process::Child,
         path: std::path::PathBuf,
+        demand: Option<greppy_core::cache::FileLock>,
     },
     Attached {
         path: std::path::PathBuf,
         root: std::path::PathBuf,
+        demand: Option<greppy_core::cache::FileLock>,
     },
 }
 
@@ -4777,6 +4856,14 @@ fn spawn_background_job_handle(
     if greppy_core::cache::ensure_workspace_store(&root).is_err() {
         return None;
     }
+    let demand_name = background_job_demand_name(&root, kind);
+    let Ok(Some(demand)) = acquire_background_job_demand(&root, kind) else {
+        return None;
+    };
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("GREPPY_TEST_BACKGROUND_DEMAND_READY") {
+        let _ = std::fs::write(path, b"ready\n");
+    }
     let hash = greppy_core::workspace::workspace_hash(&root);
     let Ok(Some(_spawn_lock)) = greppy_core::cache::acquire_named_lock(
         &format!("workspace-{hash}.job-spawn"),
@@ -4792,6 +4879,7 @@ fn spawn_background_job_handle(
         return Some(BackgroundJobLaunch::Attached {
             path: job_path,
             root,
+            demand: Some(demand),
         });
     }
     let target_generation = greppy_store::Store::open_with(
@@ -4862,6 +4950,7 @@ fn spawn_background_job_handle(
             "GREPPY_BACKGROUND_TARGET_GENERATION",
             target_generation.to_string(),
         )
+        .env(ENV_BACKGROUND_DEMAND_LOCK, &demand_name)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -4953,6 +5042,7 @@ fn spawn_background_job_handle(
     Some(BackgroundJobLaunch::Owned {
         child,
         path: job_path,
+        demand: Some(demand),
     })
 }
 
@@ -4965,11 +5055,15 @@ fn spawn_background_job(
     let Some(launch) = spawn_background_job_handle(root, cause, kind, embedding_cfg) else {
         return false;
     };
-    if let BackgroundJobLaunch::Owned { mut child, .. } = launch {
+    if let BackgroundJobLaunch::Owned {
+        mut child, demand, ..
+    } = launch
+    {
         // Detached refreshes still need a reaper in this long-lived process.
         let _ = std::thread::Builder::new()
             .name("greppy-index-reaper".into())
             .spawn(move || {
+                let _demand = demand;
                 let _ = child.wait();
             });
     }
