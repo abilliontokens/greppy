@@ -1994,6 +1994,7 @@ class Page {
       ]);
       this._emitLoad(waitUntil);
       return this._responseFromRecord({
+        requestId: result.requestId,
         url: this._url,
         status: result.status == null ? 0 : Number(result.status),
         statusText: result.statusText || "",
@@ -2088,7 +2089,12 @@ class Page {
       text: async () => decodeUtf8(bytes()),
       json: async () => JSON.parse(decodeUtf8(bytes())),
       request: () =>
-        request || this._requestFromRecord({ url: rec.url, method: "GET" }),
+        request ||
+        this._requestFromRecord({
+          requestId: rec.requestId,
+          url: rec.url,
+          method: rec.method || "GET",
+        }),
     }, "Response");
   }
 
