@@ -2958,7 +2958,6 @@ fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
         .args(["search", "find clean committed marker"])
         .current_dir(&linked)
         .env("GREPPY_STORE_DIR", &store)
-        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env("GREPPY_TEST_BASE_OWNER_HOLD_MS", "120000")
         .env("GREPPY_TEST_BASE_OWNER_READY", &delegated_ready)
         .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", &demand_ready)
