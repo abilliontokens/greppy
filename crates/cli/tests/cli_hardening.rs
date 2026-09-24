@@ -2931,6 +2931,15 @@ fn cancelling_sole_first_use_query_stops_its_automatic_index() {
 #[cfg(all(unix, not(feature = "ci-test-assets")))]
 #[test]
 fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
+    struct ReapedQuery(std::process::Child);
+    impl Drop for ReapedQuery {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
     let (primary, store, scratch) = make_real_git_repo("linked-first-use-cancel");
     let linked = scratch.0.join("linked");
     git(
@@ -2954,24 +2963,34 @@ fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
     );
     let delegated_ready = scratch.0.join("delegated-base-ready");
     let demand_ready = scratch.0.join("linked-demand-ready");
-    let mut query = Command::new(bin())
+    let log_path = scratch.0.join("linked-query.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let query = Command::new(bin())
         .args(["search", "find clean committed marker"])
         .current_dir(&linked)
         .env("GREPPY_STORE_DIR", &store)
-        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_TEST_SKIP_INFERENCE")
         .env("GREPPY_TEST_BASE_OWNER_HOLD_MS", "120000")
         .env("GREPPY_TEST_BASE_OWNER_READY", &delegated_ready)
         .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", &demand_ready)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
         .spawn()
         .expect("spawn linked first-use query");
+    let mut query = ReapedQuery(query);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while !delegated_ready.exists() || !demand_ready.exists() {
-        assert!(query.try_wait().unwrap().is_none(), "query exited early");
+        assert!(
+            query.0.try_wait().unwrap().is_none(),
+            "query exited early: {}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
         assert!(
             std::time::Instant::now() < deadline,
-            "delegated Base index or demand monitor did not become ready"
+            "delegated Base index or demand monitor did not become ready (base={}, demand={}): {}",
+            delegated_ready.exists(),
+            demand_ready.exists(),
+            std::fs::read_to_string(&log_path).unwrap_or_default()
         );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -2989,8 +3008,8 @@ fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
         serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
     let index_pid = job["pid"].as_u64().unwrap() as u32;
 
-    signal_process(query.id(), libc::SIGKILL);
-    let status = query.wait().unwrap();
+    signal_process(query.0.id(), libc::SIGKILL);
+    let status = query.0.wait().unwrap();
     assert_eq!(
         std::os::unix::process::ExitStatusExt::signal(&status),
         Some(libc::SIGKILL)

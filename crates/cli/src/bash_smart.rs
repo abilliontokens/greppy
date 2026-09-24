@@ -1850,12 +1850,32 @@ fn novelty_candidate_indices(groups: &[CollapseGroup], line_count: usize) -> Vec
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    if eligible.len() <= EMBED_BATCH_LINES {
-        return eligible;
+    if eligible.is_empty() {
+        return Vec::new();
     }
-    (0..EMBED_BATCH_LINES)
-        .map(|slot| eligible[slot * (eligible.len() - 1) / (EMBED_BATCH_LINES - 1)])
-        .collect()
+    // The weighted centroid needs representative routine output, otherwise a
+    // lone anomaly becomes its own baseline and can never be lifted. Reserve
+    // up to half a batch for the largest repeated groups; rank_novelty still
+    // permits only hidden singletons as the final lifted lines.
+    let mut baseline = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| group.count() > 1)
+        .map(|(index, group)| (index, group.count()))
+        .collect::<Vec<_>>();
+    baseline.sort_unstable_by_key(|(index, count)| (std::cmp::Reverse(*count), *index));
+    baseline.truncate(EMBED_BATCH_LINES / 2);
+    let budget = EMBED_BATCH_LINES - baseline.len();
+    let mut selected = if eligible.len() <= budget {
+        eligible
+    } else {
+        (0..budget)
+            .map(|slot| eligible[slot * (eligible.len() - 1) / (budget - 1)])
+            .collect()
+    };
+    selected.extend(baseline.into_iter().map(|(index, _)| index));
+    selected.sort_unstable();
+    selected
 }
 
 fn novelty_lifts(
@@ -2230,6 +2250,35 @@ mod tests {
                 "sampling must cover the whole log, including late anomalies"
             );
         }
+    }
+
+    #[test]
+    fn novelty_sampling_retains_repeated_background_for_a_single_anomaly() {
+        let output = format!(
+            "{}novel anomaly\n{}",
+            "routine output\n".repeat(64),
+            "routine output\n".repeat(64),
+        );
+        let lines = split_lines(output.as_bytes());
+        let groups = collapse_groups(&lines);
+        let selected = novelty_candidate_indices(&groups, lines.len());
+        assert!(selected.len() <= EMBED_BATCH_LINES);
+        assert!(selected.iter().any(|index| groups[*index].count() > 1));
+        let embedded = selected
+            .into_iter()
+            .map(|index| {
+                let vector = if groups[index].count() == 1 {
+                    vec![0.0, 1.0]
+                } else {
+                    vec![1.0, 0.0]
+                };
+                (index, vector)
+            })
+            .collect::<Vec<_>>();
+        let lifted = rank_novelty(&lines, &groups, &embedded);
+        assert_eq!(lifted.len(), 1);
+        assert_eq!(lifted[0].line, 65);
+        assert_eq!(lifted[0].bytes, b"novel anomaly");
     }
 
     #[test]
