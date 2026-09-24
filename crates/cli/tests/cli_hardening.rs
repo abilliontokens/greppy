@@ -2930,6 +2930,71 @@ fn cancelling_sole_first_use_query_stops_its_automatic_index() {
 
 #[cfg(unix)]
 #[test]
+fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
+    let (primary, store, scratch) = make_real_git_repo("linked-first-use-cancel");
+    let linked = scratch.0.join("linked");
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked-cancel",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let delegated_ready = scratch.0.join("delegated-base-ready");
+    let demand_ready = scratch.0.join("linked-demand-ready");
+    let mut query = Command::new(bin())
+        .args(["search-symbol", "clean_committed_marker"])
+        .current_dir(&linked)
+        .env("GREPPY_STORE_DIR", &store)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env("GREPPY_TEST_BASE_OWNER_HOLD_MS", "120000")
+        .env("GREPPY_TEST_BASE_OWNER_READY", &delegated_ready)
+        .env("GREPPY_TEST_BACKGROUND_DEMAND_READY", &demand_ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn linked first-use query");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !delegated_ready.exists() || !demand_ready.exists() {
+        assert!(query.try_wait().unwrap().is_none(), "query exited early");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delegated Base index or demand monitor did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let delegated_pid: u32 = std::fs::read_to_string(&delegated_ready)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let job_path = store
+        .join("workspaces")
+        .join("v2")
+        .join(greppy_core::workspace::workspace_hash(&linked))
+        .join("index.job");
+    let job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    let index_pid = job["pid"].as_u64().unwrap() as u32;
+
+    signal_process(query.id(), libc::SIGKILL);
+    let status = query.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+    wait_for_process_exit(index_pid);
+    wait_for_process_exit(delegated_pid);
+    let cancelled: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+}
+
+#[cfg(unix)]
+#[test]
 fn automatic_index_stops_only_after_last_shared_query_exits() {
     let (repo, store, scratch) = make_repo("first-use-cancel-shared", "cancel_shared_marker");
     let ready = scratch.0.join("cancel-shared-writer-ready");
