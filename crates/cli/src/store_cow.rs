@@ -327,8 +327,31 @@ pub(crate) fn overlay_freshness_proof(
     let identities = store
         .list_file_identities(project)
         .map_err(|error| Error::Store(format!("read Store-CoW file identities: {error}")))?;
+    let mut missing_dirty = std::collections::BTreeSet::new();
     for rel_path in &dirty {
-        if !persisted_delta_path_matches(root, store, project, rel_path, &identities)? {
+        match std::fs::symlink_metadata(root.join(rel_path)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_dirty.insert((*rel_path).to_owned());
+            }
+            Err(error) => {
+                return Err(Error::io(
+                    format!("stat Store-CoW Delta path {rel_path}"),
+                    error,
+                ));
+            }
+        }
+    }
+    let sparse_blobs = persisted_sparse_delta_blobs(root, &missing_dirty)?;
+    for rel_path in &dirty {
+        if !persisted_delta_path_matches(
+            root,
+            store,
+            project,
+            rel_path,
+            &identities,
+            &sparse_blobs,
+        )? {
             return Ok(Some(OverlayFreshnessProof::Stale {
                 changed_paths: vec![(*rel_path).to_owned()],
                 reason: "a Store-CoW Delta path changed after it was indexed".into(),
@@ -406,12 +429,24 @@ fn persisted_delta_path_matches(
     project: &str,
     rel_path: &str,
     identities: &std::collections::HashMap<String, greppy_store::FileIdentity>,
+    sparse_blobs: &std::collections::HashMap<String, SparseDeltaBlob>,
 ) -> Result<bool> {
     let path = root.join(rel_path);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return persisted_sparse_delta_path_matches(root, store, project, rel_path);
+            let Some(state) = store.get_file_state(project, rel_path).map_err(|error| {
+                Error::Store(format!("read sparse Store-CoW file state: {error}"))
+            })?
+            else {
+                return Ok(false);
+            };
+            let Some(blob) = sparse_blobs.get(rel_path) else {
+                return Ok(false);
+            };
+            return Ok(state.size >= 0
+                && blob.size == state.size as u64
+                && blob.sha256 == state.sha256);
         }
         Err(error) => {
             return Err(Error::io(
@@ -458,40 +493,137 @@ fn persisted_delta_path_matches(
     Ok(false)
 }
 
-fn persisted_sparse_delta_path_matches(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SparseDeltaBlob {
+    size: u64,
+    sha256: String,
+}
+
+fn persisted_sparse_delta_blobs(
     root: &Path,
-    store: &greppy_store::Store,
-    project: &str,
-    rel_path: &str,
-) -> Result<bool> {
-    let listed = Command::new("git")
+    rel_paths: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::HashMap<String, SparseDeltaBlob>> {
+    if rel_paths.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "-v", "-z", "--", rel_path])
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .args(["ls-files", "-v", "--stage", "-z", "--"])
+        .args(rel_paths);
+    let listed = command
         .output()
         .map_err(|error| Error::io("inspect sparse Store-CoW Delta path", error))?;
-    if !listed.status.success()
-        || listed.stdout.first().copied() != Some(b'S')
-        || nul_fields(&listed.stdout)?.len() != 1
-    {
-        return Ok(false);
+    if !listed.status.success() {
+        return Err(Error::Invalid(format!(
+            "git ls-files for sparse Store-CoW Delta failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        )));
     }
-    let Some(state) = store
-        .get_file_state(project, rel_path)
-        .map_err(|error| Error::Store(format!("read sparse Store-CoW file state: {error}")))?
-    else {
-        return Ok(false);
-    };
-    let staged = Command::new("git")
+    let mut entries = Vec::new();
+    for field in nul_fields(&listed.stdout)? {
+        let Some((header, rel_path)) = field.split_once('\t') else {
+            return Err(Error::Invalid(
+                "malformed sparse git ls-files record".into(),
+            ));
+        };
+        let columns = header.split_whitespace().collect::<Vec<_>>();
+        if columns.len() != 4 || columns[0] != "S" || columns[3] != "0" {
+            continue;
+        }
+        if !rel_paths.contains(rel_path) {
+            return Err(Error::Invalid(format!(
+                "git ls-files returned unexpected sparse path `{rel_path}`"
+            )));
+        }
+        entries.push((rel_path.to_owned(), columns[2].to_owned()));
+    }
+    if entries.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["cat-file", "blob", &format!(":{rel_path}")])
-        .output()
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
         .map_err(|error| Error::io("read sparse Store-CoW Delta blob", error))?;
-    if !staged.status.success() || state.size < 0 || staged.stdout.len() as i64 != state.size {
-        return Ok(false);
+    use std::io::{BufRead, Read, Write};
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Invalid("git cat-file stdin is unavailable".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Invalid("git cat-file stdout is unavailable".into()))?;
+    let mut stdout = std::io::BufReader::new(stdout);
+    let mut blobs = std::collections::HashMap::new();
+    for (rel_path, expected_oid) in &entries {
+        writeln!(&mut stdin, "{expected_oid}")
+            .and_then(|_| stdin.flush())
+            .map_err(|error| Error::io("request sparse Store-CoW Delta blob", error))?;
+        let mut header = String::new();
+        stdout
+            .read_line(&mut header)
+            .map_err(|error| Error::io("read sparse git cat-file header", error))?;
+        let header = header.trim_end_matches('\n');
+        let columns = header.split_whitespace().collect::<Vec<_>>();
+        if columns.len() != 3 || columns[0] != expected_oid || columns[1] != "blob" {
+            return Err(Error::Invalid(format!(
+                "unexpected sparse git cat-file header `{header}`"
+            )));
+        }
+        let size = columns[2]
+            .parse::<usize>()
+            .map_err(|_| Error::Invalid(format!("invalid sparse blob size in `{header}`")))?;
+        if size as u64 > greppy_freshness::incremental::MAX_FILE_SIZE_BYTES {
+            return Err(Error::Invalid(format!(
+                "sparse Store-CoW Delta blob `{rel_path}` exceeds the indexed file size limit"
+            )));
+        }
+        let mut content = vec![0; size];
+        stdout
+            .read_exact(&mut content)
+            .map_err(|error| Error::io("read sparse git cat-file content", error))?;
+        let mut newline = [0u8; 1];
+        stdout
+            .read_exact(&mut newline)
+            .map_err(|error| Error::io("finish sparse git cat-file content", error))?;
+        if newline != [b'\n'] {
+            return Err(Error::Invalid(
+                "malformed sparse git cat-file content terminator".into(),
+            ));
+        }
+        if blobs
+            .insert(
+                rel_path.clone(),
+                SparseDeltaBlob {
+                    size: size as u64,
+                    sha256: greppy_store::file_state::sha256_hex(&content),
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::Invalid(format!(
+                "duplicate sparse Store-CoW Delta path `{rel_path}`"
+            )));
+        }
     }
-    Ok(greppy_store::file_state::sha256_hex(&staged.stdout) == state.sha256)
+    drop(stdin);
+    let status = child
+        .wait()
+        .map_err(|error| Error::io("finish sparse Store-CoW Delta blob batch", error))?;
+    if !status.success() {
+        return Err(Error::Invalid(format!(
+            "git cat-file for sparse Store-CoW Delta failed with {status}"
+        )));
+    }
+    Ok(blobs)
 }
 
 fn paths_resolve_equal(left: &Path, right: &Path) -> bool {
@@ -2352,6 +2484,7 @@ mod tests {
             "p",
             ".github/workflows/ci.yml",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap());
     }
@@ -2362,13 +2495,15 @@ mod tests {
         let base = git(repo.path(), &["rev-parse", "HEAD"]);
         std::fs::create_dir_all(repo.path().join("docs")).unwrap();
         std::fs::write(repo.path().join("docs/added.rs"), "fn added() {}\n").unwrap();
-        git(repo.path(), &["add", "docs/added.rs"]);
-        git(repo.path(), &["commit", "-q", "-m", "add sparse file"]);
+        std::fs::write(repo.path().join("docs/[literal].rs"), "fn literal() {}\n").unwrap();
+        git(repo.path(), &["add", "docs/added.rs", "docs/[literal].rs"]);
+        git(repo.path(), &["commit", "-q", "-m", "add sparse files"]);
 
         let mut store = greppy_store::Store::open_memory().unwrap();
         let options = greppy_indexer::IndexOptions {
             only_paths: Some(std::collections::BTreeSet::from([
-                "docs/added.rs".to_string()
+                "docs/added.rs".to_string(),
+                "docs/[literal].rs".to_string(),
             ])),
             ..greppy_indexer::IndexOptions::default()
         };
@@ -2377,18 +2512,39 @@ mod tests {
             .get_file_state("p", "docs/added.rs")
             .unwrap()
             .is_some());
+        assert!(store
+            .get_file_state("p", "docs/[literal].rs")
+            .unwrap()
+            .is_some());
 
         git(repo.path(), &["sparse-checkout", "init", "--cone"]);
         git(repo.path(), &["sparse-checkout", "set", "src"]);
         assert!(!repo.path().join("docs/added.rs").exists());
+        assert!(!repo.path().join("docs/[literal].rs").exists());
         let visibility = visibility_against(repo.path(), &base).unwrap();
         assert!(visibility.is_dirty_path("docs/added.rs"));
+        assert!(visibility.is_dirty_path("docs/[literal].rs"));
+        let sparse_paths = std::collections::BTreeSet::from([
+            "docs/added.rs".to_string(),
+            "docs/[literal].rs".to_string(),
+        ]);
+        let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
         assert!(persisted_delta_path_matches(
             repo.path(),
             &store,
             "p",
             "docs/added.rs",
             &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/[literal].rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
         )
         .unwrap());
 
@@ -2404,12 +2560,23 @@ mod tests {
             repo.path(),
             &["update-index", "--skip-worktree", "docs/added.rs"],
         );
+        let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
         assert!(!persisted_delta_path_matches(
             repo.path(),
             &store,
             "p",
             "docs/added.rs",
             &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "docs/[literal].rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
         )
         .unwrap());
 
@@ -2417,12 +2584,14 @@ mod tests {
             repo.path(),
             &["update-index", "--force-remove", "docs/added.rs"],
         );
+        let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
         assert!(!persisted_delta_path_matches(
             repo.path(),
             &store,
             "p",
             "docs/added.rs",
             &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
         )
         .unwrap());
     }
@@ -2452,6 +2621,7 @@ mod tests {
             "p",
             "CLAUDE.md",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap());
 
@@ -2462,6 +2632,7 @@ mod tests {
             &store,
             "p",
             "CLAUDE.md",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         )
         .unwrap());
