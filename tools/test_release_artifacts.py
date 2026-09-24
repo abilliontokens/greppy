@@ -311,6 +311,76 @@ class ReleaseArtifactTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseArtifactError):
             release.verify_staged_release(output, contract, "a" * 40, "v0.2.0")
 
+    def test_optional_release_group_is_all_or_nothing(self) -> None:
+        contract_path = self.root / "contract.json"
+        contract_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": release.CONTRACT_SCHEMA,
+                    "repository": "metric-space-ai/greppy",
+                    "assets": [
+                        {"name": "payload.bin", "role": "package"},
+                        {"name": "payload.bin.sha256", "role": "checksum-sidecar"},
+                        {
+                            "name": "extra.bin",
+                            "role": "package",
+                            "optional_group": "extra",
+                        },
+                        {
+                            "name": "extra.bin.sha256",
+                            "role": "checksum-sidecar",
+                            "optional_group": "extra",
+                        },
+                        {
+                            "name": release.RELEASE_MANIFEST_NAME,
+                            "role": "release-manifest",
+                            "generated": True,
+                        },
+                        {
+                            "name": release.AGGREGATE_CHECKSUM_NAME,
+                            "role": "aggregate-checksums",
+                            "generated": True,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        source = self.root / "source"
+        source.mkdir()
+        payload = source / "payload.bin"
+        payload.write_bytes(b"payload")
+        (source / "payload.bin.sha256").write_text(
+            f"{release._sha256_file(payload)}  payload.bin\n", encoding="ascii"
+        )
+        output = self.root / "publish"
+        release.stage_release(source, output, contract_path, "a" * 40, "v0.4.0")
+        names = {path.name for path in output.iterdir()}
+        self.assertNotIn("extra.bin", names)
+        self.assertIn("payload.bin", names)
+        release.verify_staged_release(output, contract_path, "a" * 40, "v0.4.0")
+
+        extra = source / "extra.bin"
+        extra.write_bytes(b"extra")
+        partial = self.root / "partial"
+        with self.assertRaises(release.ReleaseArtifactError) as caught:
+            release.stage_release(source, partial, contract_path, "a" * 40, "v0.4.0")
+        self.assertIn("optional release group extra is partial", str(caught.exception))
+
+        (source / "extra.bin.sha256").write_text(
+            f"{release._sha256_file(extra)}  extra.bin\n", encoding="ascii"
+        )
+        complete = self.root / "complete"
+        release.stage_release(source, complete, contract_path, "a" * 40, "v0.4.0")
+        self.assertIn("extra.bin", {path.name for path in complete.iterdir()})
+        release.verify_staged_release(complete, contract_path, "a" * 40, "v0.4.0")
+        (complete / "extra.bin").unlink()
+        with self.assertRaises(release.ReleaseArtifactError) as caught:
+            release.verify_staged_release(
+                complete, contract_path, "a" * 40, "v0.4.0"
+            )
+        self.assertIn("optional release group extra is partial", str(caught.exception))
+
     def test_build_environment_record_is_bound_to_platform_commit_and_lock(
         self,
     ) -> None:
@@ -372,6 +442,70 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("greppy-agent-benchmark.tar.gz", names)
         self.assertNotIn("greppy-agent-benchmark.tar.gz.sha256", names)
         self.assertNotIn("greppy-coding-benchmark.tar.gz", names)
+        windows = [
+            asset
+            for asset in contract["assets"]
+            if asset.get("optional_group") == "windows-x86_64"
+        ]
+        self.assertEqual(
+            {asset["name"] for asset in windows},
+            {
+                "greppy-windows-x86_64.msi",
+                "greppy-windows-x86_64.msi.sha256",
+                "greppy-windows-x86_64.msi.spdx.json",
+                "build-environment-windows-x86_64.json",
+                "greppy-windows-driver-contract.json",
+                "greppy-windows-driver-signature-evidence.json",
+                "greppyworkspacefsp-x64.cat",
+                "greppy-winfsp-source.tar.gz",
+                "greppy-winfsp-source.tar.gz.sha256",
+            },
+        )
+        self.assertFalse(
+            any(asset.get("optional_group") for asset in contract["assets"] if asset not in windows)
+        )
+
+    def test_release_publish_skips_absent_windows_and_unrun_cow_performance(self) -> None:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "fromJSON(needs.windows-signing-secrets.outputs.build_include)",
+            workflow,
+        )
+        self.assertIn(
+            "fromJSON(needs.windows-signing-secrets.outputs.verify_include)",
+            workflow,
+        )
+        self.assertNotIn("do-not-exclude", workflow)
+        import tools.emit_release_matrix as matrix_emit
+
+        self.assertFalse(matrix_emit.signing_enabled({}))
+        self.assertTrue(
+            matrix_emit.signing_enabled({name: "set" for name in matrix_emit.SECRET_ENV})
+        )
+        without = matrix_emit.filtered_includes(False)
+        with_windows = matrix_emit.filtered_includes(True)
+        for key in ("build", "verify"):
+            self.assertNotIn("windows-x86_64", [row["name"] for row in without[key]])
+            self.assertIn("windows-x86_64", [row["name"] for row in with_windows[key]])
+            self.assertIn("macos-arm64", [row["name"] for row in without[key]])
+        windows_build = next(
+            row for row in with_windows["build"] if row["name"] == "windows-x86_64"
+        )
+        self.assertEqual(windows_build["features"], "cpu-only")
+        self.assertIn("cow_performance_ok", workflow)
+        self.assertIn("cow_performance_failed", workflow)
+        self.assertIn("Exact-SHA three-platform performance set", workflow)
+        self.assertIn(
+            "Exact-SHA three-platform performance set failed for $GITHUB_SHA",
+            workflow,
+        )
+        self.assertIn("Not a publish blocker.", workflow)
+        self.assertNotIn(
+            "no successful exact-SHA three-platform performance set exists",
+            workflow,
+        )
 
     def test_release_workflow_keeps_hardening_gates(self) -> None:
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
@@ -385,16 +519,16 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn("native agent fallback", ci_workflow)
         self.assertIn("portable agent fail-closed", ci_workflow)
         self.assertIn("tools.test_portable_cow_performance", workflow)
-        windows_matrix = workflow.split("- name: windows-x86_64", 1)[1].split(
-            "steps:", 1
-        )[0]
-        macos_matrix = workflow.split("- name: macos-arm64", 1)[1].split(
-            "- name: linux-x86_64", 1
-        )[0]
-        self.assertIn("footprint_devices: 'metal'", macos_matrix)
-        self.assertNotIn("footprint_devices: 'cpu metal'", macos_matrix)
-        self.assertIn("features: cpu-only", windows_matrix)
-        self.assertNotIn("features: cpu\n", windows_matrix)
+        matrix = json.loads(
+            (REPOSITORY_ROOT / "tools/release_matrix.json").read_text(encoding="utf-8")
+        )
+        windows_build = next(
+            row for row in matrix["build"] if row["name"] == "windows-x86_64"
+        )
+        macos_build = next(row for row in matrix["build"] if row["name"] == "macos-arm64")
+        self.assertEqual(macos_build["footprint_devices"], "metal")
+        self.assertEqual(windows_build["features"], "cpu-only")
+        self.assertNotEqual(windows_build["features"], "cpu")
         self.assertIn("--features ${{ matrix.features }}", workflow)
         self.assertIn("record-build-environment", workflow)
         self.assertEqual(
@@ -419,7 +553,10 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertIn("Exact-SHA three-platform performance set", workflow)
         self.assertIn("cow_performance_ok", workflow)
         self.assertNotIn("greppy-agent-benchmark", workflow)
-        self.assertIn("greppy-macos-arm64.pkg", workflow)
+        self.assertEqual(
+            next(row["asset"] for row in matrix["build"] if row["name"] == "macos-arm64"),
+            "greppy-macos-arm64.pkg",
+        )
         self.assertIn("platform/macos/build-fskit-pkg.sh", workflow)
         application_import = workflow.index("Import macOS application identity")
         application_notarize = workflow.index(
@@ -454,7 +591,7 @@ class ReleaseArtifactTests(unittest.TestCase):
             workflow,
         )
         self.assertIn(
-            '--extract-certificates "$profile_evidence/codesign" "$app"',
+            '--extract-certificates="$profile_evidence/codesign" "$app"',
             workflow,
         )
         self.assertIn(

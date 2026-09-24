@@ -131,7 +131,7 @@ def round_trip(path, payload, timeout=10.0, raw=None):
         s.close()
 
 def status(path, timeout=5.0):
-    return json.loads(round_trip(path, {"protocol": 2, "op": "status"}, timeout))
+    return json.loads(round_trip(path, {"protocol": 3, "op": "status"}, timeout))
 
 def main():
     mode, path = sys.argv[1], sys.argv[2]
@@ -203,7 +203,7 @@ def main():
                 try:
                     line = round_trip(
                         path,
-                        {"protocol": 2, "op": "infer", "request_id": request_id},
+                        {"protocol": 3, "op": "ping", "request_id": request_id},
                         timeout=timeout,
                     )
                     if not line:
@@ -347,11 +347,11 @@ EMBED_PID="$(daemon_pid "$EMBED_SOCK")"
 pgrep -f -- "-daemon --socket $EMBED_SOCK" | grep -qx "$EMBED_PID" \
   || fail "status daemon_pid $EMBED_PID does not match the daemon process list"
 
-python3 "$CLIENT" req "$EMBED_SOCK" '{"protocol":2,"op":"ping","request_id":"sanity-ping"}' >"$WORK/out/ping.json"
+python3 "$CLIENT" req "$EMBED_SOCK" '{"protocol":3,"op":"ping","request_id":"sanity-ping"}' >"$WORK/out/ping.json"
 jq -e '.ok == true and .request_id == "sanity-ping"' "$WORK/out/ping.json" >/dev/null \
   || fail "ping did not return ok with the echoed request id: $(cat "$WORK/out/ping.json")"
 python3 "$CLIENT" status "$EMBED_SOCK" >"$WORK/out/status.json"
-jq -e '.protocol == 2 and .state == "ready" and .queue_capacity >= 1' "$WORK/out/status.json" >/dev/null \
+jq -e '.protocol == 3 and .state == "ready" and (.daemon_pid | tonumber) > 0 and .queue_policy == "fair-round-robin-unbounded"' "$WORK/out/status.json" >/dev/null \
   || fail "warm daemon status is not ready: $(cat "$WORK/out/status.json")"
 python3 "$CLIENT" req "$EMBED_SOCK" '{"protocol":1,"op":"ping"}' >"$WORK/out/proto.json"
 jq -e '.error == "protocol-version mismatch"' "$WORK/out/proto.json" >/dev/null \
@@ -419,10 +419,9 @@ done
 python3 "$CLIENT" wait-active "$EMBED_SOCK" 60 >/dev/null \
   || fail "no in-flight inference observed while 5 CLI clients were queued"
 python3 "$CLIENT" flood "$EMBED_SOCK" 48 20 >"$WORK/out/flood.json"
-jq -e '.capacity >= 1' "$WORK/out/flood.json" >/dev/null \
-  || fail "flood during a busy inference produced no classified capacity rejection: $(cat "$WORK/out/flood.json")"
-jq -e '.responded >= .capacity and .responded >= 1' "$WORK/out/flood.json" >/dev/null \
-  || fail "flood responses are inconsistent: $(cat "$WORK/out/flood.json")"
+jq -e '.sent == 48 and .responded == 48 and .echo_ok == 48 and .capacity == 0 and .client_errors == 0' \
+  "$WORK/out/flood.json" >/dev/null \
+  || fail "ping flood was shed or dropped: $(cat "$WORK/out/flood.json")"
 echo "flood: $(cat "$WORK/out/flood.json")"
 
 for pid in $CLI_PIDS; do
@@ -449,7 +448,7 @@ AFTER_COMPLETED="$(python3 "$CLIENT" status "$EMBED_SOCK" | jq -r '.completed_re
 [ "$((AFTER_COMPLETED - BEFORE_COMPLETED))" -ge 5 ] \
   || fail "daemon served fewer than the 5 real embeddings ($BEFORE_COMPLETED -> $AFTER_COMPLETED)"
 REJECTED="$(python3 "$CLIENT" status "$EMBED_SOCK" | jq -r '.rejected_requests')"
-[ "$REJECTED" -ge 1 ] || fail "daemon status shows no rejected requests after the flood"
+[ "$REJECTED" -ge 1 ] || fail "daemon status lost the oversize rejection count: $REJECTED"
 
 # --- kill -9 mid-load: clean respawn, correct answers -------------------------
 # First SIGKILL the warm owner and let real clients repair its stale endpoint.
@@ -521,8 +520,9 @@ python3 "$CLIENT" wait-active "$SUMMARY_SOCK" 120 >/dev/null \
 # accept/reader stages; only requests parked behind the real summary would
 # wait longer, and abandoning them must not harm the daemon (asserted below).
 python3 "$CLIENT" flood "$SUMMARY_SOCK" 48 5 >"$WORK/out/summary-flood.json"
-jq -e '.capacity >= 1' "$WORK/out/summary-flood.json" >/dev/null \
-  || fail "summarize flood produced no classified capacity rejection: $(cat "$WORK/out/summary-flood.json")"
+jq -e '.sent == 48 and .responded == 48 and .echo_ok == 48 and .capacity == 0 and .client_errors == 0' \
+  "$WORK/out/summary-flood.json" >/dev/null \
+  || fail "summarize ping flood was shed or dropped: $(cat "$WORK/out/summary-flood.json")"
 echo "summary flood: $(cat "$WORK/out/summary-flood.json")"
 
 wait "$BRIEF_PID" || fail "brief failed under flood: $(cat "$WORK/out/brief.err")"

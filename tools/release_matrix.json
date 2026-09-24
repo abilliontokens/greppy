@@ -1,0 +1,58 @@
+{
+  "build": [
+    {
+      "name": "macos-arm64",
+      "os": "macos-latest",
+      "asset": "greppy-macos-arm64.pkg",
+      "features": "metal",
+      "footprint_devices": "metal",
+      "runner_os": "macOS",
+      "runner_arch": "ARM64",
+      "rust_host": "aarch64-apple-darwin"
+    },
+    {
+      "name": "linux-x86_64",
+      "os": "ubuntu-22.04",
+      "asset": "greppy-linux-x86_64.deb",
+      "secondary_asset": "greppy-linux-x86_64.rpm",
+      "features": "cuda",
+      "footprint_devices": "cpu",
+      "runner_os": "Linux",
+      "runner_arch": "X64",
+      "rust_host": "x86_64-unknown-linux-gnu",
+      "cuda_sub_packages": "[\"nvcc\", \"cudart\"]",
+      "cuda_non_cuda_sub_packages": "[\"libcublas\", \"libcublas-dev\"]"
+    },
+    {
+      "name": "windows-x86_64",
+      "os": "windows-2022",
+      "asset": "greppy-windows-x86_64.msi",
+      "features": "cpu-only",
+      "footprint_devices": "cpu",
+      "runner_os": "Windows",
+      "runner_arch": "X64",
+      "rust_host": "x86_64-pc-windows-msvc"
+    }
+  ],
+  "verify": [
+    {
+      "name": "macos-arm64",
+      "os": "macos-latest",
+      "asset": "greppy-macos-arm64.pkg",
+      "rust_host": "aarch64-apple-darwin"
+    },
+    {
+      "name": "linux-x86_64-no-toolkit",
+      "os": "ubuntu-22.04",
+      "asset": "greppy-linux-x86_64.deb",
+      "secondary_asset": "greppy-linux-x86_64.rpm",
+      "rust_host": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "name": "windows-x86_64",
+      "os": "windows-2022",
+      "asset": "greppy-windows-x86_64.msi",
+      "rust_host": "x86_64-pc-windows-msvc"
+    }
+  ]
+}
