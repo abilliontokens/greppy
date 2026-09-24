@@ -4186,23 +4186,27 @@ fn background_job_path(root: &std::path::Path) -> std::path::PathBuf {
         .join(BACKGROUND_JOB_FILE)
 }
 
-fn background_job_demand_name(root: &std::path::Path, kind: &str) -> String {
+fn background_job_demand_name(root: &std::path::Path) -> String {
     let hash = greppy_core::workspace::workspace_hash(root);
-    format!("workspace-{hash}.{kind}-query-demand")
+    format!("workspace-{hash}.query-demand")
 }
 
 fn acquire_background_job_demand(
     root: &std::path::Path,
-    kind: &str,
 ) -> std::io::Result<Option<greppy_core::cache::FileLock>> {
     greppy_core::cache::acquire_named_lock(
-        &background_job_demand_name(root, kind),
+        &background_job_demand_name(root),
         greppy_core::cache::LockMode::Shared,
         false,
     )
 }
 
-fn start_background_demand_monitor(job_path: &std::path::Path) {
+fn start_background_demand_monitor(
+    job_path: &std::path::Path,
+    terminal: std::sync::Arc<std::sync::Mutex<bool>>,
+    expected_pid: u32,
+    expected_generation: u64,
+) {
     let Some(lock_name) = std::env::var_os(ENV_BACKGROUND_DEMAND_LOCK) else {
         return;
     };
@@ -4218,6 +4222,19 @@ fn start_background_demand_monitor(job_path: &std::path::Path) {
                 true,
             ) {
                 Ok(Some(_exclusive)) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
                     finish_background_demand_monitor(
                         &job_path,
                         "cancelled",
@@ -4244,6 +4261,22 @@ fn start_background_demand_monitor(job_path: &std::path::Path) {
             70,
         );
     }
+}
+
+fn background_demand_may_cancel(
+    job: Option<&serde_json::Value>,
+    terminal: bool,
+    expected_pid: u32,
+    expected_generation: u64,
+) -> bool {
+    !terminal
+        && job.is_some_and(|job| {
+            job.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(expected_pid))
+                && job
+                    .get("target_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(expected_generation)
+        })
 }
 
 fn finish_background_demand_monitor(
@@ -4413,6 +4446,7 @@ struct BackgroundJobGuard {
     last_progress_write: Option<std::time::Instant>,
     progress_phase: Option<&'static str>,
     current_detail: Option<String>,
+    demand_terminal: std::sync::Arc<std::sync::Mutex<bool>>,
     complete: bool,
 }
 
@@ -4424,6 +4458,7 @@ impl BackgroundJobGuard {
         let detached = direct_path.is_some();
         let delegated = direct_path.is_none() && delegated_path.is_some();
         let path = direct_path.or(delegated_path);
+        let demand_terminal = std::sync::Arc::new(std::sync::Mutex::new(false));
         // The parent can only publish the job PID after spawn. Hold the child
         // at its entry point until that atomic record is visible, preventing
         // a very small repository from completing and removing the file
@@ -4439,7 +4474,6 @@ impl BackgroundJobGuard {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                start_background_demand_monitor(path);
             }
         }
         let published = path.as_deref().and_then(read_background_job);
@@ -4449,6 +4483,20 @@ impl BackgroundJobGuard {
             .and_then(serde_json::Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok())
             .unwrap_or_else(std::process::id);
+        let target_generation = std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if detached {
+            if let Some(path) = &path {
+                start_background_demand_monitor(
+                    path,
+                    demand_terminal.clone(),
+                    std::process::id(),
+                    target_generation,
+                );
+            }
+        }
         Self {
             path,
             detached,
@@ -4461,10 +4509,7 @@ impl BackgroundJobGuard {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(unix_now_secs_cli),
-            target_generation: std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
+            target_generation,
             backend: published
                 .as_ref()
                 .and_then(|job| job.get("backend"))
@@ -4494,6 +4539,7 @@ impl BackgroundJobGuard {
             last_progress_write: None,
             progress_phase: None,
             current_detail: None,
+            demand_terminal,
             complete: false,
         }
     }
@@ -4669,6 +4715,7 @@ impl BackgroundJobGuard {
     }
 
     fn complete(&mut self) {
+        self.publication_finished();
         self.complete = true;
         if self.delegated {
             self.write_state("base_graph_ready", None);
@@ -4684,7 +4731,18 @@ impl BackgroundJobGuard {
         self.path.as_deref()
     }
 
+    fn publication_finished(&self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+    }
+
     fn fail(&mut self, error: &Error) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         self.write_state("failed", Some(&error.to_string()));
         self.complete = true;
     }
@@ -4694,6 +4752,10 @@ impl BackgroundJobGuard {
     /// state with the degradation reason so the next semantic query
     /// retries the remaining vectors; the published graph stays live.
     fn degraded(&mut self, reason: &str) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         self.write_state("failed", Some(reason));
         self.complete = true;
     }
@@ -4736,6 +4798,10 @@ mod background_progress_tests {
 
 impl Drop for BackgroundJobGuard {
     fn drop(&mut self) {
+        *self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         if self.complete {
             return;
         }
@@ -4856,8 +4922,8 @@ fn spawn_background_job_handle(
     if greppy_core::cache::ensure_workspace_store(&root).is_err() {
         return None;
     }
-    let demand_name = background_job_demand_name(&root, kind);
-    let Ok(Some(demand)) = acquire_background_job_demand(&root, kind) else {
+    let demand_name = background_job_demand_name(&root);
+    let Ok(Some(demand)) = acquire_background_job_demand(&root) else {
         return None;
     };
     #[cfg(debug_assertions)]

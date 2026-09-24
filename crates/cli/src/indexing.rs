@@ -1215,6 +1215,7 @@ pub(crate) fn dispatch_index(
             return Err(error);
         }
     };
+    background_job.publication_finished();
     let report = &snapshot.index;
 
     println!(
@@ -1303,6 +1304,9 @@ pub(crate) fn record_overlay_job_outcome(
     background_job: &mut BackgroundJobGuard,
     result: &Result<OverlayIndexOutcome>,
 ) {
+    if result.is_ok() {
+        background_job.publication_finished();
+    }
     match result {
         Ok(OverlayIndexOutcome::Complete) => background_job.complete(),
         Ok(OverlayIndexOutcome::Degraded(reason)) => background_job.degraded(reason),
