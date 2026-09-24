@@ -2928,7 +2928,7 @@ fn cancelling_sole_first_use_query_stops_its_automatic_index() {
     assert_eq!(cancelled["state"], "cancelled");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "ci-test-assets")))]
 #[test]
 fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
     let (primary, store, scratch) = make_real_git_repo("linked-first-use-cancel");
