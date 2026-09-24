@@ -1393,16 +1393,10 @@ fn spawn_held_publication(repo: &Path, store: &Path, tag: &str) -> (std::process
     (child, release)
 }
 
-/// Run `read do_it --json --diagnostics` and hand every stderr line to
-/// `on_line` as it is written, so a test can react to the exact moment the
-/// query announces its bounded wait instead of guessing a delay.
-fn run_read_observing_stderr(
-    repo: &Path,
-    store: &Path,
-    mut on_line: impl FnMut(&str) + Send + 'static,
-) -> (i32, String, String) {
-    use std::io::{BufRead, Read};
-    let mut child = Command::new(bin())
+/// Keep the actual query alive while publication is held. Its result is
+/// checked after releasing the writer, without coupling to progress wording.
+fn spawn_read_during_refresh(repo: &Path, store: &Path) -> std::process::Child {
+    Command::new(bin())
         .args(["read", "do_it", "--json", "--diagnostics"])
         .current_dir(repo)
         .env("GREPPY_STORE_DIR", store)
@@ -1410,28 +1404,7 @@ fn run_read_observing_stderr(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn read");
-    let stderr = child.stderr.take().unwrap();
-    let observer = std::thread::spawn(move || {
-        let mut collected = String::new();
-        for line in std::io::BufReader::new(stderr).lines() {
-            let line = line.expect("read stderr line");
-            on_line(&line);
-            collected.push_str(&line);
-            collected.push('\n');
-        }
-        collected
-    });
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .expect("read stdout");
-    let status = child.wait().expect("wait for read");
-    let err = observer.join().expect("stderr observer");
-    (status.code().unwrap_or(-1), out, err)
+        .expect("spawn read")
 }
 
 fn edit_helper_to_84(repo: &Path) {
@@ -1442,30 +1415,30 @@ fn edit_helper_to_84(repo: &Path) {
     .unwrap();
 }
 
-/// A refresh that publishes inside the bounded wait serves the fresh graph:
-/// the query announces the wait, sees the publication and returns the
-/// post-edit definition with exit 0.
+/// Ordinary queries join a healthy refresh and return the current definition.
+/// They do not ask the agent to retry just because a former 2s budget elapsed.
 #[test]
 fn read_waits_for_a_publishing_refresh_and_serves_fresh_source() {
     let (repo, store) = index_fixture("read-waits-for-edit-refresh");
     edit_helper_to_84(&repo);
     let (child, release) = spawn_held_publication(&repo, &store, "publishing");
-
-    let release_on_wait = release.clone();
-    let (code, out, err) = run_read_observing_stderr(&repo, &store, move |line| {
-        if line.contains("waiting up to 2s") {
-            std::fs::write(&release_on_wait, b"").unwrap();
-        }
-    });
+    let mut query = spawn_read_during_refresh(&repo, &store);
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    let premature = query.try_wait().expect("observe waiting query");
+    std::fs::write(&release, b"").unwrap();
+    let result = query.wait_with_output().expect("finish waiting query");
+    let code = result.status.code().unwrap_or(-1);
+    let out = String::from_utf8_lossy(&result.stdout);
+    let err = String::from_utf8_lossy(&result.stderr);
+    let index_out = child.wait_with_output().expect("wait for indexer");
+    assert!(
+        premature.is_none(),
+        "query ended before publication: {result:?}"
+    );
+    assert!(index_out.status.success(), "indexer failed: {index_out:?}");
     assert_eq!(
         code, 0,
         "read must observe the published refresh; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.contains("graph refresh already running")
-            && err.contains("waiting up to 2s")
-            && err.contains("graph refresh published"),
-        "the bounded lock wait and the publication must be explicit; stderr={err:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid read json: {e}; stdout={out:?}"));
@@ -1476,36 +1449,28 @@ fn read_waits_for_a_publishing_refresh_and_serves_fresh_source() {
             .is_some_and(|source| source.contains("answer = 84")),
         "read must return the post-edit definition: {v:?}"
     );
-
-    let index_out = child.wait_with_output().expect("wait for indexer");
-    assert!(
-        index_out.status.success(),
-        "indexer failed\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&index_out.stdout),
-        String::from_utf8_lossy(&index_out.stderr)
-    );
 }
 
-/// A refresh still held when the bounded wait ends is a temporary failure:
-/// the query says so, emits no span from the stale graph, and the same
-/// query serves the fresh definition once the refresh has published.
+/// Explicitly declining automatic healing still must not expose stale spans.
 #[test]
-fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
+fn read_with_auto_refresh_disabled_refuses_stale_spans_while_writer_is_held() {
     let (repo, store) = index_fixture("read-refuses-held-refresh");
     edit_helper_to_84(&repo);
     let (child, release) = spawn_held_publication(&repo, &store, "held");
 
-    let (code, out, err) = run(&["read", "do_it", "--json", "--diagnostics"], &repo, &store);
+    let (code, out, err) = run_with_env(
+        &["read", "do_it", "--json", "--diagnostics"],
+        &repo,
+        &store,
+        &[("GREPPY_AUTO_REINDEX", "0")],
+    );
+    // Release and reap even if the following assertions expose a regression.
+    std::fs::write(&release, b"").unwrap();
+    let index_out = child.wait_with_output().expect("wait for indexer");
+    assert!(index_out.status.success(), "indexer failed: {index_out:?}");
     assert_eq!(
         code, 75,
         "a held publication is a temporary failure, not an answer; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.contains("graph refresh already running")
-            && err.contains("waiting up to 2s")
-            && err.contains("graph refresh still active")
-            && err.contains("greppy index status --json"),
-        "the bounded wait and its outcome must be explicit; stderr={err:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid read json: {e}; stdout={out:?}"));
@@ -1522,14 +1487,6 @@ fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
         "no source from the stale graph may leak: {out}"
     );
 
-    std::fs::write(&release, b"").unwrap();
-    let index_out = child.wait_with_output().expect("wait for indexer");
-    assert!(
-        index_out.status.success(),
-        "indexer failed\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&index_out.stdout),
-        String::from_utf8_lossy(&index_out.stderr)
-    );
     let (code, out, err) = run(&["read", "do_it", "--json", "--diagnostics"], &repo, &store);
     assert_eq!(
         code, 0,
@@ -1546,7 +1503,7 @@ fn read_refuses_stale_spans_while_a_refresh_is_still_held() {
 }
 
 #[test]
-fn vector_backed_drift_returns_bounded_refresh_status_instead_of_reindexing_inline() {
+fn structural_query_with_existing_vectors_joins_refresh_and_returns_callers() {
     let (repo, store) = index_fixture("vector-drift-refresh-is-bounded");
     let db = find_graph_db(&store).expect("indexed graph");
     let graph = rusqlite::Connection::open(db).expect("open graph for vector fixture");
@@ -1599,30 +1556,19 @@ fn vector_backed_drift_returns_bounded_refresh_status_instead_of_reindexing_inli
     );
     let elapsed = started.elapsed();
     assert_eq!(
-        code, 75,
-        "vector-backed drift must be retryable while its background refresh publishes; stderr={err}\nstdout={out}"
+        code, 0,
+        "ordinary navigation must finish after its refresh publishes; stderr={err}\nstdout={out}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(4),
-        "navigation hid the five-second index build for {elapsed:?}"
-    );
-    assert!(
-        err.contains("graph refresh already running")
-            && err.contains("waiting up to 2s")
-            && (err.contains("graph refresh published")
-                || err.contains("greppy index status --json")),
-        "bounded wait and recovery must be visible; stderr={err:?}"
+        ready.exists() && elapsed >= std::time::Duration::from_secs(5),
+        "query must join the held publication before serving: {elapsed:?}"
     );
     let value: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|error| panic!("invalid retry JSON: {error}; stdout={out:?}"));
-    assert_eq!(value["status"], "skipped_stale_index");
-    assert_eq!(value["fresh"], false);
+        .unwrap_or_else(|error| panic!("invalid query JSON: {error}; stdout={out:?}"));
+    assert_eq!(value["fresh"], true, "{value:?}");
     assert!(
-        matches!(
-            value["freshness"]["state"].as_str(),
-            Some("refreshing" | "drift")
-        ),
-        "retryable freshness state missing: {value:?}"
+        out.contains("caller") && out.contains("src/lib.rs"),
+        "actual caller evidence must be returned: {value:?}"
     );
 }
 
