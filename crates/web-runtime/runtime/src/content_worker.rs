@@ -2544,6 +2544,7 @@ impl ContentEngine {
                 }
                 let status = recorded_status.unwrap_or(200);
                 Ok(json!({
+                    "requestId": current_request,
                     "url": final_url,
                     "status": status,
                     "statusText": if status_text.is_empty() && status < 400 {
