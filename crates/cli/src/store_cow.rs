@@ -435,18 +435,20 @@ fn persisted_delta_path_matches(
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let Some(state) = store.get_file_state(project, rel_path).map_err(|error| {
-                Error::Store(format!("read sparse Store-CoW file state: {error}"))
-            })?
-            else {
-                return Ok(false);
-            };
             let Some(blob) = sparse_blobs.get(rel_path) else {
                 return Ok(false);
             };
-            return Ok(state.size >= 0
-                && blob.size == state.size as u64
-                && blob.sha256 == state.sha256);
+            if let Some(state) = store.get_file_state(project, rel_path).map_err(|error| {
+                Error::Store(format!("read sparse Store-CoW file state: {error}"))
+            })? {
+                return Ok(state.size >= 0
+                    && blob.size == state.size as u64
+                    && blob.sha256 == state.sha256);
+            }
+            let skip = store
+                .get_index_skip(project, rel_path)
+                .map_err(|error| Error::Store(format!("read sparse Store-CoW skip: {error}")))?;
+            return Ok(skip.is_some_and(|skip| skip.reason == "discovery_filtered"));
         }
         Err(error) => {
             return Err(Error::io(
@@ -499,6 +501,27 @@ struct SparseDeltaBlob {
     sha256: String,
 }
 
+struct ReapedChild(Option<std::process::Child>);
+
+impl ReapedChild {
+    fn child_mut(&mut self) -> &mut std::process::Child {
+        self.0.as_mut().expect("child is present until wait")
+    }
+
+    fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.take().expect("child is present until wait").wait()
+    }
+}
+
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn persisted_sparse_delta_blobs(
     root: &Path,
     rel_paths: &std::collections::BTreeSet<String>,
@@ -544,7 +567,7 @@ fn persisted_sparse_delta_blobs(
         return Ok(std::collections::HashMap::new());
     }
 
-    let mut child = Command::new("git")
+    let child = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["cat-file", "--batch"])
@@ -552,12 +575,15 @@ fn persisted_sparse_delta_blobs(
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|error| Error::io("read sparse Store-CoW Delta blob", error))?;
+    let mut child = ReapedChild(Some(child));
     use std::io::{BufRead, Read, Write};
     let mut stdin = child
+        .child_mut()
         .stdin
         .take()
         .ok_or_else(|| Error::Invalid("git cat-file stdin is unavailable".into()))?;
     let stdout = child
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| Error::Invalid("git cat-file stdout is unavailable".into()))?;
@@ -2494,9 +2520,19 @@ mod tests {
         let repo = fixture();
         let base = git(repo.path(), &["rev-parse", "HEAD"]);
         std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".github/workflows")).unwrap();
         std::fs::write(repo.path().join("docs/added.rs"), "fn added() {}\n").unwrap();
         std::fs::write(repo.path().join("docs/[literal].rs"), "fn literal() {}\n").unwrap();
-        git(repo.path(), &["add", "docs/added.rs", "docs/[literal].rs"]);
+        std::fs::write(repo.path().join(".github/workflows/ci.yml"), "name: CI\n").unwrap();
+        git(
+            repo.path(),
+            &[
+                "add",
+                "docs/added.rs",
+                "docs/[literal].rs",
+                ".github/workflows/ci.yml",
+            ],
+        );
         git(repo.path(), &["commit", "-q", "-m", "add sparse files"]);
 
         let mut store = greppy_store::Store::open_memory().unwrap();
@@ -2504,6 +2540,7 @@ mod tests {
             only_paths: Some(std::collections::BTreeSet::from([
                 "docs/added.rs".to_string(),
                 "docs/[literal].rs".to_string(),
+                ".github/workflows/ci.yml".to_string(),
             ])),
             ..greppy_indexer::IndexOptions::default()
         };
@@ -2512,6 +2549,14 @@ mod tests {
             .get_file_state("p", "docs/added.rs")
             .unwrap()
             .is_some());
+        assert_eq!(
+            store
+                .get_index_skip("p", ".github/workflows/ci.yml")
+                .unwrap()
+                .unwrap()
+                .reason,
+            "discovery_filtered"
+        );
         assert!(store
             .get_file_state("p", "docs/[literal].rs")
             .unwrap()
@@ -2521,12 +2566,15 @@ mod tests {
         git(repo.path(), &["sparse-checkout", "set", "src"]);
         assert!(!repo.path().join("docs/added.rs").exists());
         assert!(!repo.path().join("docs/[literal].rs").exists());
+        assert!(!repo.path().join(".github/workflows/ci.yml").exists());
         let visibility = visibility_against(repo.path(), &base).unwrap();
         assert!(visibility.is_dirty_path("docs/added.rs"));
         assert!(visibility.is_dirty_path("docs/[literal].rs"));
+        assert!(visibility.is_dirty_path(".github/workflows/ci.yml"));
         let sparse_paths = std::collections::BTreeSet::from([
             "docs/added.rs".to_string(),
             "docs/[literal].rs".to_string(),
+            ".github/workflows/ci.yml".to_string(),
         ]);
         let sparse_blobs = persisted_sparse_delta_blobs(repo.path(), &sparse_paths).unwrap();
         assert!(persisted_delta_path_matches(
@@ -2534,6 +2582,15 @@ mod tests {
             &store,
             "p",
             "docs/added.rs",
+            &store.list_file_identities("p").unwrap(),
+            &sparse_blobs,
+        )
+        .unwrap());
+        assert!(persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            ".github/workflows/ci.yml",
             &store.list_file_identities("p").unwrap(),
             &sparse_blobs,
         )
