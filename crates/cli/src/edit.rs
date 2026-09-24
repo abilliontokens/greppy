@@ -993,11 +993,29 @@ fn edit_nearest_package_root(
         .then(|| root_path.to_path_buf())
 }
 
-fn edit_local_typescript_compiler(package_root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let bin = package_root.join("node_modules").join(".bin");
-    [bin.join("tsc"), bin.join("tsc.cmd")]
-        .into_iter()
-        .find(|path| path.is_file())
+fn edit_local_typescript_compiler(
+    root_path: &std::path::Path,
+    package_root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let workspace_root = root_path.canonicalize().ok()?;
+    let mut directory = package_root.canonicalize().ok()?;
+    if !directory.starts_with(&workspace_root) {
+        return None;
+    }
+    loop {
+        let bin = directory.join("node_modules").join(".bin");
+        if let Some(compiler) = ["tsc", "tsc.cmd", "tsgo", "tsgo.cmd"]
+            .into_iter()
+            .map(|name| bin.join(name))
+            .find(|path| path.is_file())
+        {
+            return Some(compiler);
+        }
+        if directory == workspace_root {
+            return None;
+        }
+        directory = directory.parent()?.to_path_buf();
+    }
 }
 
 fn edit_verifiers(
@@ -1022,12 +1040,13 @@ fn edit_verifiers(
                 Some("verify: skipped — no package.json owns the touched TypeScript file".into()),
             );
         };
-        let Some(tsc) = edit_local_typescript_compiler(&package_root) else {
+        let Some(tsc) = edit_local_typescript_compiler(root_path, &package_root) else {
             return (
                 Vec::new(),
                 Some(format!(
-                    "verify: skipped — no local TypeScript compiler at {}; install dependencies first (network downloads are never started by --verify)",
-                    package_root.display()
+                    "verify: skipped — no local TypeScript compiler from {} through workspace root {}; expected node_modules/.bin/tsc or tsgo (network downloads are never started by --verify)",
+                    package_root.display(),
+                    root_path.display()
                 )),
             );
         };
