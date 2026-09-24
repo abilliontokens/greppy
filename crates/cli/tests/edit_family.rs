@@ -360,6 +360,7 @@ fn verify_prefers_package_compiler_and_does_not_climb_above_workspace() {
         diagnostic.contains("through workspace root"),
         "{diagnostic}"
     );
+    assert!(!package.join("escaped-compiler-ran").exists());
     assert!(!fixture.base.join("escaped-compiler-ran").exists());
 }
 
