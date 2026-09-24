@@ -1137,7 +1137,9 @@ pub(crate) fn dispatch_index(
         &index_options,
     )?;
     if recovery.published() {
+        background_job.publication_finished();
         let _ = remove_file_if_exists(&background_job_path(&effective_root));
+        background_job.complete();
         println!(
             "recovered and published completed index snapshot {}",
             recovery.candidate.as_deref().unwrap_or("unknown")
