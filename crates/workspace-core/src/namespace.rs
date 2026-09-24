@@ -1626,13 +1626,17 @@ impl WorkspaceCore {
              VALUES(?1, ?2, ?3)",
             params![workspace.id, destination, translated],
         )?;
+        // Move the directory's own overlay entry together with its
+        // descendants. A directory created inside the workspace has no
+        // baseline path the redirect could resolve to; without its own entry
+        // the destination did not exist at all.
         let like = escape_like(&(source.clone() + "/")) + "%";
         let descendants: Vec<(String, Option<i64>, bool)> = {
             let mut statement = transaction.prepare(
                 "SELECT path, inode_id, tombstone FROM cow_entries
-                 WHERE workspace_id = ?1 AND path LIKE ?2 ESCAPE '\\'",
+                 WHERE workspace_id = ?1 AND (path = ?3 OR path LIKE ?2 ESCAPE '\\')",
             )?;
-            let rows = statement.query_map(params![workspace.id, like], |row| {
+            let rows = statement.query_map(params![workspace.id, like, source], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0))
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -3228,6 +3232,62 @@ mod tests {
         let baseline = crate::capture_repository(repo.path(), core.chunks()).unwrap();
         let workspace = core.create_workspace("test-workspace", baseline).unwrap();
         (repo, storage, core, workspace)
+    }
+
+    /// Renaming a directory that exists only in the workspace overlay must
+    /// move the directory's own entry, not only its descendants. Before, the
+    /// rename moved `created/…` children, tombstoned `created` and left no
+    /// entry at the destination: `metadata`, `read_dir` and `unlink` of the
+    /// new name failed with NotFound (`ls d2`/`rm -r d2` after `mv d1 d2` on
+    /// the macOS device acceptance, 22./23.09.2026).
+    #[test]
+    fn renaming_a_workspace_created_directory_keeps_it_reachable() {
+        let (_repo, _storage, core, workspace) = fixture();
+        core.mkdir(&workspace, "empty1", 0o755).unwrap();
+        core.rename(&workspace, "empty1", "empty2").unwrap();
+        let moved = core.metadata(&workspace, "empty2").unwrap().unwrap();
+        assert_eq!(moved.kind, NodeKind::Directory);
+        assert_eq!(core.metadata(&workspace, "empty1").unwrap(), None);
+        assert!(core.read_dir(&workspace, "empty2").unwrap().is_empty());
+        core.unlink(&workspace, "empty2").unwrap();
+        assert_eq!(core.metadata(&workspace, "empty2").unwrap(), None);
+
+        core.mkdir(&workspace, "full1", 0o755).unwrap();
+        core.create_file(&workspace, "full1/child.txt", 0o100644)
+            .unwrap();
+        core.write(&workspace, "full1/child.txt", 0, b"c").unwrap();
+        core.rename(&workspace, "full1", "full2").unwrap();
+        let names: Vec<_> = core
+            .read_dir(&workspace, "full2")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, ["child.txt"]);
+        assert_eq!(
+            core.read(&workspace, "full2/child.txt", 0, 8).unwrap(),
+            b"c"
+        );
+        core.unlink(&workspace, "full2/child.txt").unwrap();
+        core.unlink(&workspace, "full2").unwrap();
+        assert_eq!(core.metadata(&workspace, "full2").unwrap(), None);
+
+        // A baseline directory keeps working through the redirect.
+        core.rename(&workspace, "src", "moved-src").unwrap();
+        assert_eq!(
+            core.read(&workspace, "moved-src/lib.rs", 0, 100).unwrap(),
+            b"pub fn base() {}\n"
+        );
+        assert_eq!(core.metadata(&workspace, "src").unwrap(), None);
+        let root: Vec<_> = core
+            .read_dir(&workspace, "")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(!root.contains(&"empty2".to_string()));
+        assert!(!root.contains(&"full2".to_string()));
+        assert!(root.contains(&"moved-src".to_string()));
     }
 
     /// The agent's self-check writes and removes `.greppy-selfcheck` inside
