@@ -1251,12 +1251,27 @@ fn read_resolve_file(
     let shown = if let Ok(relative) = canonical.strip_prefix(canonical_root) {
         relative.to_string_lossy().replace('\\', "/")
     } else {
-        // Reading is allowed for an explicitly absolute diagnostic/artifact
-        // path. Keep relative `../` traversal confined to the repository.
-        if !std::path::Path::new(subject).is_absolute() {
-            return None;
+        let subject_path = std::path::Path::new(subject);
+        if subject_path.is_absolute() {
+            // Reading is allowed for an explicitly absolute diagnostic or
+            // artifact path.
+            canonical.to_string_lossy().replace('\\', "/")
+        } else {
+            // A dependency directory may be symlinked outside the workspace.
+            // Permit that ordinary read while keeping parent traversal from
+            // using a symlink plus `..` to escape the workspace implicitly.
+            if subject_path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            {
+                return None;
+            }
+            candidate
+                .strip_prefix(canonical_root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/")
         }
-        canonical.to_string_lossy().replace('\\', "/")
     };
     Some((shown, canonical))
 }

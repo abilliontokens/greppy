@@ -498,6 +498,26 @@ fn read_file_accepts_explicit_absolute_path_outside_repo_only() {
     assert_eq!(escape_out, "no such file: ../diagnostic.json\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn read_file_follows_relative_symlink_to_external_dependency() {
+    use std::os::unix::fs::symlink;
+
+    let (repo, store) = fresh_workspace("relative-external-symlink");
+    let dependency = repo.parent().unwrap().join("dependency-store");
+    std::fs::create_dir_all(dependency.join(".bin")).unwrap();
+    std::fs::write(dependency.join(".bin/vp"), "#!/bin/sh\necho linked\n").unwrap();
+    symlink(&dependency, repo.join("node_modules")).unwrap();
+
+    let (code, stdout, stderr) = run(
+        &repo,
+        &store,
+        &["read-file", "node_modules/.bin/vp", "--all"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(stdout, "node_modules/.bin/vp:1-2\n#!/bin/sh\necho linked\n");
+}
+
 #[test]
 fn read_handle_is_compact_and_existing_json_shape_survives() {
     let (repo, store) = fresh_workspace("handle");
