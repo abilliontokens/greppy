@@ -2943,10 +2943,19 @@ fn abrupt_linked_query_loss_stops_and_reaps_delegated_base_index() {
             linked.to_str().unwrap(),
         ],
     );
+    let (code, out, err) = run(
+        &["search-symbol", "clean_committed_marker"],
+        &linked,
+        &store,
+    );
+    assert_eq!(
+        code, 0,
+        "structural first use must publish before semantic refresh: {out}\n{err}"
+    );
     let delegated_ready = scratch.0.join("delegated-base-ready");
     let demand_ready = scratch.0.join("linked-demand-ready");
     let mut query = Command::new(bin())
-        .args(["search-symbol", "clean_committed_marker"])
+        .args(["search", "find clean committed marker"])
         .current_dir(&linked)
         .env("GREPPY_STORE_DIR", &store)
         .env("GREPPY_TEST_SKIP_INFERENCE", "1")
