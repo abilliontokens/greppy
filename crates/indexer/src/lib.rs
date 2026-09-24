@@ -547,7 +547,7 @@ fn explicit_filtered_inventory_entry(root: &Path, rel_path: &str) -> Option<Inve
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return None;
     }
-    let stable = stable_metadata(&metadata);
+    let stable = stable_metadata(&abs_path, &metadata);
     Some(InventoryEntry {
         rel_path: rel_path.replace('\\', "/"),
         abs_path,
@@ -3194,7 +3194,7 @@ fn record_index_skip(
     generation: u64,
 ) -> Result<()> {
     let metadata = std::fs::metadata(&entry.abs_path)
-        .map(|md| stable_metadata(&md))
+        .map(|md| stable_metadata(&entry.abs_path, &md))
         .unwrap_or(StableFileMetadata {
             size: 0,
             mtime_ns: None,
@@ -3364,7 +3364,7 @@ fn record_unsupported_file_state(
         return;
     };
     if md.len() > max_file_size_bytes() {
-        let metadata = stable_metadata(&md);
+        let metadata = stable_metadata(&entry.abs_path, &md);
         // Oversized: record stat only, never read the body.
         let fs = FileState {
             project: project.to_string(),

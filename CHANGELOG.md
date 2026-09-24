@@ -4,7 +4,22 @@ All notable changes are documented here. Greppy follows Semantic Versioning.
 
 ## [Unreleased]
 
-Nothing yet.
+### Windows source builds
+
+- Freshness no longer re-hashes every indexed file on each query on Windows.
+  The stat tier requires `ctime`/file-identity, which were `None` off unix, so
+  every navigation command read the whole repository and large trees failed
+  closed with `graph freshness is unknown: budget exceeded`. Discovery now
+  records the NTFS ChangeTime and file index through an attribute-only handle;
+  `greppy_discover::stable_metadata` takes the file path.
+- A git submodule checkout (whose `.git` is a file) is no longer mistaken for a
+  linked worktree; `greppy index` there failed with "has no available primary
+  checkout".
+- The CUDA build finds `nvcc.exe` on `PATH` and passes it a plain drive-letter
+  path; previously every Windows build silently lost its GPU backend, or nvcc
+  failed to open `crt\link.stub` through a `\\?\` path.
+- `tools/fetch_model_assets.ps1` (no `jq`/`bash`) and `tools/build_windows.ps1`
+  (MSVC environment, CUDA toolkit, local GPU arch, release build).
 
 ## [0.4.0] — 2026-09-22
 
