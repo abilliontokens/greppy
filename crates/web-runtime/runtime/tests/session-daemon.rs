@@ -836,6 +836,7 @@ fn serve_status_fixture() -> String {
 struct NavigationLifecycleFixture {
     origin: String,
     events: std::sync::mpsc::Receiver<String>,
+    diagnostics: Arc<Mutex<Vec<String>>>,
     releases: Arc<(Mutex<HashSet<String>>, Condvar)>,
     stop: Arc<AtomicBool>,
     server: Option<thread::JoinHandle<()>>,
@@ -861,7 +862,12 @@ impl NavigationLifecycleFixture {
             let event = self
                 .events
                 .recv_timeout(remaining)
-                .unwrap_or_else(|error| panic!("waiting for fixture requests {pending:?}: {error}"));
+                .unwrap_or_else(|error| {
+                    let diagnostics = self.diagnostics.lock().unwrap().clone();
+                    panic!(
+                        "waiting for fixture requests {pending:?}: {error}; fixture diagnostics: {diagnostics:?}"
+                    )
+                });
             pending.remove(event.as_str());
         }
     }
@@ -873,7 +879,12 @@ impl NavigationLifecycleFixture {
             match self.events.recv_timeout(remaining) {
                 Ok(event) => assert_ne!(event, path, "unexpected fixture request {path}"),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
-                Err(error) => panic!("fixture event channel failed: {error}"),
+                Err(error) => {
+                    let diagnostics = self.diagnostics.lock().unwrap().clone();
+                    panic!(
+                        "fixture event channel failed: {error}; fixture diagnostics: {diagnostics:?}"
+                    )
+                }
             }
         }
     }
@@ -905,6 +916,8 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
         .expect("set lifecycle fixture nonblocking");
     let address = listener.local_addr().expect("lifecycle fixture addr");
     let (events_tx, events) = std::sync::mpsc::channel();
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
+    let server_diagnostics = Arc::clone(&diagnostics);
     let releases = Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
     let server_releases = Arc::clone(&releases);
     let stop = Arc::new(AtomicBool::new(false));
@@ -924,11 +937,21 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
             let events_tx = events_tx.clone();
+            let diagnostics = Arc::clone(&server_diagnostics);
             let releases = Arc::clone(&server_releases);
             let handler_stop = Arc::clone(&server_stop);
             let handler = thread::spawn(move || {
                 let mut buffer = [0_u8; 2048];
-                let n = stream.read(&mut buffer).unwrap_or(0);
+                let n = match stream.read(&mut buffer) {
+                    Ok(n) => n,
+                    Err(error) => {
+                        diagnostics
+                            .lock()
+                            .unwrap()
+                            .push(format!("request read error: {error}"));
+                        0
+                    }
+                };
                 let request = String::from_utf8_lossy(&buffer[..n]);
                 let path = request
                     .lines()
@@ -936,6 +959,10 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                     .and_then(|line| line.split_whitespace().nth(1))
                     .unwrap_or("/")
                     .to_owned();
+                diagnostics
+                    .lock()
+                    .unwrap()
+                    .push(format!("accepted path {path}"));
                 let _ = events_tx.send(path.clone());
                 if path.contains("-gate.") {
                     let (released, wake) = &*releases;
@@ -978,8 +1005,18 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
                     "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = stream.write_all(header.as_bytes());
-                let _ = stream.write_all(&body);
+                if let Err(error) = stream.write_all(header.as_bytes()) {
+                    diagnostics
+                        .lock()
+                        .unwrap()
+                        .push(format!("write headers for {path}: {error}"));
+                }
+                if let Err(error) = stream.write_all(&body) {
+                    diagnostics
+                        .lock()
+                        .unwrap()
+                        .push(format!("write body for {path}: {error}"));
+                }
             });
             server_handlers.lock().unwrap().push(handler);
         }
@@ -987,6 +1024,7 @@ fn serve_navigation_lifecycle_fixture() -> NavigationLifecycleFixture {
     NavigationLifecycleFixture {
         origin: format!("http://{address}"),
         events,
+        diagnostics,
         releases,
         stop,
         server: Some(server),
