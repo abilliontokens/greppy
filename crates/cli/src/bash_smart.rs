@@ -683,7 +683,21 @@ fn detect_blocks(
         (OutputStream::Stderr, stderr_lines),
     ] {
         let mut index = 0usize;
+        let mut formatting_diff = false;
         while index < lines.len() {
+            let content = lines[index].content;
+            if content.starts_with(b"Diff in ") && content.ends_with(b":") {
+                formatting_diff = true;
+                index += 1;
+                continue;
+            }
+            if formatting_diff {
+                if blank(content) || matches!(content.first(), Some(b' ' | b'\t' | b'+' | b'-')) {
+                    index += 1;
+                    continue;
+                }
+                formatting_diff = false;
+            }
             let kind = if ERROR_MARKER_RE.is_match(lines[index].content)
                 && !ZERO_FAILURE_COUNT_RE.is_match(lines[index].content)
             {
@@ -1823,16 +1837,34 @@ fn ensure_newline_after_raw(
     }
 }
 
+// Novelty is an optional supplement to complete mechanical diagnostics and
+// expandable raw output. Bound it to one GPU batch per stream even for huge
+// failed-build logs, sampling across the hidden output rather than its prefix.
+fn novelty_candidate_indices(groups: &[CollapseGroup], line_count: usize) -> Vec<usize> {
+    let middle_end = line_count.saturating_sub(SUCCESS_TAIL_LINES);
+    let eligible = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| {
+            group.count() == 1 && group.start > HEAD_LINES && group.start <= middle_end
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if eligible.len() <= EMBED_BATCH_LINES {
+        return eligible;
+    }
+    (0..EMBED_BATCH_LINES)
+        .map(|slot| eligible[slot * (eligible.len() - 1) / (EMBED_BATCH_LINES - 1)])
+        .collect()
+}
+
 fn novelty_lifts(
     lines: &[RawLine<'_>],
     groups: &[CollapseGroup],
     root: Option<&str>,
 ) -> Vec<LiftedLine> {
-    let middle_end = lines.len().saturating_sub(SUCCESS_TAIL_LINES);
-    if !groups
-        .iter()
-        .any(|group| group.count() == 1 && group.start > HEAD_LINES && group.start <= middle_end)
-    {
+    let candidates = novelty_candidate_indices(groups, lines.len());
+    if candidates.is_empty() {
         return Vec::new();
     }
     if test_inference_skipped() {
@@ -1860,10 +1892,10 @@ fn novelty_lifts(
         let _ = root;
         let mut provider = embed_daemon::DaemonCodeEmbeddingProvider::new(&cfg);
         let mut embedded = Vec::<(usize, Vec<f32>)>::new();
-        for chunk in groups.chunks(EMBED_BATCH_LINES) {
+        for chunk in candidates.chunks(EMBED_BATCH_LINES) {
             let texts = chunk
                 .iter()
-                .map(|group| std::str::from_utf8(&group.representative).ok())
+                .map(|index| std::str::from_utf8(&groups[*index].representative).ok())
                 .collect::<Vec<_>>();
             let valid = texts
                 .iter()
@@ -1881,19 +1913,11 @@ fn novelty_lifts(
                 return Vec::new();
             }
             for ((index, _), vector) in valid.into_iter().zip(vectors) {
-                embedded.push((groups_index(groups, chunk, index), vector));
+                embedded.push((chunk[index], vector));
             }
         }
         rank_novelty(lines, groups, &embedded)
     }
-}
-
-fn groups_index(groups: &[CollapseGroup], chunk: &[CollapseGroup], local_index: usize) -> usize {
-    let start = chunk
-        .first()
-        .and_then(|first| groups.iter().position(|group| group.start == first.start))
-        .unwrap_or(0);
-    start + local_index
 }
 
 fn rank_novelty(
@@ -2174,6 +2198,51 @@ mod tests {
             assert_eq!(clipped.end, direct.end);
             assert_eq!(clipped.representative, direct.representative);
             assert_eq!(clipped.template, direct.template);
+        }
+    }
+
+    #[test]
+    fn novelty_work_is_bounded_and_spans_large_failed_output() {
+        let groups = (1..=10_000)
+            .map(|line| CollapseGroup {
+                start: line,
+                end: line,
+                representative: format!("context line {line}").into_bytes(),
+                template: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let selected = novelty_candidate_indices(&groups, 10_000);
+        assert!(
+            selected.len() <= 16,
+            "optional log analysis must use at most one batch"
+        );
+        assert!(selected.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(selected.iter().all(|index| {
+            let line = groups[*index].start;
+            line > HEAD_LINES && line <= 10_000 - SUCCESS_TAIL_LINES
+        }));
+        for quarter in 0..4 {
+            assert!(
+                selected.iter().any(|index| {
+                    let line = groups[*index].start;
+                    line > quarter * 2_500 && line <= (quarter + 1) * 2_500
+                }),
+                "sampling must cover the whole log, including late anomalies"
+            );
+        }
+    }
+
+    #[test]
+    fn rustfmt_source_diff_is_not_a_compiler_diagnostic() {
+        let output = b"Diff in /work/src/lib.rs:42:\n     error.next_action = next.to_owned();\n-    panic!(\"old\");\n+    panic!(\"new\");\n\nerror: real formatter failure after diff\n";
+        for (stdout, stderr) in [(output.as_slice(), &b""[..]), (&b""[..], output.as_slice())] {
+            let blocks = detect_blocks(&split_lines(stdout), &split_lines(stderr));
+            assert_eq!(blocks.len(), 1, "source excerpts are not failures");
+            assert_eq!(blocks[0].kind, BlockKind::Error);
+            assert_eq!(
+                blocks[0].lines[0].bytes,
+                b"error: real formatter failure after diff"
+            );
         }
     }
 

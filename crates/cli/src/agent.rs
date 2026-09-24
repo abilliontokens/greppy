@@ -3878,7 +3878,7 @@ mod tests {
         let launch = crate::BackgroundJobLaunch::Attached {
             path: path.clone(),
             root: dir.path().to_path_buf(),
-            demand: None,
+            _demand: None,
         };
 
         cancel_background_job(launch);

@@ -4992,7 +4992,8 @@ pub(crate) enum BackgroundJobLaunch {
     Attached {
         path: std::path::PathBuf,
         root: std::path::PathBuf,
-        demand: Option<greppy_core::cache::FileLock>,
+        // Retaining this lease, rather than reading it, keeps shared work alive.
+        _demand: Option<greppy_core::cache::FileLock>,
     },
 }
 
@@ -5054,7 +5055,7 @@ fn spawn_background_job_handle(
         return Some(BackgroundJobLaunch::Attached {
             path: job_path,
             root,
-            demand: Some(demand),
+            _demand: Some(demand),
         });
     }
     let target_generation = greppy_store::Store::open_with(
