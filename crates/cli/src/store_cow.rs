@@ -2683,6 +2683,10 @@ mod tests {
         };
         greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
         assert!(store.get_index_skip("p", "CLAUDE.md").unwrap().is_some());
+        assert!(store.get_file_state("p", "CLAUDE.md").unwrap().is_none());
+
+        // Target content is not the identity of the tracked link.
+        std::fs::write(repo.path().join("AGENTS.md"), "different target content\n").unwrap();
 
         assert!(persisted_delta_path_matches(
             repo.path(),
@@ -2697,6 +2701,18 @@ mod tests {
         std::fs::remove_file(repo.path().join("CLAUDE.md")).unwrap();
         symlink("MISSING.md", repo.path().join("CLAUDE.md")).unwrap();
         assert!(!persisted_delta_path_matches(
+            repo.path(),
+            &store,
+            "p",
+            "CLAUDE.md",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap());
+        // A broken link is also a valid filtered entry after refresh.
+        greppy_indexer::index_with_options(&mut store, repo.path(), "p", &options).unwrap();
+        assert!(store.get_file_state("p", "CLAUDE.md").unwrap().is_none());
+        assert!(persisted_delta_path_matches(
             repo.path(),
             &store,
             "p",

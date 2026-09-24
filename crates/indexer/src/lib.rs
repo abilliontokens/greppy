@@ -569,7 +569,9 @@ fn explicit_filtered_inventory_entry(root: &Path, rel_path: &str) -> Option<Inve
     }
     let abs_path = root.join(relative);
     let metadata = std::fs::symlink_metadata(&abs_path).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    // Tracked Delta symlinks are not source files, but still need an identity
+    // so unchanged queries remain fresh without following their targets.
+    if !metadata.file_type().is_symlink() && !metadata.is_file() {
         return None;
     }
     let stable = stable_metadata(&metadata);
@@ -3218,7 +3220,7 @@ fn record_index_skip(
     detail: &str,
     generation: u64,
 ) -> Result<()> {
-    let metadata = std::fs::metadata(&entry.abs_path)
+    let metadata = std::fs::symlink_metadata(&entry.abs_path)
         .map(|md| stable_metadata(&md))
         .unwrap_or(StableFileMetadata {
             size: 0,
@@ -3385,9 +3387,14 @@ fn record_unsupported_file_state(
     entry: &InventoryEntry,
     generation: u64,
 ) {
-    let Ok(md) = std::fs::metadata(&entry.abs_path) else {
+    let Ok(md) = std::fs::symlink_metadata(&entry.abs_path) else {
         return;
     };
+    // The skip row owns a link's identity. Never read its target into a
+    // file_state: that mismatches lstat freshness and may leave the root.
+    if !md.is_file() {
+        return;
+    }
     if md.len() > max_file_size_bytes() {
         let metadata = stable_metadata(&md);
         // Oversized: record stat only, never read the body.
