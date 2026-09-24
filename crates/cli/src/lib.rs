@@ -844,7 +844,7 @@ pub fn run_base_build_owner_watchdog_test_harness() -> Option<u8> {
         return Some(74);
     }
     if let Some(ready) = std::env::var_os("GREPPY_TEST_BASE_OWNER_READY") {
-        if std::fs::write(ready, b"ready\n").is_err() {
+        if std::fs::write(ready, format!("{}\n", std::process::id())).is_err() {
             return Some(74);
         }
     }
@@ -4178,6 +4178,43 @@ fn vector_auto_reindex_can_rebuild(args: EmbeddingCliArgs<'_>) -> bool {
 /// Atomically published status for the one allowed background index job.
 const BACKGROUND_JOB_FILE: &str = "index.job";
 const ENV_BACKGROUND_DEMAND_LOCK: &str = "GREPPY_BACKGROUND_DEMAND_LOCK";
+static DELEGATED_BASE_OWNER: std::sync::Mutex<Option<std::process::ChildStdin>> =
+    std::sync::Mutex::new(None);
+static DELEGATED_BASE_STARTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BACKGROUND_DEMAND_CANCELLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn begin_delegated_base_owner() {
+    DELEGATED_BASE_STARTING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn register_delegated_base_owner(owner: std::process::ChildStdin) {
+    *DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(owner);
+    DELEGATED_BASE_STARTING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn clear_delegated_base_owner() {
+    DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    DELEGATED_BASE_STARTING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn delegated_base_owner_starting() -> bool {
+    DELEGATED_BASE_STARTING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn cancel_delegated_base_owner() -> bool {
+    DELEGATED_BASE_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+        .is_some()
+}
 
 fn background_job_path(root: &std::path::Path) -> std::path::PathBuf {
     workspace_locator::store_path(root)
@@ -4235,6 +4272,24 @@ fn start_background_demand_monitor(
                     ) {
                         return;
                     }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    if cancel_delegated_base_owner() {
+                        BACKGROUND_DEMAND_CANCELLED
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("cancelled");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(
+                                "automatic index stopped after its last query waiter exited"
+                            );
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
                     finish_background_demand_monitor(
                         &job_path,
                         "cancelled",
@@ -4245,21 +4300,52 @@ fn start_background_demand_monitor(
                 Ok(None) => {
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-                Err(error) => finish_background_demand_monitor(
-                    &job_path,
-                    "failed",
-                    &format!("automatic index demand monitor failed: {error}"),
-                    70,
-                ),
+                Err(error) => {
+                    let terminal = terminal.lock().unwrap_or_else(|error| error.into_inner());
+                    if *terminal {
+                        return;
+                    }
+                    let job = read_background_job(&job_path);
+                    if !background_demand_may_cancel(
+                        job.as_ref(),
+                        *terminal,
+                        expected_pid,
+                        expected_generation,
+                    ) {
+                        return;
+                    }
+                    if delegated_base_owner_starting() {
+                        drop(terminal);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    let message = format!("automatic index demand monitor failed: {error}");
+                    if cancel_delegated_base_owner() {
+                        if let Some(mut job) = job {
+                            job["state"] = serde_json::json!("failed");
+                            job["updated_at_unix_secs"] = serde_json::json!(unix_now_secs_cli());
+                            job["last_error"] = serde_json::json!(message.clone());
+                            let _ = write_background_job(&job_path, &job);
+                        }
+                        return;
+                    }
+                    finish_background_demand_monitor(&job_path, "failed", &message, 70);
+                }
             }
         });
     if let Err(error) = spawned {
-        finish_background_demand_monitor(
-            &monitor_path,
-            "failed",
-            &format!("automatic index demand monitor could not start: {error}"),
-            70,
-        );
+        let owned = read_background_job(&monitor_path).is_some_and(|job| {
+            background_demand_may_cancel(Some(&job), false, expected_pid, expected_generation)
+        });
+        if owned {
+            finish_background_demand_monitor(
+                &monitor_path,
+                "failed",
+                &format!("automatic index demand monitor could not start: {error}"),
+                70,
+            );
+        }
+        std::process::exit(70);
     }
 }
 
@@ -4738,12 +4824,35 @@ impl BackgroundJobGuard {
             .unwrap_or_else(|error| error.into_inner()) = true;
     }
 
+    pub(crate) fn publication_boundary<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T>,
+        committed: impl FnOnce(&T) -> bool,
+    ) -> Result<T> {
+        let mut terminal = self
+            .demand_terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = publish()?;
+        if committed(&result) {
+            *terminal = true;
+        }
+        Ok(result)
+    }
+
     fn fail(&mut self, error: &Error) {
         *self
             .demand_terminal
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = true;
-        self.write_state("failed", Some(&error.to_string()));
+        if BACKGROUND_DEMAND_CANCELLED.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.write_state(
+                "cancelled",
+                Some("automatic index stopped after its last query waiter exited"),
+            );
+        } else {
+            self.write_state("failed", Some(&error.to_string()));
+        }
         self.complete = true;
     }
 
