@@ -927,6 +927,40 @@ pub(crate) fn dispatch_index_agent_worktree(
     }
 }
 
+/// `greppy index rebuild [PATH]`: remove the workspace's index and build it
+/// from scratch. A plain `index` re-extracts only changed files, so a parser
+/// fix never reaches files that did not change.
+pub(crate) fn dispatch_index_rebuild(
+    path: Option<&str>,
+    root: Option<&str>,
+    embedding_args: EmbeddingCliArgs<'_>,
+) -> Result<i32> {
+    let target = match path {
+        Some(path) => absolutize_path(std::path::Path::new(path)),
+        None => std::env::current_dir()
+            .map_err(|error| Error::io("read current_dir for `greppy index rebuild`", error))?,
+    };
+    let effective_root = match root {
+        Some(root) => {
+            workspace_locator::resolve_workspace_root(&absolutize_path(std::path::Path::new(root)))
+        }
+        None => find_repo_root(&target),
+    };
+    let report = greppy_core::cache::clear_cache(Some(&effective_root))
+        .map_err(|error| Error::io("remove the index before rebuilding", error))?;
+    if report.locked_bytes > 0 {
+        eprintln!(
+            "greppy: the index for {} is in use by another greppy process; nothing was \
+             rebuilt. Stop it (or wait for it), then retry",
+            effective_root.display()
+        );
+        return Ok(EXIT_TEMPFAIL as i32);
+    }
+    let _ = remove_file_if_exists(&background_job_path(&effective_root));
+    let target = target.to_string_lossy().into_owned();
+    dispatch_index(Some(&target), root, embedding_args)
+}
+
 pub(crate) fn dispatch_index(
     path: Option<&str>,
     root: Option<&str>,

@@ -660,15 +660,13 @@ fn spawn_detached_windows(command: &std::process::Command) -> std::io::Result<()
     startup.StartupInfo.hStdError = stdout.raw();
     startup.lpAttributeList = attributes.ptr;
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // Hidden console, not `DETACHED_PROCESS`: Windows ignores `CREATE_NO_WINDOW`
+    // alongside it, and a console-less daemon's console children flash windows.
     let flags = {
         use windows_sys::Win32::System::Threading::{
-            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
-            EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, EXTENDED_STARTUPINFO_PRESENT,
         };
-        CREATE_NEW_PROCESS_GROUP
-            | CREATE_NO_WINDOW
-            | DETACHED_PROCESS
-            | EXTENDED_STARTUPINFO_PRESENT
+        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT
     };
     let created = unsafe {
         CreateProcessW(

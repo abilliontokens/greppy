@@ -1667,6 +1667,9 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     }
     set_cli_result_window(cli.limit, cli.offset);
     set_cli_json_output(command_requests_json(cli.command.as_ref()));
+    if device.is_none() && !no_gpu {
+        default_device_to_cuda()?;
+    }
     let configured_device = device.clone().or_else(|| env_nonempty(ENV_DEVICE));
     if !no_gpu {
         configure_explicit_cuda_device(configured_device.as_deref())?;
@@ -1690,6 +1693,22 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     println!("       search-symbol NAME   search-pattern REGEX");
     println!("       index status   (--help for full details)");
     Ok(EXIT_USAGE as i32)
+}
+
+/// Builds with a CUDA backend use `cuda` unless `--device`, `--no-gpu`,
+/// `GREPPY_DEVICE` or `GREPPY_NO_GPU` chose otherwise. `auto` would fall
+/// back to CPU silently when CUDA fails to load; an explicit `cuda` reports
+/// the failure instead. Set in the environment so background index jobs and
+/// inference daemons inherit the same device (and share one daemon).
+fn default_device_to_cuda() -> Result<()> {
+    const CUDA_BUILD: bool = greppy_embed_native::HAS_GPU_BACKEND
+        && cfg!(any(target_os = "linux", target_os = "windows"));
+    if !CUDA_BUILD || env_nonempty(ENV_DEVICE).is_some() || env_bool(ENV_NO_GPU)? {
+        return Ok(());
+    }
+    // SAFETY: dispatch runs this before spawning any thread or child.
+    unsafe { std::env::set_var(ENV_DEVICE, "cuda") };
+    Ok(())
 }
 
 fn configure_explicit_cuda_device(device: Option<&str>) -> Result<()> {
@@ -1988,6 +2007,17 @@ fn dispatch_subcommand(
                     ));
                 }
                 dispatch_index_status(json, root)
+            } else if path.as_deref() == Some("rebuild") {
+                if agent_worktree || json {
+                    return Err(Error::Invalid(
+                        "index rebuild takes no --agent-worktree or --json".into(),
+                    ));
+                }
+                dispatch_index_rebuild(
+                    recovery_path.as_deref(),
+                    root,
+                    EmbeddingCliArgs { device, no_gpu },
+                )
             } else if path.as_deref() == Some("recover") {
                 if agent_worktree {
                     return Err(Error::Invalid(
@@ -4702,10 +4732,13 @@ fn spawn_background_job_handle(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
+        // `CREATE_NO_WINDOW` gives the job its own hidden console, which its
+        // `git` and other console children inherit. `DETACHED_PROCESS` would
+        // override it (Windows ignores the pair), leave the job console-less,
+        // and make every child pop up a visible console window.
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
